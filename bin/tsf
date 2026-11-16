@@ -432,15 +432,15 @@ function padWidth(string $s, int $width): string
 function verifySuites(): array
 {
     return [
-        ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "bench/aot-semantics/run.sh"],
-        ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "bench/swoole-contract/run.sh"],
-        ["id" => "settle", "desc" => "金币账本（91 项）", "sh" => "bench/settle-test/run.sh"],
-        ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "bench/settle-crash/run.sh"],
-        ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "bench/fd-test/run.sh"],
+        ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh"],
+        ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "tests/swoole-contract/run.sh"],
+        ["id" => "settle", "desc" => "金币账本（91 项）", "sh" => "tests/settle-test/run.sh"],
+        ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "tests/settle-crash/run.sh"],
+        ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "tests/fd-test/run.sh"],
         ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
-        ["id" => "wasm", "desc" => "wasm 热更链路（灰度/回滚）", "sh" => "bench/wasm-link/run.sh",
+        ["id" => "wasm", "desc" => "wasm 热更链路（灰度/回滚）", "sh" => "tests/wasm-link/run.sh",
          "needs" => ["wasm32-wasip2-clang", "wasmtime", "wit-bindgen"]],
     ];
 }
@@ -505,8 +505,11 @@ function verifyRun(string $root, array $argv): int
 
         $path = $root . "/" . $s["sh"];
         if (!is_file($path)) {
-            $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => "SKIP", "ms" => 0, "tail" => "脚本不存在"];
+            // demo 是子模块：没跑 git submodule update --init 时这里必然缺
+            $why = strpos($s["sh"], "demo/") === 0 ? "demo 子模块未初始化" : "脚本不存在";
+            $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => "SKIP", "ms" => 0, "tail" => $why];
             $skip++;
+            fwrite(STDERR, "→ " . $s["id"] . " ... SKIP（" . $why . "）" . PHP_EOL);
             continue;
         }
 
