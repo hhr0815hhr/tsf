@@ -1,0 +1,24 @@
+{
+    "name": "typephp/tsf",
+    "description": "TSF — TypePHP Server Framework：用 TypePHP(AOT) + PHP 构建高性能游戏服务器",
+    "type": "library",
+    "license": "MIT",
+    "version": "0.1.0",
+    "require": {
+        "php": ">=8.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "TSF\\": "src/"
+        }
+    },
+    "bin": [
+        "bin/tsf"
+    ],
+    "config": {
+        "sort-packages": true
+    },
+    "require-dev": {
+        "swoole/ide-helper": "~6.2.3"
+    }
+}

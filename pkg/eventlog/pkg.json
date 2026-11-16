@@ -1,0 +1,7 @@
+{
+  "name": "eventlog",
+  "ns": "TSF\\EventLog",
+  "desc": "事件日志：追加写 + 崩溃安全 + 幂等重放 + 截断归档",
+  "requires": [],
+  "hint": "交易/充值/扣道具这类「丢了就是事故」的写入才用；房间状态用 snapshot 就够"
+}

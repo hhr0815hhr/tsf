@@ -1,0 +1,7 @@
+{
+  "name": "snapshot",
+  "ns": "TSF\\Snapshot",
+  "desc": "快照：带版本的 JSON 容器 + 内存/文件存储（不认识任何业务对象）",
+  "requires": [],
+  "hint": "要「进程崩了能恢复」才用；纯内存玩法、纯转发服务不需要。谁的数据谁负责 toArray/loadFrom"
+}

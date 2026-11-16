@@ -1,0 +1,1182 @@
+#!/usr/bin/env php85
+<?php
+
+/**
+ * TSF 命令行（开发期工具，解释执行）。
+ *
+ * CLI 本身不需要 AOT —— 它只在开发机上跑，负责生成工程、调用编译器、启停进程。
+ * 真正被 AOT 编译的是业务工程（main.php + 各包 src/）。
+ *
+ * 用法：
+ *   tsf new   <name>        新建工程
+ *   tsf build [dir]         编译
+ *   tsf serve [dir]         编译并启动
+ *   tsf watch [dir]         改文件自动重编重启（开发模式）
+ *   tsf lint                结构检查（禁 mixed、命名空间与目录一致）
+ *   tsf config build [dir]  Excel 配置表 → 强类型代码 + 二进制
+ *   tsf config check [dir]  只校验配置表
+ *   tsf proto build [dir]   .proto → gen/Proto/*.php（消息类 + 编解码）
+ *   tsf list                列出可选功能包及启用状态
+ *   tsf add/remove <pkg>    启用/移除功能包
+ *   tsf version
+ */
+
+const TSF_VERSION = "0.1.0-m0";
+
+$tsfRoot = dirname(__DIR__);
+$tpc = getenv("TPC");
+if ($tpc === false || $tpc === "") {
+    $tpc = "/home/hhr/typephp-src/bin/tpc.php";
+}
+$phpBin = getenv("TSF_PHP");
+if ($phpBin === false || $phpBin === "") {
+    $phpBin = "php85";
+}
+
+$argvv = $_SERVER["argv"] ?? [];
+$cmd = isset($argvv[1]) ? (string) $argvv[1] : "help";
+$arg = isset($argvv[2]) ? (string) $argvv[2] : "";
+
+function c(string $s, string $color): string
+{
+    $map = ["g" => "32", "y" => "33", "r" => "31", "b" => "36", "d" => "90"];
+    $code = $map[$color] ?? "0";
+    return "\033[" . $code . "m" . $s . "\033[0m";
+}
+
+function say(string $s): void
+{
+    echo $s . PHP_EOL;
+}
+
+function ok(string $s): void
+{
+    say(c("  OK ", "g") . $s);
+}
+
+function warn(string $s): void
+{
+    say(c("  !  ", "y") . $s);
+}
+
+function fail(string $s, int $code = 1): void
+{
+    say(c("  X  ", "r") . $s);
+    exit($code);
+}
+
+/** 生成工程的 project.yml（绝对路径，避免相对路径在不同 cwd 下失效） */
+/**
+ * 读工程清单 project.json（构建用，不是运行期配置）。
+ *
+ * @return array<string, string|array> name(string) / packages(array)
+ */
+function readProjectJson(string $projDir): array
+{
+    $path = $projDir . "/project.json";
+    $default = ["name" => basename($projDir), "packages" => []];
+    if (!is_file($path)) {
+        return $default;
+    }
+    $d = json_decode((string) file_get_contents($path), true);
+    if (!is_array($d)) {
+        return $default;
+    }
+    if (!isset($d["packages"]) || !is_array($d["packages"])) {
+        $d["packages"] = [];
+    }
+    if (!isset($d["name"]) || !is_string($d["name"])) {
+        $d["name"] = basename($projDir);
+    }
+    return $d;
+}
+
+/** @param array<string, string|array> $d */
+function writeProjectJson(string $projDir, array $d): void
+{
+    file_put_contents(
+        $projDir . "/project.json",
+        json_encode($d, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n"
+    );
+}
+
+/**
+ * 扫描可用包：每个 pkg/<name>/pkg.json 描述一个包。
+ *
+ * @return array<string, array<string, string|array>>
+ */
+function listPackages(string $tsfRoot): array
+{
+    $out = [];
+    $found = glob($tsfRoot . "/pkg/*/pkg.json");
+    if ($found === false) {
+        return $out;
+    }
+    foreach ($found as $p) {
+        $d = json_decode((string) file_get_contents($p), true);
+        if (!is_array($d) || !isset($d["name"]) || !is_string($d["name"])) {
+            continue;
+        }
+        $out[(string) $d["name"]] = $d;
+    }
+    ksort($out);
+    return $out;
+}
+
+/**
+ * 展开包的依赖闭包，返回按发现顺序排好的包名列表。
+ *
+ * project.json 只记"用户显式启用的包"，构建时在这里补齐 requires——
+ * 手写 project.json 的人不用记得把 entity/frameloop 一起写上。
+ *
+ * @param array<int, string> $explicit
+ * @param array<string, array<string, string|array>> $all
+ * @return array<int, string>
+ */
+function resolvePackages(array $explicit, array $all): array
+{
+    $out = [];
+    $seen = [];
+    $queue = [];
+    foreach ($explicit as $p) {
+        $queue[] = (string) $p;
+    }
+    while ($queue !== []) {
+        $name = (string) array_shift($queue);
+        if (isset($seen[$name])) {
+            continue;
+        }
+        $seen[$name] = true;
+        if (!isset($all[$name])) {
+            throw new \RuntimeException("包 [" . $name . "] 不存在。可用包见 `tsf list`");
+        }
+        $out[] = $name;
+        if (isset($all[$name]["requires"]) && is_array($all[$name]["requires"])) {
+            foreach ($all[$name]["requires"] as $dep) {
+                $queue[] = (string) $dep;
+            }
+        }
+    }
+    return $out;
+}
+
+function genProjectYml(string $projDir, string $tsfRoot): string
+{
+    $src = $projDir . "/src";
+    $lines = [];
+    $lines[] = "name: " . basename($projDir);
+    $lines[] = "version: 0.1.0";
+    $lines[] = "cxx-std: c++17";
+    $lines[] = "cxx-flags: |";
+    $lines[] = "  -O2";
+    $lines[] = "sources:";
+    $lines[] = "  - " . $tsfRoot . "/src";
+    // 原生原语总是参与编译（体积只有几 KB），运行期用 protocol.frame 切换。
+    // 这样同一个二进制可以 A/B 对比，也避免"配置改了但类不存在"的编译错误。
+    if (is_dir($tsfRoot . "/ext/codec/php-src")) {
+        $lines[] = "  - " . $tsfRoot . "/ext/codec/php-src";
+        $lines[] = "  - " . $tsfRoot . "/ext/codec/cpp-src";
+    }
+
+    // 可选功能包：只编工程声明要用的（含其依赖）。棋牌不需要 AOI，就不该为它付编译时间和体积。
+    $proj = readProjectJson($projDir);
+    $all = listPackages($tsfRoot);
+    foreach (resolvePackages($proj["packages"], $all) as $name) {
+        $pdir = $tsfRoot . "/pkg/" . $name . "/src";
+        if (is_dir($pdir)) {
+            $lines[] = "  - " . $pdir;
+        }
+    }
+
+    if (is_dir($src)) {
+        $lines[] = "  - " . $src;
+    }
+    // 额外源码目录（相对工程目录）。给「bench 要验证 demo 里的业务代码」这类场景用：
+    // 复制一份代码去测等于测的是副本，早晚和原件不一致。
+    if (isset($proj["sources"]) && is_array($proj["sources"])) {
+        foreach ($proj["sources"] as $extra) {
+            if (!is_string($extra) || $extra === "") {
+                continue;
+            }
+            $abs = realpath($projDir . "/" . $extra);
+            if ($abs === false || !is_dir($abs)) {
+                fail("project.json 的 sources 里有不存在的目录: " . $extra);
+            }
+            $lines[] = "  - " . $abs;
+        }
+    }
+    // 生成的配置表代码（tsf config build 的产物）。
+    // 放在独立目录而不是塞进 src/，是为了让"能手改的"和"不能手改的"一眼分开——
+    // 同目录下混着两类文件时，总有人去改生成物然后纳闷为什么被覆盖
+    if (is_dir($projDir . "/gen")) {
+        $lines[] = "  - " . $projDir . "/gen";
+    }
+    $lines[] = "  - " . $projDir . "/main.php";
+    return implode("\n", $lines) . "\n";
+}
+
+function runCmd(string $cmd, string $cwd): int
+{
+    $old = getcwd();
+    if ($old !== false) {
+        chdir($cwd);
+    }
+    $code = 0;
+    passthru($cmd, $code);
+    if ($old !== false) {
+        chdir($old);
+    }
+    return $code;
+}
+
+function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin): int
+{
+    if (!is_dir($projDir)) {
+        fail("工程目录不存在: " . $projDir);
+    }
+    try {
+        $yml = genProjectYml($projDir, $tsfRoot);
+    } catch (\RuntimeException $e) {
+        fail($e->getMessage());
+    }
+    file_put_contents($projDir . "/project.yml", $yml);
+    $cmd = $phpBin . " " . escapeshellarg($tpc) . " project.yml";
+    return runCmd($cmd, $projDir);
+}
+
+function findBinary(string $projDir): string
+{
+    $name = basename($projDir);
+    $candidates = [
+        $projDir . "/" . str_replace("-", "_", $name),
+        $projDir . "/" . $name,
+    ];
+    foreach ($candidates as $c) {
+        if (is_file($c) && is_executable($c)) {
+            return $c;
+        }
+    }
+    return "";
+}
+
+/** 生成的主程序模板 */
+function tplMain(): string
+{
+    $php = '<?php
+
+use TSF\Kernel\Bootstrap;
+use TSF\Kernel\Config;
+use TSF\Kernel\Logger;
+use TSF\Gateway\Gateway;
+use TSF\Gateway\RateLimiter;
+use TSF\Gateway\SessionManager;
+use TSF\Gateway\TokenAuth;
+use TSF\Protocol\Contract\PayloadCodec;
+use TSF\Protocol\Msg;
+use TSF\Protocol\ProtocolStack;
+use TSF\Transport\ServerFactory;
+
+function main(): void
+{
+    $base = __DIR__;
+    Bootstrap::boot($base, "app");
+    Bootstrap::ensureDirs([$base . "/var/log"]);
+
+    $host = Config::getString("server.host", "0.0.0.0");
+    $port = Config::getInt("server.port", 9001);
+
+    $opts = [
+        "worker_num" => Config::getInt("server.worker_num", 1),
+        "max_conn" => Config::getInt("server.max_conn", 10000),
+        "nodelay" => Config::getBool("server.nodelay", true),
+    ];
+
+    // ---- 协议：分帧 + 消息体，两层都可换（配置即可，不改代码）----
+    // frame:   native（C++，推荐）| header（纯 PHP，排障用）
+    // payload: raw（透传，默认）| json | msgpack | protobuf | registry
+    $proto = ProtocolStack::fromConfig(
+        Config::getString("protocol.frame", "native"),
+        Config::getString("protocol.payload", "raw")
+    );
+
+    // payload 为 raw 时不往 Gateway 传编解码器——省掉每帧一次空转
+    $payloadCodec = null;
+    if ($proto->payloadName() !== "raw") {
+        $payloadCodec = $proto->payload();
+    }
+
+    // 传输层：tcp（默认）或 ws。
+    // 走工厂是为了 AOT 类型稳定：局部变量类型由首次赋值推断，
+    // 在 if/else 里分别赋 TcpServer / WsServer 会报 "Cannot re-assign typed object"。
+    $server = ServerFactory::make(
+        Config::getString("server.transport", "tcp"),
+        $host,
+        $port,
+        $proto->frame(),
+        $opts
+    );
+
+    // gateway=off 只用于压测对照：跳过会话/限流/心跳，直连 onFrame。
+    // 生产不要关——那样就没有鉴权、限流和空闲回收了。
+    if (!Config::getBool("server.gateway", true)) {
+        Logger::warn("gateway disabled (benchmark mode only)");
+        $server->onFrame(function (int $fd, int $msgId, string $body, int $flags) use ($server): void {
+            if ($msgId === Msg::ECHO_REQ) {
+                $server->sendFrame($fd, Msg::ECHO_RESP, $body);
+            }
+        });
+        Logger::info("app ready (no gateway)", ["host" => $host, "port" => $port]);
+        $server->start();
+        return;
+    }
+
+    // ---- 会话 / 鉴权 / 限流 / 心跳 ----
+    $heartbeat = Config::getInt("server.heartbeat_sec", 30);
+    $sessions = new SessionManager($heartbeat);
+    $auth = new TokenAuth(
+        Config::getMap("server.auth.tokens"),
+        Config::getString("server.auth.secret", "")
+    );
+    $limiter = new RateLimiter(
+        Config::getInt("server.rate_per_sec", 50),
+        Config::getInt("server.rate_burst", 100)
+    );
+
+    $gw = new Gateway(
+        $server,
+        $sessions,
+        $auth,
+        $limiter,
+        $heartbeat,
+        1000,
+        Config::getBool("server.auth.require", true),
+        $payloadCodec
+    );
+    // 背压阈值：连续这么多次发送失败就断开该连接（慢客户端不拖累整个 worker）
+    $gw->setSendFailLimit(Config::getInt("server.send_fail_limit", 50));
+
+    // ---- 业务处理器 ----
+    // 用 $gw->send 而不是 $server->sendFrame：
+    // 只有经过 Gateway 才能统计发送失败、触发背压。
+    //
+    // handler 的载荷参数按 payload 选具体类型（全框架不出现 mixed，见 README §5.8）：
+    //   payload=raw  -> string $body
+    //   其他 payload -> string|array|object $data
+    if ($proto->payloadName() !== "raw") {
+        $gw->on(Msg::ECHO_REQ, function (int $fd, int $uid, string|array|object $data) use ($gw): void {
+            $gw->send($fd, Msg::ECHO_RESP, $data);
+        });
+
+        $gw->on(1003, function (int $fd, int $uid, string|array|object $data) use ($gw): void {
+            $gw->send($fd, 1004, ["uid" => $uid]);
+        });
+    } else {
+        $gw->on(Msg::ECHO_REQ, function (int $fd, int $uid, string $body) use ($gw): void {
+            $gw->send($fd, Msg::ECHO_RESP, $body);
+        });
+
+        // whoami：验证登录后 uid 已绑定
+        $gw->on(1003, function (int $fd, int $uid, string $body) use ($gw): void {
+            $gw->send($fd, 1004, "uid=" . $uid);
+        });
+    }
+
+    $gw->boot();
+
+    Logger::info("app ready", [
+        "host" => $host,
+        "port" => $port,
+        "transport" => Config::getString("server.transport", "tcp"),
+        "frame" => $proto->frameName(),
+        "payload" => $proto->payloadName(),
+        "heartbeat_sec" => $heartbeat,
+        "require_auth" => Config::getBool("server.auth.require", true),
+    ]);
+    $server->start();
+}
+';
+    return $php;
+}
+
+/** 生成的客户端模板；__TSF_ROOT__ 会被替换成框架根目录的绝对路径 */
+function tplClient(): string
+{
+    $php = '<?php
+
+// 最小客户端：用框架同一份帧实现编解码，验证端到端。
+// 客户端只需要协议的"契约 + 头实现"三个文件（不需要传输层/Gateway）。
+require_once "__TSF_ROOT__/src/Protocol/Contract/DecodedFrame.php";
+require_once "__TSF_ROOT__/src/Protocol/Contract/FrameCodec.php";
+require_once "__TSF_ROOT__/src/Protocol/Frame/HeaderFrame.php";
+
+use TSF\Protocol\Frame\HeaderFrame;
+
+$port = (int) ($argv[1] ?? 9001);
+$token = (string) ($argv[2] ?? "tok-1001");
+
+$sock = stream_socket_client("tcp://127.0.0.1:" . $port, $errno, $errstr, 3);
+if ($sock === false) {
+    fwrite(STDERR, "connect failed: " . $errstr . PHP_EOL);
+    exit(1);
+}
+
+/**
+ * 读一帧，返回 [msgId, body]；超时返回 null。
+ * 缓冲区用 static 保留：一次读到两帧时，第二帧不会丢。
+ */
+function readFrame($sock, float $timeout = 3.0): ?array
+{
+    static $buf = "";
+    $deadline = microtime(true) + $timeout;
+    while (microtime(true) < $deadline) {
+        $f = HeaderFrame::parse($buf);
+        if ($f !== null) {
+            $buf = substr($buf, $f->consumed);
+            return [$f->msgId, $f->body];
+        }
+        $chunk = fread($sock, 65536);
+        if ($chunk === false || $chunk === "") {
+            if (feof($sock)) {
+                return null;
+            }
+            usleep(1000);
+            continue;
+        }
+        $buf .= $chunk;
+    }
+    return null;
+}
+
+// 1) 登录（默认配置要求鉴权，业务消息必须登录后才能发）
+fwrite($sock, HeaderFrame::build(1, $token));          // 1 = MSG_LOGIN
+$r = readFrame($sock);
+if ($r === null || $r[0] !== 2) {                       // 2 = MSG_LOGIN_OK
+    fwrite(STDERR, "login failed: " . var_export($r, true) . PHP_EOL);
+    exit(1);
+}
+echo "login ok uid=" . $r[1] . PHP_EOL;
+
+// 2) echo 往返
+$payload = "hello-tsf-" . time();
+fwrite($sock, HeaderFrame::build(1001, $payload));      // 1001 = MSG_ECHO_REQ
+$r = readFrame($sock);
+if ($r === null) {
+    fwrite(STDERR, "timeout waiting response" . PHP_EOL);
+    fclose($sock);
+    exit(1);
+}
+echo "resp msgId=" . $r[0] . " body=" . $r[1] . PHP_EOL;
+echo ($r[1] === $payload ? "OK: echo matched" : "FAIL: body mismatch") . PHP_EOL;
+fclose($sock);
+exit($r[1] === $payload ? 0 : 1);
+';
+    return $php;
+}
+
+// ---------------- 命令 ----------------
+
+/**
+ * 结构约束检查：把"约定"变成可执行的门禁，而不是只写在文档里。
+ *
+ * 三条规则（对应 README §3 与 §5.8）：
+ *   1. 源码里不允许出现 `mixed` 类型声明 —— 用 `string|array|object` 等明确联合类型
+ *   2. 命名空间必须与目录路径一致（PSR-4）：TSF\A\B 必须在 src/A/B.php
+ *   3. ext/ 下不允许出现 TSF\* 命名空间的类 —— 扩展只提供原生原语
+ */
+/**
+ * @param array<int, string> $problems
+ */
+function lintTree(string $base, string $nsPrefix, string $root, array &$problems): int
+{
+    if (!is_dir($base)) {
+        return 0;
+    }
+    $checked = 0;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($base));
+    foreach ($it as $f) {
+        if (!$f->isFile() || substr($f->getPathname(), -4) !== ".php") {
+            continue;
+        }
+        $path = $f->getPathname();
+        $rel = str_replace($base . "/", "", $path);
+        $class = basename($rel, ".php");
+        $expected = $nsPrefix . "\\" . str_replace("/", "\\", substr($rel, 0, -4));
+        $code = file_get_contents($path);
+        $checked++;
+
+        // 规则 2：命名空间与路径一致
+        if (preg_match('/^namespace\s+([^;]+);/m', $code, $m)) {
+            $ns = trim($m[1]);
+            if ($ns . "\\" . $class !== $expected) {
+                $problems[] = str_replace($root . "/", "", $path)
+                    . "  命名空间是 " . $ns . "，按路径应为 " . substr($expected, 0, -strlen($class) - 1);
+            }
+        } else {
+            $problems[] = str_replace($root . "/", "", $path) . "  缺少 namespace 声明";
+        }
+
+        // 规则 1：不允许 mixed 类型声明（跳过注释行）
+        $lines = explode("\n", $code);
+        foreach ($lines as $i => $line) {
+            $t = ltrim($line);
+            if ($t === "" || $t[0] === "*" || strncmp($t, "//", 2) === 0 || $t[0] === "#") {
+                continue;
+            }
+            // 去掉行尾注释再判断，避免注释里的示例被误报
+            $codePart = $line;
+            $posComment = strpos($codePart, "//");
+            if ($posComment !== false) {
+                $codePart = substr($codePart, 0, $posComment);
+            }
+            if (preg_match('/(?<![A-Za-z0-9_\\\\])mixed(?![A-Za-z0-9_])/', $codePart)) {
+                $problems[] = str_replace($root . "/", "", $path) . ":" . ($i + 1)
+                    . "  出现 mixed 类型声明 → " . trim($codePart);
+            }
+        }
+    }
+    return $checked;
+}
+
+function cmdLint(string $root): int
+{
+    $problems = [];
+    $checked = 0;
+
+    // 核心
+    $checked += lintTree($root . "/src", "TSF", $root, $problems);
+
+    // 可选功能包：每个包自己声明根命名空间（pkg.json 的 ns 字段）
+    $pkgs = listPackages($root);
+    foreach ($pkgs as $name => $d) {
+        $ns = isset($d["ns"]) ? (string) $d["ns"] : "TSF\\" . ucfirst($name);
+        $checked += lintTree($root . "/pkg/" . $name . "/src", $ns, $root, $problems);
+    }
+
+    // 规则 3：ext/ 不出现 TSF 命名空间
+    if (is_dir($root . "/ext")) {
+        $it2 = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root . "/ext"));
+        foreach ($it2 as $f) {
+            if (!$f->isFile() || substr($f->getPathname(), -4) !== ".php") {
+                continue;
+            }
+            $code = file_get_contents($f->getPathname());
+            if (preg_match('/^namespace\s+TSF\\\\/m', $code)) {
+                $problems[] = str_replace($root . "/", "", $f->getPathname())
+                    . "  ext/ 下不允许 TSF 命名空间的类（适配类应放 src/）";
+            }
+        }
+    }
+
+    if ($problems === []) {
+        ok("结构检查通过：" . $checked . " 个源文件（核心 + " . count($pkgs) . " 个包），"
+            . "无 mixed 类型、命名空间与目录一致");
+        return 0;
+    }
+
+    say("结构检查发现 " . count($problems) . " 处问题：");
+    foreach ($problems as $p) {
+        say("  ✗ " . $p);
+    }
+    return 1;
+}
+
+/**
+ * watch 的轮询间隔（ms）。
+ *
+ * 200 ms 是"感知上即时"和"别把 CPU 烧在扫描上"的折中。实测全量编译 1.0~1.3 s，
+ * 所以轮询间隔根本不是瓶颈——**准不准才是**。
+ */
+const WATCH_POLL_MS = 200;
+
+/**
+ * 监听集合 = `project.yml` 的 sources 列表 + project.json。
+ *
+ * 为什么不自己写一份"该监听 src/ 和 main.php"：那是**构建输入的副本**，
+ * 加了 `gen/`（配置/协议生成物）或新包之后就会漂。直接从 project.yml 读，
+ * 永远不会漏——因为编译用的就是这份列表。
+ */
+function watchSourcePaths(string $projDir): array
+{
+    $out = [];
+    $yml = @file_get_contents($projDir . "/project.yml");
+    if ($yml !== false) {
+        foreach (explode("\n", $yml) as $line) {
+            $t = trim($line);
+            if (strncmp($t, "- ", 2) === 0) {
+                $p = trim(substr($t, 2));
+                if ($p !== "") {
+                    $out[] = $p;
+                }
+            }
+        }
+    }
+    // project.json 决定用哪些包：改它要重编（project.yml 会跟着变，但自己也要在监听范围里）
+    $out[] = $projDir . "/project.json";
+    return $out;
+}
+
+/** @return string[] 递归收集 *.php */
+function scanPhpFiles(string $dir): array
+{
+    $out = [];
+    $items = @scandir($dir);
+    if ($items === false) {
+        return $out;
+    }
+    foreach ($items as $name) {
+        if ($name === "." || $name === "..") {
+            continue;
+        }
+        $p = $dir . "/" . $name;
+        if (is_dir($p)) {
+            foreach (scanPhpFiles($p) as $f) {
+                $out[] = $f;
+            }
+            continue;
+        }
+        if (substr($name, -4) === ".php") {
+            $out[] = $p;
+        }
+    }
+    return $out;
+}
+
+/**
+ * 按**内容**算指纹，不看 mtime。
+ *
+ * `filemtime()` 只到秒：一秒内保存两次、或者改一个等长字符（`1` → `2`），
+ * mtime+size 都察觉不到。这个坑 T5-02（服务发现）和 T6-02（配置热更）各踩过一次，
+ * 这次直接按内容来。
+ *
+ * 代价是每轮要读一遍所有源文件。实测约 200 个文件 / 1~2 MB，一轮十几毫秒——
+ * 在 200 ms 的轮询间隔下是可接受的，而"漏掉改动"的代价是开发者对着没生效的代码发呆。
+ *
+ * @return array{0: int, 1: int} [指纹, 文件数]
+ */
+function watchFingerprint(array $paths): array
+{
+    $h = 0;
+    $n = 0;
+    foreach ($paths as $p) {
+        if (is_file($p)) {
+            $c = @file_get_contents($p);
+            $h = crc32($h . "|" . $p . "|" . crc32($c === false ? "" : $c));
+            $n++;
+            continue;
+        }
+        if (!is_dir($p)) {
+            continue;
+        }
+        foreach (scanPhpFiles($p) as $f) {
+            $c = @file_get_contents($f);
+            $h = crc32($h . "|" . $f . "|" . crc32($c === false ? "" : $c));
+            $n++;
+        }
+    }
+    return [$h, $n];
+}
+
+/** 两段 hrtime 之间的毫秒数 */
+function msOf(int $from, int $to): int
+{
+    return (int) round((float) ($to - $from) / 1000000.0);
+}
+
+/** 启动产物，返回进程句柄（同时记到 $GLOBALS，供信号处理器收尸） */
+function startChild(string $projDir)
+{
+    $binPath = findBinary($projDir);
+    if ($binPath === "") {
+        fail("编译成功但找不到可执行文件");
+    }
+    $desc = [0 => STDIN, 1 => STDOUT, 2 => STDERR];
+    $h = proc_open(escapeshellarg($binPath), $desc, $pipes, $projDir);
+    if (!is_resource($h)) {
+        fail("启动失败：" . $binPath);
+    }
+    $GLOBALS["tsf_watch_child"] = $h;
+    return $h;
+}
+
+/**
+ * 先 SIGTERM 再兜底 SIGKILL。
+ *
+ * 直接 SIGKILL 会跳过服务自己的 `onStop`（日志没刷、注册表没注销、快照没落盘）。
+ * 开发期也要给优雅退出留 2 秒——不然调试"退出逻辑对不对"时永远测不出来。
+ */
+function stopChild($child)
+{
+    if (!is_resource($child)) {
+        return null;
+    }
+    @proc_terminate($child, 15);
+    $deadline = microtime(true) + 2.0;
+    while (microtime(true) < $deadline) {
+        $st = proc_get_status($child);
+        if (!is_array($st) || !isset($st["running"]) || !$st["running"]) {
+            break;
+        }
+        usleep(10000);
+    }
+    $st = proc_get_status($child);
+    if (is_array($st) && isset($st["running"]) && $st["running"]) {
+        @proc_terminate($child, 9);
+    }
+    @proc_close($child);
+    $GLOBALS["tsf_watch_child"] = null;
+    return null;
+}
+
+switch ($cmd) {
+    case "version":
+        say("TSF " . TSF_VERSION . "  (tpc: " . $tpc . ")");
+        break;
+
+    case "lint":
+        exit(cmdLint($tsfRoot));
+        break;
+
+    case "new":
+        if ($arg === "") {
+            fail("用法: tsf new <name>");
+        }
+        $projDir = getcwd() . "/" . $arg;
+        if (is_dir($projDir)) {
+            fail("目录已存在: " . $projDir);
+        }
+        mkdir($projDir . "/config", 0777, true);
+        mkdir($projDir . "/src", 0777, true);
+        mkdir($projDir . "/var/log", 0777, true);
+
+        // 构建清单：声明这个工程要用哪些可选功能包（默认一个都不用）
+        writeProjectJson($projDir, ["name" => $arg, "packages" => []]);
+
+        $cfg = [
+            "app" => ["name" => $arg],
+            "log" => [
+                "level" => "info",
+                "file" => $projDir . "/var/log/app.log",
+            ],
+            // 协议：分帧层 + 消息体层，两层独立可换
+            "protocol" => [
+                // frame:   native（C++，推荐）| header（纯 PHP，排障用）
+                "frame" => "native",
+                // payload: raw（透传）| json | msgpack | protobuf | registry
+                "payload" => "raw",
+            ],
+            "server" => [
+                "host" => "0.0.0.0",
+                "port" => 9001,
+                // tcp | ws（WebSocket；payload 仍是同一套二进制帧）
+                "transport" => "tcp",
+                "worker_num" => 1,
+                "max_conn" => 10000,
+                "nodelay" => true,
+                // 心跳：服务端超过这么多秒没收到任何帧就断开
+                "heartbeat_sec" => 30,
+                // 限流：每秒补充 rate_per_sec 个令牌，桶容量 rate_burst
+                "rate_per_sec" => 50,
+                "rate_burst" => 100,
+                "auth" => [
+                    // require=false 仅用于压测/内网；生产必须为 true
+                    "require" => true,
+                    "secret" => "dev-secret-change-me",
+                    "tokens" => [
+                        "tok-1001" => 1001,
+                        "tok-1002" => 1002,
+                    ],
+                ],
+            ],
+        ];
+        file_put_contents(
+            $projDir . "/config/tsf.json",
+            json_encode($cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n"
+        );
+
+        file_put_contents($projDir . "/main.php", tplMain());
+
+        $client = str_replace("__TSF_ROOT__", $tsfRoot, tplClient());
+        file_put_contents($projDir . "/client.php", $client);
+
+        file_put_contents($projDir . "/project.yml", genProjectYml($projDir, $tsfRoot));
+
+        ok("工程已创建: " . $projDir);
+        say("");
+        say("下一步：");
+        say("  cd " . $arg);
+        say("  tsf serve .            # 编译并启动");
+        say("  php85 client.php       # 另开终端验证 echo");
+        break;
+
+    case "list":
+        $all = listPackages($tsfRoot);
+        $explicit = [];
+        $projDir = $arg === "" ? getcwd() : realpath($arg);
+        if ($projDir !== false) {
+            $proj = readProjectJson($projDir);
+            foreach ($proj["packages"] as $p) {
+                $explicit[(string) $p] = true;
+            }
+        }
+        $resolved = [];
+        if ($explicit !== []) {
+            try {
+                foreach (resolvePackages(array_keys($explicit), $all) as $n) {
+                    $resolved[$n] = true;
+                }
+            } catch (\RuntimeException $e) {
+                say("  ! " . $e->getMessage());
+            }
+        }
+
+        say("可选功能包（tsf/pkg/）：");
+        if ($all === []) {
+            say("  （无）");
+            break;
+        }
+        foreach ($all as $name => $d) {
+            if (isset($explicit[$name])) {
+                $mark = "[x]";
+            } elseif (isset($resolved[$name])) {
+                $mark = "[+]"; // 依赖被带上，不是显式启用
+            } else {
+                $mark = "[ ]";
+            }
+            $desc = isset($d["desc"]) ? (string) $d["desc"] : "";
+            $req = "";
+            if (isset($d["requires"]) && is_array($d["requires"]) && $d["requires"] !== []) {
+                $req = "  依赖: " . implode(",", $d["requires"]);
+            }
+            say("  " . $mark . " " . str_pad($name, 10) . $desc . $req);
+        }
+        say("");
+        say("  [x] 显式启用   [+] 依赖带入   [ ] 未启用");
+        break;
+
+    case "add":
+    case "remove":
+        if ($arg === "") {
+            fail("用法: tsf " . $cmd . " <package>");
+        }
+        $projDir = getcwd();
+        $all = listPackages($tsfRoot);
+        if (!isset($all[$arg])) {
+            fail("没有这个包: " . $arg . "（用 tsf list 查看可用包）");
+        }
+        $proj = readProjectJson($projDir);
+        $pkgs = [];
+        foreach ($proj["packages"] as $p) {
+            $pkgs[] = (string) $p;
+        }
+        if ($cmd === "add") {
+            // 只记显式启用的包；依赖在构建时由 resolvePackages 展开
+            if (!in_array($arg, $pkgs, true)) {
+                $pkgs[] = $arg;
+            }
+        } else {
+            $kept = [];
+            foreach ($pkgs as $p) {
+                if ($p !== $arg) {
+                    $kept[] = $p;
+                }
+            }
+            $pkgs = $kept;
+        }
+        $proj["packages"] = $pkgs;
+        writeProjectJson($projDir, $proj);
+        ok(($cmd === "add" ? "已启用 " : "已移除 ") . $arg . "；当前显式启用: [" . implode(", ", $pkgs) . "]");
+        try {
+            $res = resolvePackages($pkgs, $all);
+            say("构建时的实际包集合: [" . implode(", ", $res) . "]");
+        } catch (\RuntimeException $e) {
+            say("  ! " . $e->getMessage());
+        }
+        say("重新编译后生效: tsf build .");
+        break;
+
+    case "config":
+        // 配置表工具链只在开发机跑（解释执行），不进 AOT 产物。
+        // 所以它可以用 ZipArchive/SimpleXML 读 Excel，而运行期只用 tsf/src/Config/Reader
+        $toolDir = $tsfRoot . "/tools/config";
+        require_once $toolDir . "/Bin.php";
+        require_once $toolDir . "/Field.php";
+        require_once $toolDir . "/Xlsx.php";
+        require_once $toolDir . "/Exporter.php";
+
+        $sub = $arg;
+        $dirArg = isset($argvv[3]) ? (string) $argvv[3] : ".";
+        if ($sub !== "build" && $sub !== "check") {
+            say("用法: tsf config build|check [工程目录]");
+            say("  build  Excel → gen/Config/*.php + build/config/*.bin");
+            say("  check  只校验，不写产物");
+            exit(2);
+        }
+        $projDir = realpath($dirArg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $dirArg);
+        }
+        $exporter = new \TSF\Tool\Config\Exporter($projDir);
+        $rc = $exporter->run($sub === "build");
+        if ($rc === 0 && $sub === "build") {
+            ok("配置表已导出到 " . $projDir . "/build/config");
+        }
+        exit($rc);
+
+    case "proto":
+        // 协议生成：只在开发机跑，产物是 gen/Proto/*.php（会被编进二进制）
+        $toolDir = $tsfRoot . "/tools/proto";
+        require_once $toolDir . "/Parser.php";
+        require_once $toolDir . "/Generator.php";
+
+        $sub = $arg;
+        $dirArg = isset($argvv[3]) ? (string) $argvv[3] : ".";
+        if ($sub !== "build") {
+            say("用法: tsf proto build [工程目录]");
+            say("  读 <工程>/proto/*.proto（proto3 子集），生成 <工程>/gen/Proto/*.php");
+            exit(2);
+        }
+        $projDir = realpath($dirArg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $dirArg);
+        }
+        $files = glob($projDir . "/proto/*.proto");
+        if ($files === false || $files === []) {
+            fail("没有 .proto 文件：" . $projDir . "/proto/");
+        }
+        sort($files);
+
+        $messages = [];
+        $enums = [];
+        $errors = [];
+        foreach ($files as $file) {
+            $src = (string) file_get_contents($file);
+            $p = new \TSF\Tool\Proto\Parser($file);
+            $r = $p->parse($src);
+            foreach ($r["errors"] as $e) {
+                $errors[] = $e;
+            }
+            foreach ($r["messages"] as $m) {
+                $messages[] = $m;
+            }
+            foreach ($r["enums"] as $e) {
+                $enums[] = $e;
+            }
+        }
+        // 注意：这里**不能**因为解析出错就退出——语义校验还要跑（未知类型、协议号冲突…），
+        // 否则用户得改一轮跑一轮。合并见下面
+        $gen = new \TSF\Tool\Proto\Generator([
+            "messages" => $messages,
+            "enums" => $enums,
+            "errors" => [],
+        ]);
+        // 解析出错也要往下跑语义校验：否则用户得先修语法、再跑一次才看到类型错误，
+        // 改一轮跑一轮。这里把两阶段的问题合并成一张清单
+        $gen->validate();
+        $all = $errors;
+        foreach ($gen->errors() as $e) {
+            $all[] = $e;
+        }
+        if ($all !== []) {
+            say("  ✗ 发现 " . count($all) . " 处问题，未生成任何文件：");
+            foreach ($all as $e) {
+                say("    " . $e);
+            }
+            exit(1);
+        }
+
+        $code = $gen->generate();
+
+        $outDir = $projDir . "/gen/Proto";
+        if (!is_dir($outDir) && !mkdir($outDir, 0777, true) && !is_dir($outDir)) {
+            fail("建不了目录 " . $outDir);
+        }
+        $bytes = 0;
+        foreach ($code as $name => $content) {
+            file_put_contents($outDir . "/" . $name, $content);
+            $bytes += strlen($content);
+        }
+        ok("生成 " . count($code) . " 个文件（" . count($messages) . " 个消息 / "
+            . count($enums) . " 个枚举，" . round($bytes / 1024) . " KB）→ gen/Proto/");
+        foreach ($messages as $m) {
+            say("      " . $m["name"] . "  id=" . $m["id"] . "  字段 " . count($m["fields"]));
+        }
+        exit(0);
+
+    case "build":
+        $projDir = $arg === "" ? getcwd() : realpath($arg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $arg);
+        }
+        $code = doBuild($projDir, $tsfRoot, $tpc, $phpBin);
+        if ($code !== 0) {
+            fail("编译失败（exit " . $code . "）");
+        }
+        $binPath = findBinary($projDir);
+        if ($binPath === "") {
+            fail("编译成功但找不到可执行文件");
+        }
+        ok("产物: " . $binPath . "  (" . round(filesize($binPath) / 1024) . " KB)");
+        break;
+
+    case "migrate":
+        // 部署步骤：跑一次就退出。**不要**把它塞进 workerStart——
+        // 多 worker 会同时 CREATE TABLE，靠记录表只能挡"重复执行"，挡不住并发建表。
+        // 生产上可以直接用产物：`./duel migrate`（本项目里就是 tsf migrate 干的事）
+        $projDir = $arg === "" ? getcwd() : realpath($arg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $arg);
+        }
+        // 守卫：没有 migrations/ 的工程不该走这条路。更重要的是——产物里必须有
+        // `migrate` 分支，否则 `./bin migrate` 会被当成"没带参数"直接起服务，
+        // 部署脚本就挂在那里等一个永远不返回的迁移
+        if (!is_dir($projDir . "/migrations")) {
+            fail("这个工程没有 migrations/ 目录，不需要迁移");
+        }
+        $code = doBuild($projDir, $tsfRoot, $tpc, $phpBin);
+        if ($code !== 0) {
+            fail("编译失败（exit " . $code . "）");
+        }
+        $binPath = findBinary($projDir);
+        if ($binPath === "") {
+            fail("编译成功但找不到可执行文件");
+        }
+        ok("执行 " . basename($binPath) . " migrate");
+        $rc = runCmd(escapeshellarg($binPath) . " migrate", $projDir);
+        exit($rc);
+        break;
+
+    case "migrate-status":
+        $projDir = $arg === "" ? getcwd() : realpath($arg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $arg);
+        }
+        if (!is_dir($projDir . "/migrations")) {
+            fail("这个工程没有 migrations/ 目录");
+        }
+        $binPath = findBinary($projDir);
+        if ($binPath === "") {
+            fail("还没编译过：先跑 tsf build");
+        }
+        $rc = runCmd(escapeshellarg($binPath) . " migrate-status", $projDir);
+        exit($rc);
+        break;
+
+    case "serve":
+        $projDir = $arg === "" ? getcwd() : realpath($arg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $arg);
+        }
+        $code = doBuild($projDir, $tsfRoot, $tpc, $phpBin);
+        if ($code !== 0) {
+            fail("编译失败（exit " . $code . "）");
+        }
+        $binPath = findBinary($projDir);
+        if ($binPath === "") {
+            fail("找不到可执行文件");
+        }
+        ok("启动 " . basename($binPath) . "（Ctrl+C 结束）");
+        runCmd(escapeshellarg($binPath), $projDir);
+        break;
+
+    case "watch":
+        $projDir = $arg === "" ? getcwd() : realpath($arg);
+        if ($projDir === false) {
+            fail("目录不存在: " . $arg);
+        }
+
+        say(c("首次编译…", "b"));
+        if (doBuild($projDir, $tsfRoot, $tpc, $phpBin) !== 0) {
+            fail("首次编译失败，先修好再 watch（否则后面每改一次都失败）");
+        }
+
+        // 监听集合直接**从 project.yml 读**：那就是构建输入本身。
+        // 自己另写一份"该监听哪些目录"一定会漂——加了 gen/ 或新包，watch 不知道
+        $paths = watchSourcePaths($projDir);
+        $child = startChild($projDir);
+        $last = watchFingerprint($paths);
+        ok("watch 就绪：" . $last[1] . " 个文件，轮询 " . WATCH_POLL_MS . "ms，Ctrl+C 退出");
+        say(c("  监听：" . implode(" ", $paths), "d"));
+
+        // Ctrl+C 要顺手把子进程收掉，否则留一个孤儿进程占着端口，
+        // 下次 watch 会莫名其妙启动失败
+        if (function_exists("pcntl_async_signals")) {
+            pcntl_async_signals(true);
+            $bye = function (): void {
+                $c = $GLOBALS["tsf_watch_child"] ?? null;
+                if (is_resource($c)) {
+                    @proc_terminate($c, 15);
+                }
+                say("");
+                say("watch 退出");
+                exit(0);
+            };
+            pcntl_signal(SIGINT, $bye);
+            pcntl_signal(SIGTERM, $bye);
+        }
+
+        while (true) {
+            usleep(WATCH_POLL_MS * 1000);
+
+            // 产物自己退出了（崩溃 / 正常结束）：报一次，别死循环重启。
+            // 自动重启一个一启动就崩的程序只会刷屏，还掩盖真正的错误
+            if (is_resource($child)) {
+                $st = proc_get_status($child);
+                if (is_array($st) && isset($st["running"]) && !$st["running"]) {
+                    say(c("[watch] 产物已退出（exit " . (int) $st["exitcode"] . "），等待改动…", "y"));
+                    @proc_close($child);
+                    $child = null;
+                    $GLOBALS["tsf_watch_child"] = null;
+                }
+            }
+
+            $now = watchFingerprint($paths);
+            if ($now[0] === $last[0]) {
+                continue;
+            }
+            // 防抖：编辑器保存往往连着改几个文件（.php + 备份），
+            // 立刻编的话会编到一半的状态，还会连编两次。
+            // 120 ms 是"够等到第二次写"和"别白等"的折中
+            usleep(120000);
+            $paths = watchSourcePaths($projDir);
+            $now = watchFingerprint($paths);
+            $last = $now[0];
+
+            $t0 = hrtime(true);
+            $child = stopChild($child);
+            $tStop = hrtime(true);
+            say(c("[watch] 变更 " . $now[1] . " 个文件，重新编译…", "b"));
+            $code = doBuild($projDir, $tsfRoot, $tpc, $phpBin);
+            $tBuild = hrtime(true);
+            if ($code !== 0) {
+                // 编译失败**不重启**：旧进程已经停了，但与其带着旧二进制跑
+                // （让人误以为改动生效了），不如让它停着，错误就在上面
+                warn("编译失败，已停止；改好会自动重试");
+                continue;
+            }
+            $child = startChild($projDir);
+            $ms = (int) round((float) (hrtime(true) - $t0) / 1000000.0);
+            ok("已重启（总计 " . $ms . " ms：停 " . msOf($t0, $tStop)
+                . " + 编译 " . msOf($tStop, $tBuild)
+                . " + 启动 " . msOf($tBuild, hrtime(true)) . "）");
+        }
+        break;
+
+    default:
+        say("TSF " . TSF_VERSION);
+        say("");
+        say("用法:");
+        say("  tsf new <name>      新建工程");
+        say("  tsf build [dir]     编译");
+        say("  tsf migrate [dir]   跑数据库迁移（部署时执行一次，跑完退出）");
+        say("  tsf migrate-status  只看迁移状态，不写库");
+        say("  tsf serve [dir]     编译并启动");
+        say("  tsf watch [dir]     开发模式（改动自动重编重启）");
+        say("  tsf lint            结构检查（禁 mixed、命名空间与目录一致）");
+        say("  tsf list            列出可选功能包（pkg/）及当前工程启用了哪些");
+        say("  tsf add <pkg>       启用功能包（连带启用其依赖）");
+        say("  tsf remove <pkg>    移除功能包");
+        say("  tsf version         版本");
+        say("");
+        say("环境变量: TPC=<tpc.php 路径>  TSF_PHP=<php 可执行文件>");
+        break;
+}

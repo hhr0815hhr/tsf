@@ -1,0 +1,7 @@
+{
+  "name": "entity",
+  "ns": "TSF\\Entity",
+  "desc": "坐标：Entity（整数坐标 + 速度）+ EntitySet（推进 + 位置变化回调）",
+  "requires": [],
+  "hint": "只要\"有位置的东西\"就需要它，但不需要房间。EntitySet 的回调用闭包接 AOI，所以这个包零依赖"
+}

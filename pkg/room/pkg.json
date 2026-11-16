@@ -1,0 +1,7 @@
+{
+  "name": "room",
+  "ns": "TSF\\Room",
+  "desc": "房间：状态机 + 成员表（含身份与席位，不含坐标）",
+  "requires": ["fsm", "frameloop"],
+  "hint": "要「一局游戏」才用它；只要状态机用 fsm，只要成员管理用 MemberTable。坐标在 entity，视野在 aoi"
+}

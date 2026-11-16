@@ -1,0 +1,7 @@
+{
+  "name": "frameloop",
+  "ns": "TSF\\FrameLoop",
+  "desc": "帧循环（定时投帧 + 可变 delta + 单帧耗时统计）",
+  "requires": [],
+  "hint": "要 50ms 帧同步的玩法用（MOBA/射击/MMO 场景）；棋牌、回合制不需要"
+}
