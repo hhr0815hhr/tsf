@@ -406,6 +406,121 @@ function moduleBuild(string $projDir, string $tpc, string $phpBin): int
     return 0;
 }
 
+/**
+ * 验证套件清单。
+ *
+ * **只收录确实跑过、且能独立跑起来的**。bench/ 下有二十多个 run*.sh，其中不少是
+ * 压测/专项（bot、cluster-bench、probe-*），需要外部条件或跑很久，塞进"一键回归"
+ * 只会让人对结果失去信任——一个长期红的套件等于没有套件。
+ */
+/// 按「显示宽度」补齐：str_pad 按字节算，一个汉字 3 字节会被当成 3 列，
+/// 输出到终端就错位了。
+function padWidth(string $s, int $width): string
+{
+    $len = mb_strlen($s, "UTF-8");
+    return $s . str_repeat(" ", max(0, $width - $len));
+}
+
+function verifySuites(): array
+{
+    return [
+        ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "bench/aot-semantics/run.sh"],
+        ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "bench/swoole-contract/run.sh"],
+        ["id" => "settle", "desc" => "金币账本（91 项）", "sh" => "bench/settle-test/run.sh"],
+        ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "bench/settle-crash/run.sh"],
+        ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "bench/fd-test/run.sh"],
+        ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
+        ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
+        ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
+        ["id" => "wasm", "desc" => "wasm 热更链路（灰度/回滚）", "sh" => "bench/wasm-link/run.sh"],
+    ];
+}
+
+/**
+ * 一键回归。
+ *
+ * 存在意义不是"省几条命令"，而是让「跑没跑过」这件事有唯一答案：
+ * 之前验证散在 9 个目录里，各自的入口、前置条件、判定方式都不一样，
+ * 新人接手时最贵的成本是"不知道有这些脚本"。
+ */
+function verifyRun(string $root, array $argv): int
+{
+    $suites = verifySuites();
+
+    $only = "";
+    $list = false;
+    foreach ($argv as $a) {
+        if ($a === "--list") {
+            $list = true;
+        } elseif (strpos($a, "--only=") === 0) {
+            $only = substr($a, 7);
+        } elseif ($a !== "verify" && $a !== "" && $a[0] !== "-") {
+            $only = $a;
+        }
+    }
+
+    if ($list) {
+        foreach ($suites as $s) {
+            $mark = is_file($root . "/" . $s["sh"]) ? " " : "!";
+            echo $mark . " " . padWidth($s["id"], 14) . $s["desc"] . PHP_EOL;
+        }
+        echo PHP_EOL . "（! 表示脚本不存在）" . PHP_EOL;
+        return 0;
+    }
+
+    $pass = 0;
+    $fail = 0;
+    $skip = 0;
+    $rows = [];
+
+    foreach ($suites as $s) {
+        if ($only !== "" && strpos($s["id"], $only) === false) {
+            continue;
+        }
+        $path = $root . "/" . $s["sh"];
+        if (!is_file($path)) {
+            $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => "SKIP", "ms" => 0, "tail" => "脚本不存在"];
+            $skip++;
+            continue;
+        }
+
+        fwrite(STDERR, "→ " . $s["id"] . " ... ");
+        $t0 = microtime(true);
+        $out = [];
+        $rc = 0;
+        exec("bash " . escapeshellarg($path) . " 2>&1", $out, $rc);
+        $ms = (int) ((microtime(true) - $t0) * 1000);
+
+        $tail = "";
+        if ($rc !== 0) {
+            $tail = implode(" | ", array_slice($out, -4));
+        }
+        $state = $rc === 0 ? "PASS" : "FAIL";
+        if ($rc === 0) {
+            $pass++;
+        } else {
+            $fail++;
+        }
+        fwrite(STDERR, $state . PHP_EOL);
+        $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => $state, "ms" => $ms, "tail" => $tail];
+    }
+
+    echo PHP_EOL;
+    echo padWidth("结果", 6) . padWidth("套件", 15) . padWidth("内容", 34) . "耗时" . PHP_EOL;
+    echo str_repeat("-", 68) . PHP_EOL;
+    foreach ($rows as $r) {
+        $sec = number_format($r["ms"] / 1000, 1) . "s";
+        echo padWidth($r["state"], 6) . padWidth($r["id"], 15) . padWidth($r["desc"], 34) . $sec . PHP_EOL;
+        if ($r["tail"] !== "") {
+            echo "      ↳ " . $r["tail"] . PHP_EOL;
+        }
+    }
+    echo str_repeat("-", 68) . PHP_EOL;
+    echo "通过 " . $pass . " / 失败 " . $fail . " / 跳过 " . $skip . PHP_EOL;
+
+    return $fail === 0 ? 0 : 1;
+}
+
 function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin): int
 {
     if (!is_dir($projDir)) {
@@ -1237,6 +1352,10 @@ switch ($cmd) {
         $rc = runCmd(escapeshellarg($binPath) . " migrate-status", $projDir);
         exit($rc);
         break;
+
+    case "verify":
+        $root = dirname(__DIR__, 2);
+        exit(verifyRun($root, $argv));
 
     case "module":
         $sub = $argv[2] ?? "";
