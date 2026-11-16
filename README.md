@@ -1,7 +1,8 @@
 # TSF — TypePHP Server Framework
 
 > 用 TypePHP（AOT）+ PHP 构建高性能游戏服务器，取代「C++ + Lua」。
-> 当前版本：**v0.1.0-m0（骨架可跑）**
+> 当前版本：**v0.6.0**（M0–M6 已交付；M7 热更未做）
+> 上一版是 2026-11-12 的 v0.1.0-m0（只有骨架）。变更记录见 `../CHANGELOG.md`。
 
 ---
 
