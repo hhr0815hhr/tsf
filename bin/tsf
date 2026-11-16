@@ -258,6 +258,154 @@ function runCmd(string $cmd, string $cwd): int
     return $code;
 }
 
+/// 在 PATH 里找一个可执行文件；找不到返回 null。
+function findInPath(string $name): ?string
+{
+    $path = getenv("PATH");
+    foreach (explode(PATH_SEPARATOR, is_string($path) ? $path : "") as $dir) {
+        if ($dir === "") {
+            continue;
+        }
+        $c = rtrim($dir, "/") . "/" . $name;
+        if (is_file($c) && is_executable($c)) {
+            return $c;
+        }
+    }
+    return null;
+}
+
+/**
+ * wasm 模块的发布流水线：编译 → 预编译 → manifest。
+ *
+ * 之前这四步是手工敲的（tpc 编 wasm、tp-precompile 预编译、拷贝到目标路径、
+ * 设 TP_METHODS 重启），漏一步的现象都很隐蔽：
+ *   - 少了 tp-precompile（用 wasmtime CLI 代替）→ 所有模块加载失败，句柄 -1000
+ *   - 少了工具链检查 → tpc 报 "WASI toolchain check failed"，但不说缺什么
+ *
+ * 所以这一版把「检查 + 编译 + 预编译 + 记账」串成一条命令，产出可发布的 dist/。
+ */
+function moduleBuild(string $projDir, string $tpc, string $phpBin): int
+{
+    $ymlPath = $projDir . "/project.yml";
+    if (!is_file($ymlPath)) {
+        fwrite(STDERR, "没有 project.yml：先跑 tsf build 生成一次，或手写一份" . PHP_EOL);
+        return 1;
+    }
+    $yml = (string) file_get_contents($ymlPath);
+
+    if (!preg_match("/^name:\s*(\S+)/m", $yml, $m)) {
+        fwrite(STDERR, "project.yml 里没有 name" . PHP_EOL);
+        return 1;
+    }
+    $name = $m[1];
+    if (!preg_match("/^wasm:\s*\S+/m", $yml)) {
+        fwrite(STDERR, "这不是 wasm 模块工程：project.yml 缺少 wasm: component" . PHP_EOL);
+        return 1;
+    }
+
+    // 工具链检查：缺什么就说什么，不要让 tpc 抛一句笼统的 check failed
+    $missing = [];
+    $tools = ["wasm32-wasip2-clang", "wasmtime", "wit-bindgen"];
+    foreach ($tools as $tool) {
+        if (findInPath($tool) === null) {
+            $missing[] = $tool;
+        }
+    }
+    if ($missing !== []) {
+        fwrite(STDERR, "缺 WASI 工具链：" . implode(", ", $missing) . PHP_EOL);
+        fwrite(STDERR, "  需要：wasi-sdk（clang >= 22）、wasmtime CLI、wit-bindgen-cli 0.60，且都在 PATH 里" . PHP_EOL);
+        fwrite(STDERR, "  注意 clang 版本：SDK 太旧 tpc 会直接拒绝（它要求 22+）" . PHP_EOL);
+        return 1;
+    }
+
+    $old = getcwd();
+    chdir($projDir);
+
+    echo "1/3 编译 wasm component ..." . PHP_EOL;
+    $cmd = $phpBin . " " . escapeshellarg($tpc) . " project.yml";
+    passthru($cmd, $rc);
+    if ($rc !== 0) {
+        chdir($old);
+        fwrite(STDERR, "编译失败" . PHP_EOL);
+        return 1;
+    }
+
+    $wasm = $projDir . "/" . $name . ".wasm";
+    if (!is_file($wasm)) {
+        chdir($old);
+        fwrite(STDERR, "没找到产物：" . $wasm . PHP_EOL);
+        return 1;
+    }
+
+    // 预编译工具：优先 TSF_PRECOMPILE，其次从 ld-flags 的 -L 目录里找。
+    // 必须用它，不能用 wasmtime CLI——fuel/epoch 是编译期插桩，产物带 fingerprint，
+    // 配置不一致宿主直接拒绝启动（现象是所有模块句柄变 -1000，极难联想到预编译参数）。
+    $pre = getenv("TSF_PRECOMPILE");
+    if (!is_string($pre) || $pre === "" || !is_executable($pre)) {
+        $pre = "";
+        // 模块工程通常没有 ld-flags（它不链接宿主库），所以先在 PATH 里找。
+        // 部署机上把宿主的 target/release 加进 PATH，或者设 TSF_PRECOMPILE 都行。
+        $found = findInPath("tp-precompile");
+        if ($found !== null) {
+            $pre = $found;
+        }
+        preg_match_all("/-L(\S+)/", $yml, $lm);
+        foreach ($lm[1] as $dir) {
+            if (is_executable($dir . "/tp-precompile")) {
+                $pre = $dir . "/tp-precompile";
+                break;
+            }
+        }
+    }
+    if ($pre === "") {
+        chdir($old);
+        fwrite(STDERR, "找不到 tp-precompile：" . PHP_EOL);
+        fwrite(STDERR, "  用 TSF_PRECOMPILE 指定，或在 project.yml 的 ld-flags 里保留 -L<目录>" . PHP_EOL);
+        return 1;
+    }
+
+    $dist = $projDir . "/dist";
+    if (!is_dir($dist)) {
+        mkdir($dist, 0775, true);
+    }
+    $cwasm = $dist . "/" . $name . ".cwasm";
+
+    echo "2/3 预编译（" . basename($pre) . "）..." . PHP_EOL;
+    // tp-precompile 的用法是 `tp-precompile <in> <out>`，没有 build 子命令
+    // （precompile.sh 里的 build/verify 是它自己的分支，不是工具的参数）
+    passthru(escapeshellarg($pre) . " " . escapeshellarg($wasm) . " " . escapeshellarg($cwasm), $rc);
+    chdir($old);
+    if ($rc !== 0 || !is_file($cwasm)) {
+        fwrite(STDERR, "预编译失败" . PHP_EOL);
+        return 1;
+    }
+
+    echo "3/3 写 manifest ..." . PHP_EOL;
+    $clang = trim((string) shell_exec("wasm32-wasip2-clang --version 2>/dev/null | head -1"));
+    $wtime = trim((string) shell_exec("wasmtime --version 2>/dev/null | head -1"));
+    $manifest = [
+        "name" => $name,
+        "wasm" => basename($wasm),
+        "wasm_sha256" => hash_file("sha256", $wasm),
+        "cwasm" => basename($cwasm),
+        "cwasm_sha256" => hash_file("sha256", $cwasm),
+        "cwasm_bytes" => filesize($cwasm),
+        "built_at" => date("c"),
+        "toolchain" => [
+            "clang" => $clang,
+            "wasmtime" => $wtime,
+        ],
+    ];
+    $mf = $dist . "/" . $name . ".manifest.json";
+    file_put_contents($mf, json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+
+    echo "OK  " . $dist . PHP_EOL;
+    echo "    " . basename($cwasm) . "  " . number_format((int) $manifest["cwasm_bytes"]) . " 字节" . PHP_EOL;
+    echo "    " . basename($mf) . PHP_EOL;
+    echo "    校验和：" . substr((string) $manifest["cwasm_sha256"], 0, 16) . "..." . PHP_EOL;
+    return 0;
+}
+
 function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin): int
 {
     if (!is_dir($projDir)) {
@@ -1089,6 +1237,15 @@ switch ($cmd) {
         $rc = runCmd(escapeshellarg($binPath) . " migrate-status", $projDir);
         exit($rc);
         break;
+
+    case "module":
+        $sub = $argv[2] ?? "";
+        if ($sub !== "build") {
+            fwrite(STDERR, "用法: tsf module build [dir]" . PHP_EOL);
+            exit(1);
+        }
+        $dir = isset($argv[3]) ? $argv[3] : ".";
+        exit(moduleBuild(realpath($dir) ?: $dir, $tpc, $phpBin));
 
     case "serve":
         $projDir = $arg === "" ? getcwd() : realpath($arg);
