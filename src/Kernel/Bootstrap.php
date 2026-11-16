@@ -32,8 +32,11 @@ final class Bootstrap
         }
 
         // 1) 配置
+        // `${base}` 在这里展开成工程目录：示例的 tsf.json 里有日志/库/快照的路径，
+        // 不展开的话仓库换个位置跑就会写回原目录（见 Config::expandBase 的注释）
         $cfgDir = $baseDir . "/config";
         Config::load($cfgDir, self::$env);
+        Config::expandBase($baseDir);
 
         // 2) 日志
         $logFile = Config::getString("log.file", $baseDir . "/var/log/" . $channel . ".log");
@@ -42,8 +45,8 @@ final class Bootstrap
         $logStdout = Config::getBool("log.stdout", false);
         Logger::init($channel, $logFile, $logLevel, $logStdout);
 
-        // 3) 基础信息不走容器：baseDir/env 由 Bootstrap 自己的访问器提供，
-        //    容器只装服务（object），免得容器退化成"什么都能塞"的键值缓存。
+        // 3) 基础信息不放进任何全局注册表：baseDir/env 由 Bootstrap 自己的访问器提供。
+        //    （曾经有个 Container，已删——静态容器是隐式共享，和"只发消息"的模型冲突。）
         self::$booted = true;
         Logger::info("boot", [
             "env" => self::$env,

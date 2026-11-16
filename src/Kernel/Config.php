@@ -184,4 +184,30 @@ final class Config
     {
         return self::$env;
     }
+
+    /**
+     * 把配置值里的 `${base}` 换成本次启动的工程目录。
+     *
+     * 为什么需要：示例工程的 `tsf.json` 里写的是日志、sqlite、快照的绝对路径。
+     * 绝对路径让配置**不可搬迁**——仓库 clone 到别处跑起来，会悄悄把日志和库写回
+     * 原来那个目录，看起来一切正常，实际在污染另一棵树。
+     *
+     * 用占位符而不是相对路径：相对路径依赖进程的工作目录，`./demo/duel/duel` 从根目录
+     * 起就会把数据写到根目录；工程目录是**编译期/启动期就确定**的，不依赖 cwd。
+     *
+     * 不是模板引擎：只做一次字面替换，认不出占位符就当普通字符串。
+     */
+    public static function expandBase(string $base): void
+    {
+        $marker = '${base}';
+        $out = [];
+        foreach (self::$flat as $k => $v) {
+            if (is_string($v) && str_contains($v, $marker)) {
+                $out[$k] = str_replace($marker, $base, $v);
+            } else {
+                $out[$k] = $v;
+            }
+        }
+        self::$flat = $out;
+    }
 }
