@@ -519,6 +519,26 @@ Cannot re-assign variable from `php::Str` to `php::Int`
 对策：要么别混用（字符串比较用 `===` 自己判，走 `T::ok`），要么给不同类型各写一个函数。
 这条也解释了为什么框架里很多地方宁可写 `T::ok($a === $b, ...)` 而不是更漂亮的 `T::eq`。
 
+### 5.2.2 两个"不报错但不干活"的坑
+
+**`Swoole\Timer::tick` 的回调必须声明 `int $timerId`。**
+
+```php
+// 错：注册成功、返回 timerId，但一次都不触发。没有任何报错。
+\Swoole\Timer::tick(1000, function (): void { ... });
+
+// 对：
+\Swoole\Timer::tick(1000, function (int $timerId): void { ... });
+```
+
+AOT 下闭包的函数签名是固定生成的，Swoole 调回调时会传 timerId，空参闭包在这里
+静默失败。排查花了很久：日志里没有异常，只能靠"回调里写个探针文件"确认它到底跑没跑。
+
+**`Gateway::send()` 在 `payload: raw` 时必须传字符串。**
+传数组会抛 `payload=raw 时业务消息必须是 string`——而消息 handler 外面有 try/catch，
+异常被吞掉，表现是"服务端什么也没发、客户端一直等"。凡是 handler 里主动发消息的地方，
+都要自己确认载荷形态和协议配置一致。
+
 ### 5.3 不要依赖"改 PHP 文件即生效"
 
 `embedded-files` 的运行时 `require` 是从**构建期生成的 opcode 表**加载，改磁盘文件不生效；`eval()` 与动态 `include` 对 AOT/Native Class 不可用。

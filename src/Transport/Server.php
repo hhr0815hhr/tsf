@@ -82,6 +82,8 @@ abstract class Server
         $this->onWorkerStart[] = $cb;
     }
 
+
+
     /** 把已注册的 worker 启动钩子依次跑一遍（子类在 Swoole 的 workerStart 里调） */
     protected function fireWorkerStart(int $workerId): void
     {
@@ -93,6 +95,18 @@ abstract class Server
     }
 
     abstract public function start(): void;
+
+    /**
+     * 让服务器**优雅退出**：停止 accept，worker 处理完当前事件后退出。
+     *
+     * 存在的理由见 `demo/duel` 的 drain 流程——节点退役不是"能关就关"，
+     * 要等房间打完（否则玩家的对局全靠快照恢复，白丢一局）。
+     * 默认什么也不做，是为了让"没有实现关闭能力"的传输在调用处暴露成
+     * "关不掉"而不是"看起来关了"。
+     */
+    public function shutdown(): void
+    {
+    }
 
     /**
      * 按 max_conn 抬高 PHP 的 memory_limit。

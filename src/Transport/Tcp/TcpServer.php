@@ -102,4 +102,16 @@ final class TcpServer extends Server
     {
         return $this->server;
     }
+
+    /**
+     * 优雅退出：Swoole 会先停止 accept，等当前事件处理完再退出。
+     * 调用方负责先停止接新业务（见 demo/duel 的 drain 流程），这里只负责"关"。
+     */
+    public function shutdown(): void
+    {
+        if ($this->server !== null) {
+            $this->server->shutdown();
+        }
+    }
+
 }
