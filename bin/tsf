@@ -458,7 +458,10 @@ function verifyRun(string $root, array $argv): int
 
     $only = "";
     $list = false;
-    foreach ($argv as $a) {
+    // argv[0] 是脚本路径、argv[1] 是子命令名，都不该参与过滤。
+    // 不 slice 的话，裸 `tsf verify` 会把脚本路径当成 only 去匹配套件 id，
+    // 结果一个套件都不跑、还报「通过 0 / 失败 0 / 跳过 0」——看着像"全绿"。
+    foreach (array_slice($argv, 2) as $a) {
         if ($a === "--list") {
             $list = true;
         } elseif (strpos($a, "--only=") === 0) {
