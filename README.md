@@ -79,7 +79,7 @@ php85 client.php 9001
 swap / call2 / stats`，灰度用 hash(key) 确定性分流）、`tsf module build` 一条命令出包
 （cwasm + manifest）、全量与回滚双向可逆（3.5–5.5 ms）。**未做**：L1（C++ 函数级，
 工程上不可行）、T7-04 的「发布 → drain → 重启 → 恢复」一条命令串联（drain 与重连
-本身已验收）。详见 `../DESIGN-WASM-HOTRELOAD.md`。
+本身已验收）。详见 `../docs/DESIGN-WASM-HOTRELOAD.md`。
 其余曾列在这里的「RPC 框架、集群成员管理、配置表导出、监控指标、迁移工具、
 房间快照、事件日志」都已交付，见上表对应行——这段曾经漏改，一直写到 2026-11 才修。
 
@@ -553,7 +553,7 @@ AOT 抛 `ArgumentCountError`），而 Swoole 固定按自己的参数个调回�
 
 `embedded-files` 的运行时 `require` 是从**构建期生成的 opcode 表**加载，改磁盘文件不生效；`eval()` 与动态 `include` 对 AOT/Native Class 不可用。
 
-**热更只能走三条路**：配置数据（运行期读文件）、wasm 模块（E1 已验证）、滚动重启。详见 `../FRAMEWORK-TASK.md` §1.4。
+**热更只能走三条路**：配置数据（运行期读文件）、wasm 模块（E1 已验证）、滚动重启。详见 `../docs/FRAMEWORK-TASK.md` §1.4。
 
 ### 5.4 静态调用的返回值直接用，不要链式下钻
 
