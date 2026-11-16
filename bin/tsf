@@ -26,7 +26,10 @@ const TSF_VERSION = "0.6.0";
 $tsfRoot = dirname(__DIR__);
 $tpc = getenv("TPC");
 if ($tpc === false || $tpc === "") {
-    $tpc = "/home/hhr/typephp-src/bin/tpc.php";
+    // 默认位置：$HOME/typephp-src。用 getenv 而不是 "$HOME/..."——
+    // 双引号里那是 PHP 变量插值，未定义变量会变成空串，静默拼成 /typephp-src/...
+    $home = getenv("HOME");
+    $tpc = (is_string($home) && $home !== "" ? $home : "") . "/typephp-src/bin/tpc.php";
 }
 $phpBin = getenv("TSF_PHP");
 if ($phpBin === false || $phpBin === "") {
