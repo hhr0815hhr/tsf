@@ -21,7 +21,7 @@
  *   tsf version
  */
 
-const TSF_VERSION = "0.6.0";
+const TSF_VERSION = "0.7.0";
 
 $tsfRoot = dirname(__DIR__);
 $tpc = getenv("TPC");

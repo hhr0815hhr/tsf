@@ -1,7 +1,7 @@
 # TSF — TypePHP Server Framework
 
 > 用 TypePHP（AOT）+ PHP 构建高性能游戏服务器，取代「C++ + Lua」。
-> 当前版本：**v0.6.0**（M0–M6 已交付；M7 热更未做）
+> 当前版本：**v0.7.0**（M0–M6 全交付；M7 的模块级热更 T7-01/02/03/05 已落地，T7-04 零件齐但未串联，L1 不做）
 > 上一版是 2026-11-12 的 v0.1.0-m0（只有骨架）。变更记录见 `../CHANGELOG.md`。
 
 ---
@@ -75,7 +75,11 @@ php85 client.php 9001
 | **事件日志** | 📦 包 | `pkg/eventlog`：追加写 + 两档持久性；**1,000 笔 kill -9 零丢失**，追加 2.6 µs/条（§12.9）。已接进 `demo/duel` 做金币结算：**5 轮随机 kill -9，余额与日志始终一致、无重复（§25）** |
 | CLI | ✅ | `new` / `build` / `serve` / `watch` / `migrate` / `migrate-status` / `list` / `add` / `remove` / `lint` / `version` |
 
-**尚未实现**（见 `../FRAMEWORK-TASK.md`）：只有 wasm 三级热更（M7）。
+**wasm 热更（M7）**：模块级热更已可用——`tsf/pkg/wasm`（`Module::load / canary /
+swap / call2 / stats`，灰度用 hash(key) 确定性分流）、`tsf module build` 一条命令出包
+（cwasm + manifest）、全量与回滚双向可逆（3.5–5.5 ms）。**未做**：L1（C++ 函数级，
+工程上不可行）、T7-04 的「发布 → drain → 重启 → 恢复」一条命令串联（drain 与重连
+本身已验收）。详见 `../DESIGN-WASM-HOTRELOAD.md`。
 其余曾列在这里的「RPC 框架、集群成员管理、配置表导出、监控指标、迁移工具、
 房间快照、事件日志」都已交付，见上表对应行——这段曾经漏改，一直写到 2026-11 才修。
 
