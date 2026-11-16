@@ -13,10 +13,36 @@ namespace TSF\Metrics;
  * 计数器也能有 count（等于它的值），直方图也有 value（等于均值），
  * 导出表格时不用按类型分支取值。
  */
+/**
+ * 指标类型。
+ *
+ * 用 enum 而不是三个字符串常量：以后加一种类型（比如 summary），
+ * `match` 的穷尽性会让所有漏分支的地方**编译期**报错；
+ * 字符串常量只会静默走到默认分支，等线上看板数字不对才发现。
+ *
+ * 注意：enum case 在 AOT 下是对象而非标量常量，所以这里换来的是类型安全，
+ * **不是**比较速度——不要把它当性能优化。
+ */
+enum MetricKind
+{
+    case Counter;
+    case Gauge;
+    case Histogram;
+
+    /** 导出用的短名（日志表格、Prometheus 的 type 字段） */
+    public function label(): string
+    {
+        return match ($this) {
+            self::Counter => "counter",
+            self::Gauge => "gauge",
+            self::Histogram => "histogram",
+        };
+    }
+}
+
 final class MetricSnapshot
 {
-    /** counter | gauge | histogram */
-    public string $kind = "counter";
+    public MetricKind $kind = MetricKind::Counter;
 
     public string $name = "";
 

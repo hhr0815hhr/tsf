@@ -190,7 +190,7 @@ final class Metrics
             $s->name = $name;
             $h = self::$hists[$name] ?? null;
             if ($h !== null) {
-                $s->kind = "histogram";
+                $s->kind = MetricKind::Histogram;
                 $s->count = $h->count;
                 $s->sum = $h->sum;
                 $s->max = $h->max;
@@ -204,14 +204,14 @@ final class Metrics
                 continue;
             }
             if (isset(self::$gauges[$name])) {
-                $s->kind = "gauge";
+                $s->kind = MetricKind::Gauge;
                 $s->count = 1;
                 $s->value = self::$gauges[$name];
                 $s->max = self::$gaugeMax[$name] ?? $s->value;
                 $out[] = $s;
                 continue;
             }
-            $s->kind = "counter";
+            $s->kind = MetricKind::Counter;
             $s->count = 1;
             $s->value = (float) (self::$counters[$name] ?? 0);
             $out[] = $s;
@@ -232,7 +232,7 @@ final class Metrics
         $head = sprintf("%-24s %-10s %8s %10s %10s %10s %10s %10s", "NAME", "KIND", "COUNT", "MEAN", "P50", "P90", "P99", "MAX");
         $out .= $head . PHP_EOL;
         foreach ($snap as $s) {
-            if ($s->kind === "counter") {
+            if ($s->kind === MetricKind::Counter) {
                 $out .= sprintf(
                     "%-24s %-10s %8s %10s %10s %10s %10s %10s",
                     $s->name,
@@ -246,7 +246,7 @@ final class Metrics
                 ) . PHP_EOL;
                 continue;
             }
-            if ($s->kind === "gauge") {
+            if ($s->kind === MetricKind::Gauge) {
                 $out .= sprintf(
                     "%-24s %-10s %8s %10s %10s %10s %10s %10s",
                     $s->name,
