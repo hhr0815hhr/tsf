@@ -534,6 +534,12 @@ Cannot re-assign variable from `php::Str` to `php::Int`
 AOT 下闭包的函数签名是固定生成的，Swoole 调回调时会传 timerId，空参闭包在这里
 静默失败。排查花了很久：日志里没有异常，只能靠"回调里写个探针文件"确认它到底跑没跑。
 
+**根因后来被测出来了**：AOT 对闭包实参个数是**严格**的（PHP 会忽略多余实参，
+AOT 抛 `ArgumentCountError`），而 Swoole 固定按自己的参数个调回调，异常被事件循环
+吞掉就成了"注册成功、一次不触发"。这不是 Swoole 的怪癖，是"PHP 宽松 / AOT 严格"
+的一般性差异——`bench/aot-semantics` 里有 45 个用例专门对照这件事，
+**凡注册给框架或 Swoole 的回调，形参必须精确匹配**。
+
 **`Gateway::send()` 在 `payload: raw` 时必须传字符串。**
 传数组会抛 `payload=raw 时业务消息必须是 string`——而消息 handler 外面有 try/catch，
 异常被吞掉，表现是"服务端什么也没发、客户端一直等"。凡是 handler 里主动发消息的地方，
