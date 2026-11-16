@@ -186,6 +186,38 @@ final class Grid
     }
 
     /**
+     * 批量算邻居：**同一格的玩家共享一次 9 格扫描**。
+     *
+     * 为什么值得：同一格里的所有玩家，3×3 范围完全一样。逐人调 neighbors() 时，
+     * 同格 N 个玩家要把同一批格子扫 N 遍；这里每个格子只扫一遍，N 个玩家共用结果。
+     * 收益直接等于「同格玩家数」——出生点、战斗区这类密集场景收益最大；
+     * 全散开时每格只有 1 人，收益为零（此时不如逐个调，省了遍历 uids 的开销）。
+     *
+     * 返回的是**共享数组**（PHP 数组赋值是写时复制）。调用方只读没问题；
+     * 要排除自己或做任何修改，先自己拷一份。
+     *
+     * @param array<int, int> $uids uid => uid（与 neighborsOfKey() 的返回同构，可直接喂）
+     * @return array<int, array<int, int>> uid => 邻居集合
+     */
+    public function neighborsShared(array $uids): array
+    {
+        $cache = [];
+        $out = [];
+        foreach ($uids as $uid => $_) {
+            if (!isset($this->cellOf[$uid])) {
+                $out[$uid] = [];
+                continue;
+            }
+            $k = $this->cellOf[$uid];
+            if (!isset($cache[$k])) {
+                $cache[$k] = $this->neighborsOfKey($k);
+            }
+            $out[$uid] = $cache[$k];
+        }
+        return $out;
+    }
+
+    /**
      * 按格子 key 取 3×3 范围内的所有实体（含该格自己）。
      *
      * 单独开这个方法是为了"移动后还能拿到移动前的邻居"：move() 返回旧 key，
