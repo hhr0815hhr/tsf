@@ -51,21 +51,40 @@ final class Restorer
     /**
      * 恢复某一类快照。
      *
-     * @param \Closure $rebuild (Snapshot): bool —— 返回 false 表示这条数据不可用
-     * @param bool     $dropBad 解不出来/重建失败时是否删掉快照
+     * @param \Closure     $rebuild (Snapshot): bool —— 返回 false 表示这条数据不可用
+     * @param bool         $dropBad 解不出来/重建失败时是否删掉快照
+     * @param ?\Closure    $accept  (int $key): bool —— **过滤归属**，返回 false 表示"不是我的"
      *
-     * @return array{done: int, skipped: int, ms: int, slow: bool}
+     * `$accept` 单独一个参数，而不是让 `$rebuild` 返回 false 来跳过，是因为两者语义不同：
+     * `$rebuild` 返回 false 意味着"这条数据坏了，可以删"（`$dropBad` 时会真删）。
+     * 拿它来跳过别人的房间会把**别的节点的快照删掉**——多节点下这是数据丢失，
+     * 而且不报错，只在那个节点的玩家回不来时才被发现。
+     *
+     * @return array{done: int, skipped: int, not_mine: int, ms: int, slow: bool}
      */
-    public function restore(Store $store, string $kind, \Closure $rebuild, bool $dropBad = true): array
-    {
+    public function restore(
+        Store $store,
+        string $kind,
+        \Closure $rebuild,
+        bool $dropBad = true,
+        ?\Closure $accept = null
+    ): array {
         $t0 = hrtime(true);
         $keys = $store->keys($kind);
+        $notMine = 0;
         $done = 0;
         $skipped = 0;
         $i = 0;
         $slow = false;
 
         foreach ($keys as $id) {
+            // 归属过滤放在 get() 之前：不属于本节点的快照连读都不读，
+            // 更不能走到下面任何一条 delete 分支
+            if ($accept !== null && !$accept($id)) {
+                $notMine++;
+                continue;
+            }
+
             $snap = $store->get($kind, $id);
             if ($snap === null) {
                 // 版本不符或文件损坏：删掉，否则每次启动都要在这里卡一下
@@ -99,6 +118,12 @@ final class Restorer
             $slow = true;
         }
 
-        return ["done" => $done, "skipped" => $skipped, "ms" => $ms, "slow" => $slow];
+        return [
+            "done" => $done,
+            "skipped" => $skipped,
+            "not_mine" => $notMine,
+            "ms" => $ms,
+            "slow" => $slow,
+        ];
     }
 }
