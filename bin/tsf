@@ -189,6 +189,14 @@ function genProjectYml(string $projDir, string $tsfRoot): string
         if (is_dir($pdir)) {
             $lines[] = "  - " . $pdir;
         }
+        // 带原生部分的包（例如 wasm 桥接）把 PHP 存根和 C++ 分开放：
+        // 混进 src/ 会让两边的处理规则互相干扰（.cc 被当 PHP、.php 被当 C++ 都不是第一次了）
+        foreach (["php-src", "cpp-src"] as $sub) {
+            $sd = $tsfRoot . "/pkg/" . $name . "/" . $sub;
+            if (is_dir($sd)) {
+                $lines[] = "  - " . $sd;
+            }
+        }
     }
 
     if (is_dir($src)) {
@@ -215,6 +223,24 @@ function genProjectYml(string $projDir, string $tsfRoot): string
         $lines[] = "  - " . $projDir . "/gen";
     }
     $lines[] = "  - " . $projDir . "/main.php";
+    // 链接参数：由工程自己声明。链接哪些库、rpath 指向哪里是「部署形态」决定的，
+    // 放进 pkg 没有意义（同一个包在测试机上和在服务器上链的路径不同）。
+    // 之前这里不生成 ld-flags，导致「启用 wasm 包」的工程根本链不上 libtp_host——
+    // 手写 project.yml 能过，tsf build 就过不了，而且报的是链接错误，很难联想到生成器。
+    if (isset($proj["ld-flags"]) && is_array($proj["ld-flags"])) {
+        $flags = [];
+        foreach ($proj["ld-flags"] as $f) {
+            if (is_string($f) && $f !== "") {
+                $flags[] = $f;
+            }
+        }
+        if ($flags !== []) {
+            $lines[] = "ld-flags: |";
+            foreach ($flags as $f) {
+                $lines[] = "  " . $f;
+            }
+        }
+    }
     return implode("\n", $lines) . "\n";
 }
 
