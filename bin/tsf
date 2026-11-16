@@ -262,7 +262,15 @@ function runCmd(string $cmd, string $cwd): int
 function findInPath(string $name): ?string
 {
     $path = getenv("PATH");
-    foreach (explode(PATH_SEPARATOR, is_string($path) ? $path : "") as $dir) {
+    $dirs = explode(PATH_SEPARATOR, is_string($path) ? $path : "");
+    // cargo install 的产物落在 ~/.cargo/bin，默认不在 PATH 里（cargo 本身也不在）。
+    // 不兜这一步，wit-bindgen 会被误判成没装——而 preflight 脚本又会判成装了，
+    // 两处标准不一致比两边都错更难查。
+    $home = getenv("HOME");
+    if (is_string($home) && $home !== "") {
+        $dirs[] = $home . "/.cargo/bin";
+    }
+    foreach ($dirs as $dir) {
         if ($dir === "") {
             continue;
         }
@@ -432,7 +440,8 @@ function verifySuites(): array
         ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
-        ["id" => "wasm", "desc" => "wasm 热更链路（灰度/回滚）", "sh" => "bench/wasm-link/run.sh"],
+        ["id" => "wasm", "desc" => "wasm 热更链路（灰度/回滚）", "sh" => "bench/wasm-link/run.sh",
+         "needs" => ["wasm32-wasip2-clang", "wasmtime", "wit-bindgen"]],
     ];
 }
 
@@ -477,6 +486,23 @@ function verifyRun(string $root, array $argv): int
         if ($only !== "" && strpos($s["id"], $only) === false) {
             continue;
         }
+        // 依赖外部工具链的套件：缺了就跳过，别让它把整套判成失败。
+        // 一个因为环境没配而永远红的套件，会让人学会忽略整个 CI。
+        if (isset($s["needs"])) {
+            $lack = [];
+            foreach ($s["needs"] as $tool) {
+                if (findInPath($tool) === null) {
+                    $lack[] = $tool;
+                }
+            }
+            if ($lack !== []) {
+                $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => "SKIP", "ms" => 0, "tail" => "缺 " . implode(",", $lack)];
+                $skip++;
+                fwrite(STDERR, "→ " . $s["id"] . " ... SKIP（缺 " . implode(",", $lack) . "）" . PHP_EOL);
+                continue;
+            }
+        }
+
         $path = $root . "/" . $s["sh"];
         if (!is_file($path)) {
             $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => "SKIP", "ms" => 0, "tail" => "脚本不存在"];
