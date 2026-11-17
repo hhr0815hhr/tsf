@@ -23,26 +23,26 @@ use TSF\Fsm\Machine;
  * Room 不判断"什么状态能进人""什么状态该推帧"——那些是业务语义。它只在
  * 明确被要求时做事：`close()` 之后不再收人，其余一概不管。
  */
-final class Room
+class Room
 {
-    private int $id;
+    protected int $id;
 
     /** 业务注入的状态机；为 null 时用 setState() 自己维护一个裸状态值 */
-    private ?Machine $fsm = null;
+    protected ?Machine $fsm = null;
 
-    private MemberTable $members;
+    protected MemberTable $members;
 
-    private int $frame = 0;
+    protected int $frame = 0;
 
-    private int $elapsedMs = 0;
+    protected int $elapsedMs = 0;
 
-    private bool $closed = false;
+    protected bool $closed = false;
 
     /** @var array<int, string> 状态号 → 名字，业务注册 */
-    private array $names = [];
+    protected array $names = [];
 
     /** 没有状态机时的裸状态值 */
-    private int $bareState = 0;
+    protected int $bareState = 0;
 
     /**
      * @param Machine|null $fsm 业务的状态机。不传则用裸状态值（setState/getState）
