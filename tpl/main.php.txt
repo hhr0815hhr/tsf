@@ -1,0 +1,160 @@
+<?php
+
+use TSF\Kernel\AppConfig;
+use TSF\Kernel\Bootstrap;
+use TSF\Kernel\Logger;
+use TSF\Gateway\Gateway;
+use TSF\Gateway\RateLimiter;
+use TSF\Gateway\SessionManager;
+use TSF\Gateway\TokenAuth;
+use TSF\Protocol\Msg;
+use TSF\Protocol\ProtocolStack;
+use TSF\Transport\Server;
+use TSF\Transport\ServerFactory;
+
+/**
+ * 启动流程拆成六步，每步一个函数：
+ *
+ *   main()              串联，十来行
+ *   AppConfig::load()   读配置（不再散落各处的 Config::get*）
+ *   buildProtocol()     协议栈
+ *   buildServer()       传输层
+ *   buildGateway()      会话 / 鉴权 / 限流
+ *   registerHandlers()  业务处理器
+ *
+ * 拆开的原因不只是"好看"：想单独验证协议栈装配对不对时，可以直接调
+ * buildProtocol()，不用把整个服务拉起来、占端口、连客户端。都焊在一个
+ * 函数里就只能整体跑。
+ */
+function main(): void
+{
+    $base = __DIR__;
+    Bootstrap::boot($base, "app");
+    Bootstrap::ensureDirs([$base . "/var/log"]);
+
+    $cfg = AppConfig::load();
+    $proto = buildProtocol($cfg);
+    $server = buildServer($cfg, $proto);
+
+    // 压测对照：跳过会话 / 限流 / 心跳，直连 onFrame。
+    // 生产不要关 —— 那样就没有鉴权、限流和空闲回收了。
+    if (!$cfg->gateway) {
+        runBenchMode($server, $cfg);
+        return;
+    }
+
+    $gw = buildGateway($cfg, $server, $proto);
+    registerHandlers($gw, $proto);
+    $gw->boot();
+
+    logReady($cfg, $proto);
+    $server->start();
+}
+
+/** 分帧 + 消息体，两层都可换（配置即可，不改代码） */
+function buildProtocol(AppConfig $cfg): ProtocolStack
+{
+    return ProtocolStack::fromConfig($cfg->frameName, $cfg->payloadName);
+}
+
+/**
+ * 传输层：tcp 或 ws。
+ *
+ * 走工厂而不是在 if/else 里分别 new：AOT 下局部变量的类型由首次赋值推断，
+ * 分支里分别赋 TcpServer / WsServer 会报 "Cannot re-assign typed object"。
+ * 工厂返回类型统一是 Server，所以这里能声明返回类型。
+ */
+function buildServer(AppConfig $cfg, ProtocolStack $proto): Server
+{
+    return ServerFactory::make(
+        $cfg->transport,
+        $cfg->host,
+        $cfg->port,
+        $proto->frame(),
+        $cfg->serverOpts()
+    );
+}
+
+function buildGateway(AppConfig $cfg, Server $server, ProtocolStack $proto): Gateway
+{
+    $sessions = new SessionManager($cfg->heartbeatSec);
+    $auth = new TokenAuth($cfg->authTokens, $cfg->authSecret);
+    $limiter = new RateLimiter($cfg->ratePerSec, $cfg->rateBurst);
+
+    // payload 为 raw 时不往 Gateway 传编解码器 —— 省掉每帧一次空转
+    $codec = null;
+    if ($proto->payloadName() !== "raw") {
+        $codec = $proto->payload();
+    }
+
+    $gw = new Gateway(
+        $server,
+        $sessions,
+        $auth,
+        $limiter,
+        $cfg->heartbeatSec,
+        1000,
+        $cfg->requireAuth,
+        $codec
+    );
+    $gw->setSendFailLimit($cfg->sendFailLimit);
+    return $gw;
+}
+
+/**
+ * 业务处理器。
+ *
+ * 用 $gw->send 而不是 $server->sendFrame：只有经过 Gateway 才能统计发送失败、
+ * 触发背压。
+ *
+ * handler 的载荷参数按 payload 选具体类型（全框架不出现 mixed）：
+ *   payload=raw  -> string $body
+ *   其他 payload -> string|array|object $data
+ *
+ * 两种签名不能合并成一个：AOT 下闭包的参数类型是硬约束，反过来会崩。
+ */
+function registerHandlers(Gateway $gw, ProtocolStack $proto): void
+{
+    if ($proto->payloadName() !== "raw") {
+        $gw->on(Msg::ECHO_REQ, function (int $fd, int $uid, string|array|object $data) use ($gw): void {
+            $gw->send($fd, Msg::ECHO_RESP, $data);
+        });
+        $gw->on(1003, function (int $fd, int $uid, string|array|object $data) use ($gw): void {
+            $gw->send($fd, 1004, ["uid" => $uid]);
+        });
+        return;
+    }
+
+    $gw->on(Msg::ECHO_REQ, function (int $fd, int $uid, string $body) use ($gw): void {
+        $gw->send($fd, Msg::ECHO_RESP, $body);
+    });
+    // whoami：验证登录后 uid 已绑定
+    $gw->on(1003, function (int $fd, int $uid, string $body) use ($gw): void {
+        $gw->send($fd, 1004, "uid=" . $uid);
+    });
+}
+
+function runBenchMode(Server $server, AppConfig $cfg): void
+{
+    Logger::warn("gateway disabled (benchmark mode only)");
+    $server->onFrame(function (int $fd, int $msgId, string $body, int $flags) use ($server): void {
+        if ($msgId === Msg::ECHO_REQ) {
+            $server->sendFrame($fd, Msg::ECHO_RESP, $body);
+        }
+    });
+    Logger::info("app ready (no gateway)", ["host" => $cfg->host, "port" => $cfg->port]);
+    $server->start();
+}
+
+function logReady(AppConfig $cfg, ProtocolStack $proto): void
+{
+    Logger::info("app ready", [
+        "host" => $cfg->host,
+        "port" => $cfg->port,
+        "transport" => $cfg->transport,
+        "frame" => $proto->frameName(),
+        "payload" => $proto->payloadName(),
+        "heartbeat_sec" => $cfg->heartbeatSec,
+        "require_auth" => $cfg->requireAuth,
+    ]);
+}
