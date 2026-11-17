@@ -72,6 +72,60 @@ final class Scheduler
     /** 当前正在处理哪个服务（用于给发出的消息填 from） */
     private int $current = 0;
 
+    /**
+     * 协程模式开关（默认关）。
+     *
+     * 关闭时 `currentOf()` 直接读属性，和原来等价（多一次方法调用，约 50ns）。
+     * 开启后每条消息跑在协程里、`current` 存进**协程上下文** —— 否则多个协程
+     * 会互相覆盖这个全局属性，发出的消息 from 全乱（症状极难查：
+     * 「服务收到了消息但不知道谁发的」）。
+     */
+    private bool $coroutine = false;
+
+    /** 开启协程调度。需要配合 Swoole\Runtime::enableCoroutine 才有异步 I/O 效果 */
+    public function setCoroutine(bool $on): void
+    {
+        $this->coroutine = $on;
+    }
+
+    public function coroutineEnabled(): bool
+    {
+        return $this->coroutine;
+    }
+
+    /**
+     * 读「当前服务」。
+     *
+     * 协程模式下从协程上下文取 —— 每个协程有自己的一份，互不干扰。
+     * 非协程模式直接返回属性，是热路径（deliver 每条消息都要读）。
+     */
+    private function currentOf(): int
+    {
+        if (!$this->coroutine) {
+            return $this->current;
+        }
+        $ctx = \Swoole\Coroutine::getContext();
+        if (!is_object($ctx)) {
+            return $this->current;
+        }
+        $v = $ctx["sched_cur"] ?? 0;
+        return is_int($v) ? $v : 0;
+    }
+
+    private function setCurrentOf(int $addr): void
+    {
+        if (!$this->coroutine) {
+            $this->current = $addr;
+            return;
+        }
+        $ctx = \Swoole\Coroutine::getContext();
+        if (is_object($ctx)) {
+            $ctx["sched_cur"] = $addr;
+        }
+        // 同时更新属性：给"协程外部"（比如 tick 的收尾）读，不会造成错乱
+        $this->current = $addr;
+    }
+
     private Timers $timers;
 
     /** 跨节点通道；为 null 时远程地址一律投递失败 */
@@ -224,10 +278,10 @@ final class Scheduler
 
         // onStart 里也可能发消息（比如启动时给别的服务打个招呼），
         // 所以要让它"以自己身份"发，否则 from 会是 0（系统）。
-        $prev = $this->current;
-        $this->current = $id;
+        $prev = $this->currentOf();
+        $this->setCurrentOf($id);
         $svc->onStart();
-        $this->current = $prev;
+        $this->setCurrentOf($prev);
         return $id;
     }
 
@@ -250,8 +304,8 @@ final class Scheduler
         if ($dropped > 0) {
             $this->stat["undelivered"] += $dropped;
         }
-        if ($this->current === $id) {
-            $this->current = 0;
+        if ($this->currentOf() === $id) {
+            $this->setCurrentOf(0);
         }
         $svc->onStop();
         return true;
@@ -274,7 +328,7 @@ final class Scheduler
                 $this->stat["undelivered"]++;
                 return false;
             }
-            if ($this->cluster->send($to, $this->current, $msgId, $data, $session)) {
+            if ($this->cluster->send($to, $this->currentOf(), $msgId, $data, $session)) {
                 return true;
             }
             $this->stat["undelivered"]++;
@@ -290,7 +344,7 @@ final class Scheduler
 
         // 每消息的 sent 计数不进热路径：一次数组自增约 174 ns。
         // 吞吐类指标由压测/监控层按批次统计，框架只记低频事件（spawn/kill/error）。
-        if (!$box->push(new Message($this->current, $msgId, $data, $session))) {
+        if (!$box->push(new Message($this->currentOf(), $msgId, $data, $session))) {
             // 信箱满：丢新的，不让积压无限涨（旧消息通常还有意义）
             $this->stat["overflow"]++;
             return false;
@@ -311,10 +365,10 @@ final class Scheduler
      */
     public function deliverAs(int $fromAddr, int $to, int $msgId, string|array|object $data = "", int $session = 0): bool
     {
-        $prev = $this->current;
-        $this->current = $fromAddr;
+        $prev = $this->currentOf();
+        $this->setCurrentOf($fromAddr);
         $ok = $this->deliver($to, $msgId, $data, $session);
-        $this->current = $prev;
+        $this->setCurrentOf($prev);
         return $ok;
     }
 
@@ -335,10 +389,10 @@ final class Scheduler
                 }
                 // 临时把 current 设成远端地址：deliver 会用 current 填 from，
                 // 这样服务看到的"谁发的"就是真实的远端地址，且热路径不用多一个参数。
-                $prev = $this->current;
-                $this->current = $p->src;
+                $prev = $this->currentOf();
+                $this->setCurrentOf($p->src);
                 $this->deliver($p->dst, $p->msgId, $p->data, $p->session);
-                $this->current = $prev;
+                $this->setCurrentOf($prev);
             }
         }
 
@@ -348,10 +402,10 @@ final class Scheduler
             $due = $this->timers->due(self::nowMs());
             foreach ($due as $t) {
                 // 定时器消息的 from 应该是"自己"（自定闹钟），不是 0（系统）
-                $prev = $this->current;
-                $this->current = $t->addr;
+                $prev = $this->currentOf();
+                $this->setCurrentOf($t->addr);
                 $this->deliver($t->addr, $t->msgId, $t->data);
-                $this->current = $prev;
+                $this->setCurrentOf($prev);
             }
         }
 
@@ -373,8 +427,8 @@ final class Scheduler
 
             // current 按批设置而不是按条：同一批消息都由同一个服务处理，
             // 每条都存/恢复要两次属性写（约 300 ns），按批做只付一次。
-            $prev = $this->current;
-            $this->current = $id;
+            $prev = $this->currentOf();
+            $this->setCurrentOf($id);
 
             $n = 0;
             // budget 提到局部变量：内层每轮读一次属性约 150 ns，按条累加很可观
@@ -415,10 +469,10 @@ final class Scheduler
                     "msgId" => $m === null ? 0 : $m->msgId,
                     "err" => $e->getMessage(),
                 ]);
-                $this->current = $prev;
+                $this->setCurrentOf($prev);
                 $this->kill($id);
             }
-            $this->current = $prev;
+            $this->setCurrentOf($prev);
             // 每条都做 $stat["handled"]++ 要 174 ns；按批累加等价，代价可忽略
             $this->stat["handled"] += $n;
 
