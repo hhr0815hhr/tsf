@@ -50,6 +50,8 @@ final class Schedule extends Service
     private const KIND_EVERY = 3;
     private const KIND_AT = 4;
 
+    private const KIND_CRON = 5;
+
     /**
      * @var array<string, array<string, int|string>> name => [kind, next, target, msgId, data, a, b]
      *
@@ -71,6 +73,19 @@ final class Schedule extends Service
         $now = time();
         $fire = [];
         foreach ($this->tasks as $name => $t) {
+            $kind = (int) ($t["kind"] ?? 0);
+
+            // cron 任务不走「下次时间」，而是「当前这一秒是否匹配」。
+            // 同一秒内只触发一次（lastFired 记在 a 里）—— 否则 tick 抖动会重复触发。
+            if ($kind === self::KIND_CRON) {
+                $expr = (string) ($t["expr"] ?? "");
+                $last = (int) ($t["a"] ?? 0);
+                if ($last !== $now && Cron::matches($expr, $now)) {
+                    $fire[] = $name;
+                }
+                continue;
+            }
+
             $next = (int) ($t["next"] ?? 0);
             if ($next > 0 && $now >= $next) {
                 $fire[] = $name;
@@ -151,6 +166,35 @@ final class Schedule extends Service
         ];
     }
 
+    /**
+     * cron 表达式。支持 6 段（秒 分 时 日 月 周）或 5 段（秒默认 0）。
+     *
+     *     $schedule->cron("reset",   "0 0 5 * * *",   $world, Msg::RESET);      // 每天 5:00
+     *     $schedule->cron("tick5",   "0/5 * * * * *", $world, Msg::TICK5);      // 每 5 秒
+     *     $schedule->cron("monthly", "0 0 0 1 * *",   $world, Msg::MONTHLY);    // 每月 1 号 0 点
+     *     $schedule->cron("workday", "0 0 9 * * 1-5", $world, Msg::WORKDAY);    // 工作日 9 点
+     *
+     * 非法表达式**当场抛异常**，而不是注册成功但永远不触发 —— 后者在运营场景里
+     * 是灾难（活动该开没开，且没有任何报错）。
+     */
+    public function cron(string $name, string $expr, int $target, int $msgId, string|array|object $data = ""): void
+    {
+        $f = Cron::parse($expr);
+        if ($f === []) {
+            throw new \RuntimeException("schedule: 非法 cron 表达式 [" . $expr . "]");
+        }
+        $this->tasks[$name] = [
+            "kind" => self::KIND_CRON,
+            "next" => 0,
+            "target" => $target,
+            "msgId" => $msgId,
+            "data" => is_string($data) ? $data : (string) json_encode($data),
+            "a" => 0,               // cron 用 a 存"最后触发的秒"
+            "b" => 0,
+            "expr" => $expr,
+        ];
+    }
+
     public function cancel(string $name): bool
     {
         if (!isset($this->tasks[$name])) {
@@ -165,11 +209,14 @@ final class Schedule extends Service
     {
         $out = [];
         foreach ($this->tasks as $name => $t) {
+            $kind = (int) $t["kind"];
             $out[] = [
                 "name" => (string) $name,
-                "kind" => (int) $t["kind"],
+                "kind" => $kind,
                 "next" => (int) $t["next"],
-                "nextAt" => date("Y-m-d H:i:s", (int) $t["next"]),
+                "nextAt" => $kind === self::KIND_CRON
+                    ? (string) ($t["expr"] ?? "")
+                    : date("Y-m-d H:i:s", (int) $t["next"]),
             ];
         }
         return $out;
@@ -190,6 +237,12 @@ final class Schedule extends Service
 
         if ($target > 0 && $msgId > 0) {
             Scheduler::instance()->deliver($target, $msgId, $data);
+        }
+
+        // cron：只记"这一秒已经触发过"，不重算 next
+        if ($kind === self::KIND_CRON) {
+            $this->tasks[$name]["a"] = $now;
+            return;
         }
 
         // 重算下次
