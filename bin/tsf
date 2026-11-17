@@ -12,7 +12,7 @@
  *   tsf build [dir]         编译
  *   tsf serve [dir]         编译并启动
  *   tsf watch [dir]         改文件自动重编重启（开发模式）
- *   tsf lint                结构检查（禁 mixed、命名空间与目录一致）
+ *   tsf lint                结构检查（禁 mixed、命名空间与目录一致、核心不依赖 pkg）
  *   tsf config build [dir]  Excel 配置表 → 强类型代码 + 二进制
  *   tsf config check [dir]  只校验配置表
  *   tsf proto build [dir]   .proto → gen/Proto/*.php（消息类 + 编解码）
@@ -866,11 +866,35 @@ function cmdLint(string $root): int
     $problems = [];
     $checked = 0;
 
+    $pkgs = listPackages($root);
+
     // 核心
     $checked += lintTree($root . "/src", "TSF", $root, $problems);
 
+    // 规则 4：核心不得引用可选包（依赖必须单向 src ← pkg）
+    //
+    // 这条规则的意义不是洁癖。一旦核心 use 了某个 pkg，那个「可选包」就变成事实上的
+    // 必需品 —— 关掉它核心编不过。同时意味着核心接受了那个包的业务假设（房间、AOI、
+    // 存档……）。可选性靠依赖方向保证，不靠文档承诺。
+    $pkgNs = [];
+    foreach ($pkgs as $name => $d) {
+        $pkgNs[$name] = isset($d["ns"]) ? (string) $d["ns"] : "TSF\\" . ucfirst($name);
+    }
+    $it4 = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root . "/src"));
+    foreach ($it4 as $f) {
+        if (!$f->isFile() || substr($f->getPathname(), -4) !== ".php") {
+            continue;
+        }
+        $code = (string) file_get_contents($f->getPathname());
+        foreach ($pkgNs as $pname => $bad) {
+            if (preg_match('/^use\s+' . preg_quote($bad, "/") . '\\\\/m', $code)) {
+                $problems[] = str_replace($root . "/", "", $f->getPathname())
+                    . "  核心引用了可选包 " . $pname . " → 依赖必须单向（src 不得 use pkg）";
+            }
+        }
+    }
+
     // 可选功能包：每个包自己声明根命名空间（pkg.json 的 ns 字段）
-    $pkgs = listPackages($root);
     foreach ($pkgs as $name => $d) {
         $ns = isset($d["ns"]) ? (string) $d["ns"] : "TSF\\" . ucfirst($name);
         $checked += lintTree($root . "/pkg/" . $name . "/src", $ns, $root, $problems);
@@ -893,7 +917,7 @@ function cmdLint(string $root): int
 
     if ($problems === []) {
         ok("结构检查通过：" . $checked . " 个源文件（核心 + " . count($pkgs) . " 个包），"
-            . "无 mixed 类型、命名空间与目录一致");
+            . "无 mixed 类型、命名空间与目录一致、核心不依赖可选包");
         return 0;
     }
 
@@ -1508,7 +1532,7 @@ switch ($cmd) {
         say("  tsf migrate-status  只看迁移状态，不写库");
         say("  tsf serve [dir]     编译并启动");
         say("  tsf watch [dir]     开发模式（改动自动重编重启）");
-        say("  tsf lint            结构检查（禁 mixed、命名空间与目录一致）");
+        say("  tsf lint            结构检查（禁 mixed、命名空间一致、核心不依赖 pkg）");
         say("  tsf list            列出可选功能包（pkg/）及当前工程启用了哪些");
         say("  tsf add <pkg>       启用功能包（连带启用其依赖）");
         say("  tsf remove <pkg>    移除功能包");
