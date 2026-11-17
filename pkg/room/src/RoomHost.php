@@ -20,7 +20,7 @@ use TSF\Service\Service;
  *   小房间（棋牌、回合制、无实时位置）→ 共享
  *   大房间（MMO 副本、MOBA、实体多）  → 独占
  */
-final class RoomHost extends Service
+class RoomHost extends Service
 {
     public const MSG_ADD = 3201;
 
@@ -35,23 +35,23 @@ final class RoomHost extends Service
     public const MAX_DELTA_MS = 200;
 
     /** @var array<int, Room> roomId => Room */
-    private array $rooms = [];
+    protected array $rooms = [];
 
-    private int $frameMs;
+    protected int $frameMs;
 
-    private int $maxRooms;
+    protected int $maxRooms;
 
-    private ?RoomManager $manager;
+    protected ?RoomManager $manager;
 
-    private int $lastTickMs = 0;
+    protected int $lastTickMs = 0;
 
-    private int $ticks = 0;
+    protected int $ticks = 0;
 
-    private int $maxTickUs = 0;
+    protected int $maxTickUs = 0;
 
-    private int $maxRoomsSeen = 0;
+    protected int $maxRoomsSeen = 0;
 
-    private int $reaped = 0;
+    protected int $reaped = 0;
 
     public function __construct(?RoomManager $manager = null, int $frameMs = 50, int $maxRooms = 200)
     {
@@ -113,7 +113,7 @@ final class RoomHost extends Service
     }
 
     /** 一帧：算一次 delta，推进所有房间 */
-    private function tickAll(): void
+    protected function tickAll(): void
     {
         $now = Scheduler::nowMs();
         $delta = $now - $this->lastTickMs;
@@ -152,7 +152,7 @@ final class RoomHost extends Service
         }
     }
 
-    private function dispatch(int $roomId, int $op, string|array|object $payload): void
+    protected function dispatch(int $roomId, int $op, string|array|object $payload): void
     {
         if (!isset($this->rooms[$roomId])) {
             return;
@@ -193,7 +193,7 @@ final class RoomHost extends Service
     }
 
     /** 摘掉一个房间：先关状态、再摘表、最后通知管理器（顺序不能反） */
-    private function reap(int $roomId): void
+    protected function reap(int $roomId): void
     {
         if (!isset($this->rooms[$roomId])) {
             return;

@@ -14,7 +14,7 @@ use TSF\Service\Service;
  * 不同玩法/不同评分口径要用**不同实例**，不要混在一个队列里：
  * 青铜和王者的分差没有可比性，混装会把两边都配得很难看。
  */
-final class MatchService extends Service
+class MatchService extends Service
 {
     public const MSG_JOIN = 4001;
 
@@ -26,13 +26,13 @@ final class MatchService extends Service
     /** 入队/离队结果：ok / reject */
     public const MSG_RESULT = 4100;
 
-    private MatchQueue $queue;
+    protected MatchQueue $queue;
 
     /** 扫描间隔（毫秒）；0 表示不自动扫，完全由外部投 MSG_TICK */
-    private int $intervalMs;
+    protected int $intervalMs;
 
     /** @var \Closure|null */
-    private ?\Closure $onMatched = null;
+    protected ?\Closure $onMatched = null;
 
     public function __construct(int $baseTolerance = 50, int $expandPerSec = 50, int $intervalMs = 100)
     {
@@ -89,7 +89,7 @@ final class MatchService extends Service
     }
 
     /** 扫一轮，把配对结果交出去 */
-    private function drain(): void
+    protected function drain(): void
     {
         $pairs = $this->queue->tryMatch(Scheduler::nowMs());
         if ($pairs === []) {
@@ -104,7 +104,7 @@ final class MatchService extends Service
         }
     }
 
-    private function reply(Message $m, string $text): void
+    protected function reply(Message $m, string $text): void
     {
         if ($m->from === 0) {
             return; // 系统/测试直发，没有回包对象

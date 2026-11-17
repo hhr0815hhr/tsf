@@ -24,7 +24,7 @@ use TSF\Service\Scheduler;
  * 不做成单例：管理器是业务自己持有的对象（一个进程可能管多种房间池），
  * 生命周期跟着进程走。
  */
-final class RoomManager
+class RoomManager
 {
     public const MODE_DEDICATED = 0;
 
@@ -41,24 +41,24 @@ final class RoomManager
     public const OP_CLOSE = 5;
 
     /** @var array<int, int> roomId => 承载它的服务地址 */
-    private array $rooms = [];
+    protected array $rooms = [];
 
     /** @var array<int, int> hostAddr => 已挂房间数（仅共享模式） */
-    private array $hostLoad = [];
+    protected array $hostLoad = [];
 
-    private int $nextRoomId = 1;
+    protected int $nextRoomId = 1;
 
-    private int $created = 0;
+    protected int $created = 0;
 
-    private int $closed = 0;
+    protected int $closed = 0;
 
-    private int $mode;
+    protected int $mode;
 
-    private int $frameMs;
+    protected int $frameMs;
 
-    private int $maxRoomsPerHost;
+    protected int $maxRoomsPerHost;
 
-    private int $hostAddr = 0;
+    protected int $hostAddr = 0;
 
     public function __construct(int $mode = self::MODE_DEDICATED, int $frameMs = 50, int $maxRoomsPerHost = 200)
     {
@@ -141,7 +141,7 @@ final class RoomManager
         return Scheduler::instance()->deliver($addr, $msgId, $payload);
     }
 
-    private function opToMsgId(int $op): int
+    protected function opToMsgId(int $op): int
     {
         if ($op === self::OP_JOIN) {
             return RoomService::MSG_JOIN;
@@ -162,7 +162,7 @@ final class RoomManager
     }
 
     /** 选一个还有余量的宿主，没有就开新的 */
-    private function ensureHost(): int
+    protected function ensureHost(): int
     {
         if ($this->hostAddr !== 0) {
             $load = isset($this->hostLoad[$this->hostAddr]) ? $this->hostLoad[$this->hostAddr] : 0;

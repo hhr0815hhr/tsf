@@ -17,16 +17,16 @@ namespace TSF\Room;
  * 玩家坐下时分配最小空位，离开后空出来给别人。席位号在一局内不变——
  * 客户端按席位号画座位，中途换号会让人物跳位。
  */
-final class MemberTable
+class MemberTable
 {
     /** @var array<int, Member> uid => 成员 */
-    private array $byUid = [];
+    protected array $byUid = [];
 
     /** @var array<int, int> seat => uid */
-    private array $bySeat = [];
+    protected array $bySeat = [];
 
     /** 席位上限（只算占席位的人） */
-    private int $capacity;
+    protected int $capacity;
 
     public function __construct(int $capacity = 8)
     {
@@ -237,7 +237,7 @@ final class MemberTable
     }
 
     /** 找最小空席位；满了返回 -1 */
-    private function freeSeat(): int
+    protected function freeSeat(): int
     {
         for ($s = 0; $s < $this->capacity; $s++) {
             if (!isset($this->bySeat[$s])) {

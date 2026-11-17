@@ -20,18 +20,18 @@ namespace TSF\Match;
  * 容差是**每人独立**的（等得久的更宽松），但 break 判断用全局最大容差作上界，
  * 这样既公平又不会退化成 O(n²)。
  */
-final class MatchQueue
+class MatchQueue
 {
     /** @var array<int, array{0:int, 1:int}> uid => [score, sinceMs] */
-    private array $waiting = [];
+    protected array $waiting = [];
 
     /** 基础容差：刚入队时能接受的分差 */
-    private int $baseTolerance;
+    protected int $baseTolerance;
 
     /** 每秒放宽多少分 */
-    private int $expandPerSec;
+    protected int $expandPerSec;
 
-    private int $matchedPairs = 0;
+    protected int $matchedPairs = 0;
 
     public function __construct(int $baseTolerance = 50, int $expandPerSec = 50)
     {

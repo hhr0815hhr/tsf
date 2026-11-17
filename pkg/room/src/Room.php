@@ -25,7 +25,7 @@ use TSF\Fsm\Machine;
  *
  * 为什么坐标不在这里：不是所有玩法都有坐标。见 README §10.1.1。
  */
-final class Room
+class Room
 {
     public const WAITING = 1;
 
@@ -35,11 +35,11 @@ final class Room
 
     public const CLOSED = 4;
 
-    private int $id;
+    protected int $id;
 
-    private Machine $fsm;
+    protected Machine $fsm;
 
-    private MemberTable $members;
+    protected MemberTable $members;
 
     /** @var array<int, string> 状态号 → 名字；业务可注册自己的 */
     private array $names = [];
@@ -54,10 +54,10 @@ final class Room
     private array $loadable = [];
 
     /** 已经推进的帧数 */
-    private int $frame = 0;
+    protected int $frame = 0;
 
     /** 累计推进的时间（毫秒），用于和真实时间对账 */
-    private int $elapsedMs = 0;
+    protected int $elapsedMs = 0;
 
     public function __construct(int $id, int $maxPlayers = 8)
     {

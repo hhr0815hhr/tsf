@@ -40,18 +40,18 @@ namespace TSF\Fsm;
  * - **不做层次状态机（HFSM）**：那层复杂度要等到真的有"父状态共享转移"的
  *   需求时再加，现在加只是给自己找麻烦。
  */
-final class Machine
+class Machine
 {
-    private int $state;
+    protected int $state;
 
     /** @var array<int, array<string, int>> from => event => to */
-    private array $table = [];
+    protected array $table = [];
 
     /** @var array<int, \Closure> state => (int $from, int $to): void */
-    private array $onEnter = [];
+    protected array $onEnter = [];
 
     /** @var array<int, \Closure> state => (int $from, int $to): void */
-    private array $onExit = [];
+    protected array $onExit = [];
 
     public function __construct(int $initial)
     {

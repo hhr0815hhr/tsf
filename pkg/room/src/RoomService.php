@@ -16,7 +16,7 @@ use TSF\Service\Service;
  *
  * 房间的状态只由自己的消息驱动，天然串行、不需要锁——这是消息模型的直接红利。
  */
-final class RoomService extends Service
+class RoomService extends Service
 {
     public const MSG_JOIN = 3001;
 
@@ -39,16 +39,16 @@ final class RoomService extends Service
     /** 单帧 delta 上限：卡顿后不要一次把实体推太远 */
     public const MAX_DELTA_MS = 200;
 
-    private Room $room;
+    protected Room $room;
 
-    private ?RoomManager $manager;
+    protected ?RoomManager $manager;
 
-    private ?FrameLoop $loop = null;
+    protected ?FrameLoop $loop = null;
 
-    private bool $closed = false;
+    protected bool $closed = false;
 
     /** 是否自动开帧循环。棋牌类可以传 false，只拿房间状态机 */
-    private bool $autoFrame;
+    protected bool $autoFrame;
 
     public function __construct(int $roomId, int $maxPlayers = 8, ?RoomManager $manager = null, bool $autoFrame = true)
     {
@@ -142,7 +142,7 @@ final class RoomService extends Service
     }
 
     /** 一帧：算真实 delta、推进房间时钟、记录耗时 */
-    private function onFrame(): void
+    protected function onFrame(): void
     {
         $loop = $this->loop;
         if ($loop === null) {
@@ -159,7 +159,7 @@ final class RoomService extends Service
         }
     }
 
-    private function reply(Message $m, string $text): void
+    protected function reply(Message $m, string $text): void
     {
         if ($m->from === 0) {
             return; // 系统/测试直发，没有回包对象
@@ -168,7 +168,7 @@ final class RoomService extends Service
     }
 
     /** 关房：撤销自己的定时器（由 kill 负责）并从管理器摘掉 */
-    private function shutdown(): void
+    protected function shutdown(): void
     {
         if ($this->closed) {
             return;
