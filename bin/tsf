@@ -596,10 +596,36 @@ function tplFile(string $name): string
     return $s;
 }
 
-/** wasm 模块的 project.yml（{{name}} 会被替换） */
+/**
+ * wasm 模块的 project.yml。
+ *
+ * wasm-package / wasm-world 从 `pkg/wasm/src/Iface.php` 读 —— 那是唯一来源。
+ * 之前模板里写死字符串，一旦上游的 world 名变了，所有工程的 project.yml 都要手工改。
+ */
 function tplModuleYml(string $modName): string
 {
-    return str_replace("{{name}}", $modName, tplFile("module.project.yml.txt"));
+    $pkg = "";
+    $world = "";
+    $ifaceFile = __DIR__ . "/../pkg/wasm/src/Iface.php";
+    if (is_file($ifaceFile)) {
+        $src = (string) file_get_contents($ifaceFile);
+        if (preg_match('/PACKAGE\s*=\s*"([^"]+)"/', $src, $m) === 1) {
+            $pkg = $m[1];
+        }
+        if (preg_match('/WORLD\s*=\s*"([^"]+)"/', $src, $m) === 1) {
+            $world = $m[1];
+        }
+    }
+    if ($pkg === "" || $world === "") {
+        // 读不到就报错，不要生成一个"看起来对、加载时 -1"的工程
+        fwrite(STDERR, "读不到 wasm 接口定义：" . $ifaceFile . PHP_EOL);
+        fwrite(STDERR, "  确认 pkg/wasm/src/Iface.php 里有 PACKAGE / WORLD 常量" . PHP_EOL);
+        return "";
+    }
+
+    $tpl = tplFile("module.project.yml.txt");
+    $tpl = str_replace(["{{name}}", "{{wasm_package}}", "{{wasm_world}}"], [$modName, $pkg, $world], $tpl);
+    return $tpl;
 }
 
 function tplModuleLib(): string
@@ -1003,10 +1029,13 @@ switch ($cmd) {
         // wasm 热更模块单独一个目录：编译目标、产物、更新方式都和 src/ 不同，
         // 混在一起用户分不清哪段代码是 native、哪段进沙箱（见 docs/guide/09）。
         // 只给结构和一个能编译的示例，不预置任何业务逻辑。
-        mkdir($projDir . "/modules/sample", 0777, true);
-        file_put_contents($projDir . "/modules/README.md", tplModulesReadme());
-        file_put_contents($projDir . "/modules/sample/project.yml", tplModuleYml("sample"));
-        file_put_contents($projDir . "/modules/sample/lib.php", tplModuleLib());
+        $sampleYml = tplModuleYml("sample");
+        if ($sampleYml !== "") {
+            mkdir($projDir . "/modules/sample", 0777, true);
+            file_put_contents($projDir . "/modules/README.md", tplModulesReadme());
+            file_put_contents($projDir . "/modules/sample/project.yml", $sampleYml);
+            file_put_contents($projDir . "/modules/sample/lib.php", tplModuleLib());
+        }
 
         // 构建清单：声明这个工程要用哪些可选功能包（默认一个都不用）
         writeProjectJson($projDir, ["name" => $arg, "packages" => []]);
@@ -1347,12 +1376,17 @@ switch ($cmd) {
                 fwrite(STDERR, "模块已存在: " . $target . PHP_EOL);
                 exit(2);
             }
+            $yml = tplModuleYml($modName);
+            if ($yml === "") {
+                fwrite(STDERR, "模板生成失败，已中止（不写半成品）" . PHP_EOL);
+                exit(1);
+            }
             mkdir($target, 0777, true);
-            file_put_contents($target . "/project.yml", tplModuleYml($modName));
+            file_put_contents($target . "/project.yml", $yml);
             file_put_contents($target . "/lib.php", tplModuleLib());
             echo "已创建 modules/" . $modName . PHP_EOL;
             echo "  编译: tsf module build modules/" . $modName . PHP_EOL;
-            echo "  注意 project.yml 里的 wasm-package / wasm-world 要和宿主一致" . PHP_EOL;
+            echo "  接口声明已按 pkg/wasm/src/Iface.php 自动填好（不要手改）" . PHP_EOL;
             exit(0);
         }
 

@@ -3,10 +3,11 @@
 # 编译：tsf module build .        （在模块目录里跑，或 tsf module build modules/{{name}}）
 # 产物：dist/{{name}}.cwasm
 #
-# ⚠️ 下面两个值必须和宿主桥接层**完全一致**，否则加载时 tp_open 返回 -1 且无提示。
-#    目前全仓库只有 spike 阶段的值，正式接口确定后要同步改这里。
-wasm-package: typephp:s1-probe@1.0.0
-wasm-world: s1-probe
+# ⚠️ 下面两个值由脚手架从 pkg/wasm/src/Iface.php 填入，**不要手改**。
+#    它们必须和 typephp 运行时 tp_open() 里硬编码的 world 一致，
+#    不一致时加载返回 -1 且不告诉你原因。
+wasm-package: {{wasm_package}}
+wasm-world: {{wasm_world}}
 
 name: {{name}}
 wasm: component
