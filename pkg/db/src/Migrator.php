@@ -43,6 +43,14 @@ final class Migrator
 
     private int $applied = 0;
 
+    /**
+     * 最近一次失败的原因（空字符串表示没有失败）。
+     *
+     * 迁移失败却「没有任何输出」是最危险的状态 —— 部署脚本照跑、表不存在、
+     * 线上报错要等到业务触发。所以失败原因必须留得住。
+     */
+    public string $lastError = "";
+
     private int $skipped = 0;
 
     public function __construct(Source $src, string $dir)
@@ -241,6 +249,25 @@ final class Migrator
         $name = basename($path);
 
         try {
+            if ($db->driver() === "mysql") {
+                // MySQL 的 DDL 会**隐式提交**当前事务：把 CREATE TABLE 包在
+                // transaction() 里，commit 时会发现「没有活动事务」而抛错，
+                // 结果整条迁移失败、表没建，而 up() 又把这个异常吞掉了 ——
+                // 表现为「迁移报告执行成功、表根本不存在」，且 sqlite 上永远复现不了。
+                //
+                // 所以 MySQL 这条路径不做事务包裹：DDL 直接执行，版本记录单独写。
+                // 代价是「DDL 成功但记录失败」时会留下一个未记录的表；
+                // 用 IF NOT EXISTS 重跑一次即可（迁移语句本身要求幂等）。
+                foreach ($stmts as $one) {
+                    $db->exec((string) $one);
+                }
+                $db->exec(
+                    "INSERT INTO " . self::TABLE . " (version, name, applied_at, checksum) VALUES (?, ?, ?, ?)",
+                    [$version, $name, time(), $sum]
+                );
+                return true;
+            }
+
             $db->transaction(function (Db $d) use ($stmts, $version, $name, $sum): void {
                 foreach ($stmts as $one) {
                     $d->exec((string) $one);
@@ -252,6 +279,7 @@ final class Migrator
             });
             return true;
         } catch (\Throwable $e) {
+            $this->lastError = basename($path) . ": " . $e->getMessage();
             return false;
         }
     }

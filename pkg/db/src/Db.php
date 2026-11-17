@@ -170,6 +170,20 @@ final class Db extends Source
     /** 执行写语句，返回受影响行数 */
     public function exec(string $sql, array $args = [], bool $reuse = false): int
     {
+        // 没有参数就不需要预处理：直接走 PDO::exec。
+        //
+        // 这不只是省一次 prepare —— **MySQL 的服务端预处理不支持 DDL**：
+        // `PREPARE` 一个 CREATE TABLE 会报
+        //   SQLSTATE[HY000]: General error: 1295 This command is not supported
+        //   in the prepared statement protocol yet
+        // 而 Migrator 正是用 exec() 跑建表语句的，异常又被它的 catch 吞掉，
+        // 结果是「up() 报告执行了、表根本没建、没有任何报错」。
+        // 这个 bug 在 sqlite 上永远暴露不出来（sqlite 的 prepare 允许 DDL）。
+        if ($args === []) {
+            $n = $this->conn()->exec($sql);
+            return is_int($n) ? $n : 0;
+        }
+
         $st = $this->stmt($sql, $args, $reuse);
         $n = $st->rowCount();
         $st->closeCursor();
@@ -301,14 +315,23 @@ final class Db extends Source
             if ($this->txDepth === 1) {
                 $pdo->commit();
             }
-            $this->txDepth--;
         } catch (\Throwable $e) {
             if ($this->txDepth === 1) {
-                $pdo->rollBack();
+                try {
+                    $pdo->rollBack();
+                } catch (\Throwable $ignored) {
+                    // MySQL 里 DDL 会隐式提交事务，此时 rollBack 会报
+                    // 「There is no active transaction」。这不是本函数该关心的事，
+                    // 吞掉即可，但**不能让它跳过后面的 txDepth--**。
+                }
             }
             $this->txDepth--;
             throw $e;
         }
+        // 必须放在 try 外：原来写在 try 里，commit() 一抛异常就跳过了这一句，
+        // txDepth 永久 +1，之后所有 transaction() 都不再 begin/commit ——
+        // 表现是「事务静默失效」，很难查。
+        $this->txDepth--;
     }
 
     public function inTransaction(): bool
