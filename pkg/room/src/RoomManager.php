@@ -77,8 +77,11 @@ final class RoomManager
      *
      * $autoFrame 只在独占模式有意义：共享模式下所有房间由宿主统一驱动，
      * 想关帧就整个宿主都不该存在。
+     *
+     * $factory 只在独占模式生效（共享模式由 RoomHost 统一承载，无法换实现）。
+     * 签名 `function (int $roomId, int $maxPlayers): Service`；不传则用默认的 RoomService。
      */
-    public function create(int $maxPlayers = 8, bool $autoFrame = true): int
+    public function create(int $maxPlayers = 8, bool $autoFrame = true, ?\Closure $factory = null): int
     {
         $roomId = $this->nextRoomId;
         $this->nextRoomId++;
@@ -94,7 +97,13 @@ final class RoomManager
             ]);
         } else {
             $mgr = $this;
-            $addr = Scheduler::instance()->spawnOf(function () use ($roomId, $maxPlayers, $mgr, $autoFrame) {
+            // $factory 是给业务留的出口：默认的 RoomService 只会跑「帧循环 + 标准操作」，
+            // 承载不了斗地主这种有自己的出牌协议、自己的状态机的玩法。
+            // 注入工厂之后，房间的生命周期仍由 RoomManager 管，业务逻辑在业务 Service 里。
+            $addr = Scheduler::instance()->spawnOf(function () use ($roomId, $maxPlayers, $mgr, $autoFrame, $factory) {
+                if ($factory !== null) {
+                    return $factory($roomId, $maxPlayers);
+                }
                 return new RoomService($roomId, $maxPlayers, $mgr, $autoFrame);
             });
             $this->rooms[$roomId] = $addr;

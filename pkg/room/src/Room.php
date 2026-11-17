@@ -41,6 +41,18 @@ final class Room
 
     private MemberTable $members;
 
+    /** @var array<int, string> 状态号 → 名字；业务可注册自己的 */
+    private array $names = [];
+
+    /** @var array<int, int> 允许进人的状态（state => 1） */
+    private array $joinable = [];
+
+    /** @var array<int, int> 推进帧的状态（state => 1） */
+    private array $running = [];
+
+    /** @var array<int, int> 允许被快照覆盖的状态（state => 1） */
+    private array $loadable = [];
+
     /** 已经推进的帧数 */
     private int $frame = 0;
 
@@ -54,6 +66,19 @@ final class Room
 
         // 转移规则集中声明。close 从任何非 CLOSED 状态都允许，所以三条边都要写——
         // 这比在 close() 里写 `if ($state !== CLOSED)` 更能表达"关闭是全局可用的"。
+        // 默认语义 = 改造前的硬编码行为，保证已有代码零改动。
+        // 三个集合都是「业务语义」，框架不该替业务决定：斗地主多一个「叫地主」状态，
+        // 它既允许进人、又不该推帧——这套东西由业务声明，而不是改框架源码。
+        $this->names = [
+            self::WAITING => "waiting",
+            self::PLAYING => "playing",
+            self::SETTLED => "settled",
+            self::CLOSED => "closed",
+        ];
+        $this->joinable = [self::WAITING => 1, self::PLAYING => 1];
+        $this->running = [self::PLAYING => 1];
+        $this->loadable = [self::WAITING => 1];
+
         $fsm = new Machine(self::WAITING);
         $fsm->allow(self::WAITING, "start", self::PLAYING)
             ->allow(self::PLAYING, "finish", self::SETTLED)
@@ -76,16 +101,60 @@ final class Room
     public function stateName(): string
     {
         $s = $this->fsm->state();
-        if ($s === self::WAITING) {
-            return "waiting";
+        return $this->names[$s] ?? ("state" . $s);
+    }
+
+    /**
+     * 注册自定义状态名。
+     *
+     * 改造前 `stateName()` 是四条 if：第五个状态会被当成 "closed"——一个错误答案，
+     * 而不是"未知"。查表之后未知状态返回 `state5` 这种可辨认的名字。
+     */
+    public function setStateName(int $state, string $name): void
+    {
+        $this->names[$state] = $name;
+    }
+
+    /**
+     * 声明「哪些状态允许进人」。
+     *
+     * 不传则沿用默认（WAITING / PLAYING 可进）。**这是业务语义**：斗地主的「叫地主」
+     * 阶段允许进人（还能观战），而「结算中」不允许。
+     *
+     * @param array<int, int> $states 状态号列表
+     */
+    public function setJoinableStates(array $states): void
+    {
+        $this->joinable = [];
+        foreach ($states as $st) {
+            $this->joinable[$st] = 1;
         }
-        if ($s === self::PLAYING) {
-            return "playing";
+    }
+
+    /**
+     * 声明「哪些状态推进帧」。
+     *
+     * @param array<int, int> $states
+     */
+    public function setRunningStates(array $states): void
+    {
+        $this->running = [];
+        foreach ($states as $st) {
+            $this->running[$st] = 1;
         }
-        if ($s === self::SETTLED) {
-            return "settled";
+    }
+
+    /**
+     * 声明「哪些状态允许被快照覆盖」。
+     *
+     * @param array<int, int> $states
+     */
+    public function setLoadableStates(array $states): void
+    {
+        $this->loadable = [];
+        foreach ($states as $st) {
+            $this->loadable[$st] = 1;
         }
-        return "closed";
     }
 
     /** 状态机本体——需要改转移规则或挂钩子时用 */
@@ -151,7 +220,7 @@ final class Room
     /** 加入（玩家身份）。只要布尔结果时用它 */
     public function add(int $uid, string $name = ""): bool
     {
-        if ($this->state() === self::CLOSED || $this->state() === self::SETTLED) {
+        if (!isset($this->joinable[$this->state()])) {
             return false;
         }
         return $this->members->add($uid, Member::PLAYER, $name) !== null;
@@ -164,7 +233,7 @@ final class Room
      */
     public function addAs(int $uid, int $role, string $name = ""): ?Member
     {
-        if ($this->state() === self::CLOSED || $this->state() === self::SETTLED) {
+        if (!isset($this->joinable[$this->state()])) {
             return null;
         }
         return $this->members->add($uid, $role, $name);
@@ -216,7 +285,7 @@ final class Room
      */
     public function tick(int $deltaMs): bool
     {
-        if ($this->fsm->state() !== self::PLAYING) {
+        if (!isset($this->running[$this->fsm->state()])) {
             return false;
         }
         if ($deltaMs < 0) {
@@ -274,13 +343,15 @@ final class Room
      */
     public function loadFrom(array $d): bool
     {
-        if (!$this->members->isEmpty() || $this->fsm->state() !== self::WAITING) {
+        if (!$this->members->isEmpty() || !isset($this->loadable[$this->fsm->state()])) {
             return false;
         }
 
-        $state = isset($d["state"]) ? (int) $d["state"] : self::WAITING;
-        if ($state < self::WAITING || $state > self::CLOSED) {
-            $state = self::WAITING;
+        // 不再把状态号限制在 [WAITING, CLOSED]：业务自定义的状态（比如叫地主）
+        // 也是合法状态，硬校验会把它悄悄改成 WAITING，恢复出来的房间状态是错的。
+        $state = isset($d["state"]) ? (int) $d["state"] : $this->fsm->state();
+        if ($state < 0) {
+            $state = $this->fsm->state();
         }
         $this->fsm->force($state);
 
