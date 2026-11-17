@@ -82,6 +82,9 @@ final class Scheduler
      */
     private bool $coroutine = false;
 
+    /** @var array<int, bool> 协程模式下：哪些服务正有协程在处理（保证同一服务串行） */
+    private array $busy = [];
+
     /** 开启协程调度。需要配合 Swoole\Runtime::enableCoroutine 才有异步 I/O 效果 */
     public function setCoroutine(bool $on): void
     {
@@ -99,7 +102,7 @@ final class Scheduler
      * 协程模式下从协程上下文取 —— 每个协程有自己的一份，互不干扰。
      * 非协程模式直接返回属性，是热路径（deliver 每条消息都要读）。
      */
-    private function currentOf(): int
+    public function currentOf(): int
     {
         if (!$this->coroutine) {
             return $this->current;
@@ -112,7 +115,7 @@ final class Scheduler
         return is_int($v) ? $v : 0;
     }
 
-    private function setCurrentOf(int $addr): void
+    public function setCurrentOf(int $addr): void
     {
         if (!$this->coroutine) {
             $this->current = $addr;
@@ -425,6 +428,15 @@ final class Scheduler
             $box = $this->boxes[$id];
             $box->queued = false;
 
+            // 协程模式：把这一批交给协程，不在这里同步跑。
+            // 好处是 onMessage 里的阻塞 I/O（redis/PDO）只挂起自己那个协程，
+            // 其他服务照常被调度 —— 前提是开了 Runtime::enableCoroutine。
+            if ($this->coroutine) {
+                $this->dispatchAsync($svc, $box, $id);
+                $handled++;
+                continue;
+            }
+
             // current 按批设置而不是按条：同一批消息都由同一个服务处理，
             // 每条都存/恢复要两次属性写（约 300 ns），按批做只付一次。
             $prev = $this->currentOf();
@@ -502,6 +514,55 @@ final class Scheduler
      * 用在"纯服务进程"里（没有网络事件驱动）。如果是跑在 Swoole 服务器里，
      * 应该由网络回调调用 tick()，不要开 run()，否则会和事件循环抢控制权。
      */
+    /**
+     * 协程模式下处理一个服务的信箱。
+     *
+     * **同一服务同时只有一个协程**（busy 标志）—— 这是"服务有状态但不必加锁"的前提。
+     * 不同服务的协程可以并发：A 卡在 redis 上时，B 照常被调度。
+     *
+     * 一个协程连着处理 batch 条（而不是每条一个协程）：少创建协程，且天然保序。
+     */
+    private function dispatchAsync(Service $svc, Mailbox $box, int $id): void
+    {
+        if (isset($this->busy[$id])) {
+            // 已经有协程在处理它：不并发，等它处理完继续 pop（消息本来就在信箱里）
+            return;
+        }
+        $this->busy[$id] = true;
+
+        $budget = $this->budget;
+        // 用 $self 捕获而不是直接在闭包里写 $this：AOT 下闭包访问 $this 的属性没先例。
+        // 闭包定义在类内、作用域是 Scheduler，所以 private 成员也调得到。
+        $self = $this;
+
+        \swoole_coroutine_create(function () use ($self, $svc, $box, $id, $budget): void {
+            $n = 0;
+            $m = null;
+            try {
+                $self->setCurrentOf($id);
+                while ($n < $budget) {
+                    $m = $box->pop();
+                    if ($m === null) {
+                        break;
+                    }
+                    $svc->onMessage($m);
+                    $n++;
+                }
+            } catch (\Throwable $e) {
+                // 和同步路径同语义：单个服务出错就销毁它（状态可能已不一致）
+                $self->stat["errors"]++;
+                Logger::error("service error (coroutine), killing", [
+                    "svc" => Addr::label($id),
+                    "msgId" => $m === null ? 0 : $m->msgId,
+                    "err" => $e->getMessage(),
+                ]);
+                $self->kill($id);
+            } finally {
+                unset($self->busy[$id]);
+            }
+        });
+    }
+
     public function run(): void
     {
         while (true) {
