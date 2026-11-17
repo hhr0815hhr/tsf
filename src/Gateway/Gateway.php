@@ -134,8 +134,13 @@ final class Gateway
      * 和 `SessionManager::close()` 的分工：网关负责清会话/限流状态，
      * 业务在这个钩子里决定"掉线对玩法意味着什么"（退出匹配、判负、存档）。
      */
-    public function onDisconnect(callable $cb): void
+    public function onDisconnect(\Closure $cb): void
     {
+        // 参数类型必须是 \Closure，不能是 callable：
+        // callable 在 AOT 里是联合类型（string|array|Closure|...），赋给
+        // `?\Closure` 属性时会被转成 stdClass，运行时调用就报
+        // `stdClass->{closure}()` —— 而且编译期不报错。
+        // `on(int $msgId, \Closure $fn)` 一直正常，正是因为它用了精确类型。
         $this->onDisconnect = $cb;
     }
 
