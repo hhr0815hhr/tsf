@@ -52,7 +52,8 @@ class RoomService extends Service
 
     public function __construct(int $roomId, int $maxPlayers = 8, ?RoomManager $manager = null, bool $autoFrame = true)
     {
-        $this->room = new Room($roomId, $maxPlayers);
+        // 默认用三段式；业务想换状态机就继承本类并覆写
+        $this->room = ThreeStage::room($roomId, $maxPlayers);
         $this->manager = $manager;
         $this->autoFrame = $autoFrame;
     }
@@ -154,7 +155,7 @@ class RoomService extends Service
         $loop->endFrame();
 
         // 结算完且没人了：顺手回收
-        if ($this->room->state() === Room::SETTLED && $this->room->isEmpty()) {
+        if ($this->room->state() === ThreeStage::SETTLED && $this->room->isEmpty()) {
             $this->shutdown();
         }
     }

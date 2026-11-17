@@ -90,7 +90,7 @@ class RoomHost extends Service
                 // 所以正常路径走不到这里——这是防御，不是主逻辑。
                 return;
             }
-            $this->rooms[$roomId] = new Room($roomId, $max);
+            $this->rooms[$roomId] = ThreeStage::room($roomId, $max);
             return;
         }
 
@@ -132,7 +132,7 @@ class RoomHost extends Service
         // 直接用 $room->id() 拿 int 更省事（README §5.9 同类问题）。
         foreach ($this->rooms as $room) {
             $room->tick($delta);
-            if ($room->state() === Room::SETTLED && $room->isEmpty()) {
+            if ($room->state() === ThreeStage::SETTLED && $room->isEmpty()) {
                 $dead[] = $room->id();
             }
         }
