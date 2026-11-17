@@ -1,0 +1,30 @@
+<?php
+
+// wasm 模块示例。
+//
+// 只有标了 #[\WasmExport] 的函数会被导出给宿主调用。没标的函数可以随便写，
+// 它们只是模块内部的辅助函数。
+//
+// 约束（做不到就别用 wasm，直接写进 src/）：
+//   1. 导出函数的**签名不能变** —— 换了签名宿主要重编，等于停服
+//   2. 换实现**不迁移内存** —— 宿主里的状态结构不变，模块自己别指望跨版本保存状态
+//   3. **一次调用做很多事**，不要设计成每帧百万次小调用（跨边界成本比计算贵）
+
+#[\WasmExport]
+function version(): int
+{
+    return 1;
+}
+
+/**
+ * 示例：伤害公式。策划调数值最典型的地方 —— 逻辑常改、接口稳定。
+ */
+#[\WasmExport]
+function calcDamage(int $atk, int $def, bool $crit): int
+{
+    $base = $atk - intdiv($def, 2);
+    if ($base < 1) {
+        $base = 1;
+    }
+    return $crit ? $base * 2 : $base;
+}

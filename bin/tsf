@@ -584,6 +584,34 @@ function findBinary(string $projDir): string
 }
 
 /** 生成的主程序模板 */
+/** 从 tsf/tpl 读一个模板；缺文件时返回空串（让调用方暴露问题，而不是生成空文件） */
+function tplFile(string $name): string
+{
+    $path = __DIR__ . "/../tpl/" . $name;
+    $s = @file_get_contents($path);
+    if (!is_string($s) || $s === "") {
+        fwrite(STDERR, "缺少模板文件：" . $path . PHP_EOL);
+        return "";
+    }
+    return $s;
+}
+
+/** wasm 模块的 project.yml（{{name}} 会被替换） */
+function tplModuleYml(string $modName): string
+{
+    return str_replace("{{name}}", $modName, tplFile("module.project.yml.txt"));
+}
+
+function tplModuleLib(): string
+{
+    return tplFile("module.lib.php.txt");
+}
+
+function tplModulesReadme(): string
+{
+    return tplFile("modules.README.md.txt");
+}
+
 function tplMain(): string
 {
     // 模板独立成文件（tsf/tpl/main.php.txt）：内容有一百多行、含多个顶层函数，
@@ -972,6 +1000,14 @@ switch ($cmd) {
         mkdir($projDir . "/src", 0777, true);
         mkdir($projDir . "/var/log", 0777, true);
 
+        // wasm 热更模块单独一个目录：编译目标、产物、更新方式都和 src/ 不同，
+        // 混在一起用户分不清哪段代码是 native、哪段进沙箱（见 docs/guide/09）。
+        // 只给结构和一个能编译的示例，不预置任何业务逻辑。
+        mkdir($projDir . "/modules/sample", 0777, true);
+        file_put_contents($projDir . "/modules/README.md", tplModulesReadme());
+        file_put_contents($projDir . "/modules/sample/project.yml", tplModuleYml("sample"));
+        file_put_contents($projDir . "/modules/sample/lib.php", tplModuleLib());
+
         // 构建清单：声明这个工程要用哪些可选功能包（默认一个都不用）
         writeProjectJson($projDir, ["name" => $arg, "packages" => []]);
 
@@ -1291,11 +1327,70 @@ switch ($cmd) {
 
     case "module":
         $sub = $argv[2] ?? "";
+        $dir = isset($argv[3]) ? $argv[3] : ".";
+
+        // 新建模块：在工程根的 modules/ 下生成 project.yml + lib.php
+        if ($sub === "add") {
+            $modName = $argv[3] ?? "";
+            if (preg_match('/^[a-z][a-z0-9_-]*$/', $modName) !== 1) {
+                fwrite(STDERR, "用法: tsf module add <name>" . PHP_EOL);
+                fwrite(STDERR, "  name 小写字母开头，可含数字、下划线、连字符" . PHP_EOL);
+                exit(2);
+            }
+            $modulesDir = getcwd() . "/modules";
+            if (!is_dir($modulesDir)) {
+                fwrite(STDERR, "当前目录没有 modules/ —— 先 cd 到工程根目录（有 project.yml 那层）" . PHP_EOL);
+                exit(2);
+            }
+            $target = $modulesDir . "/" . $modName;
+            if (is_dir($target)) {
+                fwrite(STDERR, "模块已存在: " . $target . PHP_EOL);
+                exit(2);
+            }
+            mkdir($target, 0777, true);
+            file_put_contents($target . "/project.yml", tplModuleYml($modName));
+            file_put_contents($target . "/lib.php", tplModuleLib());
+            echo "已创建 modules/" . $modName . PHP_EOL;
+            echo "  编译: tsf module build modules/" . $modName . PHP_EOL;
+            echo "  注意 project.yml 里的 wasm-package / wasm-world 要和宿主一致" . PHP_EOL;
+            exit(0);
+        }
+
+        // 批量编译 modules/ 下所有模块（每个子目录一个独立工程）
+        if ($sub === "build-all") {
+            $modulesDir = getcwd() . "/modules";
+            if (!is_dir($modulesDir)) {
+                fwrite(STDERR, "当前目录没有 modules/" . PHP_EOL);
+                exit(2);
+            }
+            $good = 0;
+            $bad = 0;
+            $dirs = glob($modulesDir . "/*", GLOB_ONLYDIR);
+            if (is_array($dirs)) {
+                foreach ($dirs as $one) {
+                    if (!is_file($one . "/project.yml")) {
+                        continue;
+                    }
+                    echo PHP_EOL . "== " . basename($one) . " ==" . PHP_EOL;
+                    if (moduleBuild($one, $tpc, $phpBin) === 0) {
+                        $good++;
+                    } else {
+                        $bad++;
+                    }
+                }
+            }
+            echo PHP_EOL . "完成：成功 " . $good . "，失败 " . $bad . PHP_EOL;
+            exit($bad > 0 ? 1 : 0);
+        }
+
         if ($sub !== "build") {
-            fwrite(STDERR, "用法: tsf module build [dir]" . PHP_EOL);
+            fwrite(STDERR, "用法:" . PHP_EOL);
+            fwrite(STDERR, "  tsf module add <name>    新建模块（在工程根目录跑）" . PHP_EOL);
+            fwrite(STDERR, "  tsf module build <dir>   编译一个模块" . PHP_EOL);
+            fwrite(STDERR, "  tsf module build-all     编译 modules/ 下所有模块" . PHP_EOL);
+            fwrite(STDERR, "  什么时候该写 wasm 模块见 docs/guide/09-wasm-or-typephp.md" . PHP_EOL);
             exit(1);
         }
-        $dir = isset($argv[3]) ? $argv[3] : ".";
         exit(moduleBuild(realpath($dir) ?: $dir, $tpc, $phpBin));
 
     case "serve":

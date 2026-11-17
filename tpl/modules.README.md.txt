@@ -1,0 +1,62 @@
+# modules/ —— wasm 热更模块
+
+这个目录下的**每个子目录都是一个独立的编译工程**（有自己的 `project.yml`），
+用 `tsf module build <dir>` 编译，产物在 `<dir>/dist/*.cwasm`。
+
+## 为什么单独放一个目录
+
+native 代码（`src/`）和 wasm 模块的编译目标不同、依赖不同、产物形态也不同：
+
+| | `src/` + `main.php` | `modules/<name>/` |
+|:--|:--|:--|
+| 编译命令 | `tsf build .` | `tsf module build modules/<name>` |
+| 产物 | 一个可执行文件 | `.wasm` → `.cwasm` |
+| 更新方式 | 重启进程 | `canary` / `swap` 热更 |
+| 能否互相引用 | 不能 | 不能 |
+
+**两者不能互相 require**：模块编进沙箱，宿主的东西它看不见；宿主也不编模块源码。
+共享的只有数据格式（消息号、结构体字段），靠约定而不是靠 import。
+
+## 什么时候把代码放这里
+
+**只有当这段逻辑需要不停服更新时才放这里。** 其余一律写在 `src/`：
+
+- 常规业务逻辑（状态机、规则判断）→ `src/`，native 更快
+- 运营活动、数值平衡公式（策划经常改、接口稳定）→ `modules/`
+- 一次性脚本、跑批 → 不要放这里
+
+判断细节见 `docs/guide/09-wasm-or-typephp.md`。
+
+## 前置条件（缺一个都编不过）
+
+| 依赖 | 说明 |
+|:--|:--|
+| `wasm32-wasip2-clang` | wasi-sdk，**clang >= 22**（旧版 tpc 直接拒绝） |
+| `wasmtime` | 运行 / 验证 |
+| `wit-bindgen` | 0.60 |
+| `tp-precompile` | 预编译成 `.cwasm`（**不能用 `wasmtime compile` 代替**） |
+
+`tsf module build` 会先检查这几个，缺什么直接说，不会让你在 tpc 的笼统报错里猜。
+
+## ⚠️ 当前状态：接口还没定
+
+模块的 `wasm-package` / `wasm-world` 必须和**宿主桥接层**完全一致，否则加载时
+`tp_open` 返回 `-1`，**且不会告诉你为什么**。
+
+目前全仓库只有一组值（spike 阶段验证用的）：
+
+```
+wasm-package: typephp:s1-probe@1.0.0
+wasm-world: s1-probe
+```
+
+**这意味着 wasm 集成还停在 spike 阶段，没有面向业务的正式接口。**
+在宿主侧确定正式 IFACE 之前：
+
+- 生成的示例模块**编得过，但加载不上**（接口不匹配）
+- 不要在生产依赖 wasm 热更
+
+要启用这块，需要先做两件事（属于框架层，不是脚手架）：
+
+1. 宿主和模块共用一份 IFACE 定义（而不是各自写死字符串）
+2. 宿主暴露一个查询接口（比如 `wasm_iface(): string`），脚手架自动填进 `project.yml`

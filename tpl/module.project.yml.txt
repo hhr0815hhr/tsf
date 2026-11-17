@@ -1,0 +1,23 @@
+# wasm 热更模块工程。
+#
+# 编译：tsf module build .        （在模块目录里跑，或 tsf module build modules/{{name}}）
+# 产物：dist/{{name}}.cwasm
+#
+# ⚠️ 下面两个值必须和宿主桥接层**完全一致**，否则加载时 tp_open 返回 -1 且无提示。
+#    目前全仓库只有 spike 阶段的值，正式接口确定后要同步改这里。
+wasm-package: typephp:s1-probe@1.0.0
+wasm-world: s1-probe
+
+name: {{name}}
+wasm: component
+# library：只导出函数，没有自己的 main（绝大多数业务模块都是这个）
+wasm-mode: library
+
+# phpx 的 wasm 头用了 std::abort / std::fill 却没 include，
+# clang 22+ 不再间接包含（旧版 libc++ 恰好包着）。这两行不能删。
+cxx-flags: |
+  -include cstdlib
+  -include algorithm
+
+sources:
+  - lib.php
