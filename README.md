@@ -20,10 +20,7 @@
 
 ```bash
 # 1) 框架（约 3.2MB，142 个文件）
-#    在 composer.json 里加这两项（包还没发到 Packagist）：
-#      "repositories": [{ "type": "vcs", "url": "https://github.com/hhr0815hhr/tsf" }],
-#      "require": { "hhr0815hhr/tsf": "^0.7" }
-composer install
+composer require hhr0815hhr/tsf
 
 # 2) 工具链：typephp 编译器（约 42MB，解压 168MB）
 curl -fsSL https://raw.githubusercontent.com/hhr0815hhr/TypeServer/main/scripts/install-toolchain.sh | bash
@@ -33,9 +30,6 @@ export TSF_PHP=php85
 # 3) 自检
 ./vendor/bin/tsf doctor
 ```
-
-> **为什么不能只写 `composer require`**：包还没发到 Packagist，Composer 默认只查 Packagist，
-> 所以必须先声明 `repositories`。发到 Packagist 之后这一项就可以删了。
 
 **为什么是两步**：tsf 不是纯 PHP 框架 —— 它调用 typephp 编译器（`tpc`）把 PHP 编成 C++。
 Composer 只能装 PHP 代码，装不了编译器本体和 C++ 后端（clang），所以工具链单独发。
