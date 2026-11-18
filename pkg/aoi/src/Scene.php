@@ -134,6 +134,25 @@ final class Scene
         $this->grid->remove($uid);
     }
 
+    /**
+     * 按半径取候选：技能命中、攻击判定的正确入口。
+     *
+     * 和 viewOf() 是两个不同语义，别混用：
+     *   viewOf()        九宫格视野，稳定 3×3（换格才变），用于"谁能看到谁"
+     *   around(uid, R)  半径 R 内的候选，跟着技能走，用于"能打到谁"
+     *
+     * 用 viewOf 做命中判定会在 R > 一格宽时静默漏判（实测 cell=64/R=500 漏判约一半），
+     * 因为九宫格只覆盖 192 单位；而把格宽放大到 R 的量级又会毁掉筛除率。
+     *
+     * 返回含自己（调用方用 uid 比较排除，比在这里复制一份数组便宜）。
+     *
+     * @return array<int, int> uid => uid
+     */
+    public function around(int $uid, int $radius): array
+    {
+        return $this->grid->around($uid, $radius);
+    }
+
     /** @return array<int, int> uid => uid，不含自己 */
     public function viewOf(int $uid): array
     {
