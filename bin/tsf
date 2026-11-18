@@ -26,10 +26,18 @@ const TSF_VERSION = "0.7.0";
 $tsfRoot = dirname(__DIR__);
 $tpc = getenv("TPC");
 if ($tpc === false || $tpc === "") {
-    // 默认位置：$HOME/typephp-src。用 getenv 而不是 "$HOME/..."——
-    // 双引号里那是 PHP 变量插值，未定义变量会变成空串，静默拼成 /typephp-src/...
+    // 探测顺序（用 getenv 而不是 "$HOME/..."——双引号里那是 PHP 变量插值，
+    // 未定义变量会变成空串，静默拼成 /typephp-src/...）：
+    //   1. ~/.tsf/toolchain/typephp/bin/tpc.php   安装脚本装的位置
+    //   2. ~/typephp-src/bin/tpc.php              源码树（开发机）
     $home = getenv("HOME");
-    $tpc = (is_string($home) && $home !== "" ? $home : "") . "/typephp-src/bin/tpc.php";
+    $home = is_string($home) && $home !== "" ? $home : "";
+    $installed = $home . "/.tsf/toolchain/typephp/bin/tpc.php";
+    if (is_file($installed)) {
+        $tpc = $installed;
+    } else {
+        $tpc = $home . "/typephp-src/bin/tpc.php";
+    }
 }
 $phpBin = getenv("TSF_PHP");
 if ($phpBin === false || $phpBin === "") {
