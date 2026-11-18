@@ -126,6 +126,76 @@ tsf/
 
 ---
 
+## 最容易卡住的三件事（先看这个）
+
+这三条都是"看起来没问题、实际没生效"的类型，排查成本远高于修的成本。
+
+### 1. 编译失败了，但看不到真正的错误
+
+`tsf build` 默认并行编译（4 job）。并行池会把 g++ 的 stderr 吞掉，只剩：
+
+```
+PHP Fatal error: Uncaught Exception: Compilation failed for: .../main.cc
+#1 Translator.php(3006): ...
+```
+
+真正的 `error: 'server' is not captured` 根本看不到。
+
+**现在的行为**：检测到 g++ 阶段失败会自动用 `-j 1` 重试一次并打印完整错误
+（已成功的文件命中增量缓存，只重编出错的，代价很小）。
+
+**手动方式**（想自己控制时）：
+
+```bash
+php85 ~/.tsf/toolchain/typephp/bin/tpc.php project.yml -j 1 -O2
+```
+
+注意只有 **g++ 阶段**的失败才会被吞。PHP→C++ 转换阶段的失败（比如
+`Fatal error: The variable $a is undefined`）本来就打得很清楚。
+
+### 2. 改了配置文件，进程里不生效
+
+AOT 二进制里的 `include` 会命中 opcache，**不会**因为文件 mtime 变化自动失效，
+即使 `opcache.validate_timestamps=On` 也一样。
+
+症状极具误导性：文件监听正常、重载计数在涨、mtime 也变了，但读到的永远是旧值，
+而且没有任何报错。重启进程就好了（冷启动时 opcache 是空的），所以很容易误判成
+"缓存没清干净"。
+
+**对策**：不要自己写 `include`，用 `TSF\Kernel\FileLoader`：
+
+```php
+$conf = \TSF\Kernel\FileLoader::array(__DIR__ . "/config/skill.php");   // 配置表
+$fn   = \TSF\Kernel\FileLoader::closure(__DIR__ . "/hot/activity.php"); // 热更脚本
+```
+
+它内部做了 `opcache_invalidate($path, true)`。返回 `null` 表示不可用，
+调用方应当**保留旧数据**而不是清空。
+
+### 3. 想改 `pkg/` 里的源码，改了却被覆盖
+
+`vendor/hhr0815hhr/tsf` 是 composer 装的，直接改会被下一次 `composer update` 覆盖。
+要让本地改动生效，把它接成本地仓库：
+
+```json
+{
+    "repositories": [
+        { "type": "path", "url": "/path/to/tsf", "options": { "symlink": true } }
+    ]
+}
+```
+
+```bash
+composer update hhr0815hhr/tsf
+ls -la vendor/hhr0815hhr/tsf    # 应该看到 -> /path/to/tsf 的软链
+```
+
+如果 `composer update` 说 "Nothing to modify"，说明 lock 里记录的还是旧来源，
+需要先删掉软链再 `composer install`（`composer reinstall` 在部分版本上不会重读
+path 配置）。
+
+---
+
 ## 五、AOT 编码约束（必须遵守，都是踩过的坑）
 
 ### 5.1 不要对 `mixed` 的嵌套数组反复下标遍历（**tpc 0.9.6 未能复现**）
