@@ -944,7 +944,8 @@ function cmdNewLogin(string $name, string $cwd, string $tsfRoot): int
     }
     file_put_contents($projDir . "/main.php", $body);
 
-    writeProjectJson($projDir, ["name" => $name, "packages" => []]);
+    // 登录服依赖 pkg/http（路由 + 统一响应）
+    writeProjectJson($projDir, ["name" => $name, "packages" => ["http"]]);
     file_put_contents($projDir . "/project.yml", genProjectYml($projDir, $tsfRoot));
 
     ok("登录服已创建: " . $projDir);

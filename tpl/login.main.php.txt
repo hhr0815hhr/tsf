@@ -1,30 +1,36 @@
 <?php
 
 use TSF\Gateway\TokenAuth;
+use TSF\Http\App;
+use TSF\Http\Request;
+use TSF\Http\Response;
 use TSF\Kernel\Bootstrap;
+use TSF\Kernel\Config;
 use TSF\Kernel\Logger;
 
 /**
- * 登录服：Swoole HttpServer + AOT。
+ * 登录服：Swoole HttpServer + AOT + 路由。
  *
- * ## 为什么登录服也用 tsf
+ * ## 加接口只要一行
  *
- * Swoole 项目本来就要重启才能生效（改代码 → 重启进程），所以 AOT 多出来的一次
- * 编译（约 1.9s）几乎没有额外代价；而它换来的是：同一套 `tsf build` 部署
- * （scp 一个二进制，目标机不需要装 PHP）和同一套 Logger / Config。
+ * ```php
+ * $app->post("/notice", NoticeHandler::class);      // 推荐：类名，可单测
+ * $app->get("/ping", fn (Request $r): Response => Response::ok());  // 临时接口
+ * ```
  *
- * ## 它只做三件事
+ * 路径参数用 `:name`：`$app->get("/player/:uid", ...)`，handler 里 `$req->param("uid")`。
  *
- *   POST /login   校验账号 → 签发 token → 告诉客户端连哪个 gateway
- *   GET  /health  存活检查（给 LB / K8s 用）
- *   其他          404
+ * ## 统一响应
  *
- * ## token 格式
+ * `Response::ok($data)`   → `{"code":0,"data":...}`
+ * `Response::fail(1001, "name required", 400)` → `{"code":1001,"msg":"...","status":400}`
  *
- * 由 `TSF\Gateway\TokenAuth::sign($uid, $ttl)` 签发，**和网关验签是同一个类**，
- * 所以不会出现"登录服和网关算法对不上"的问题。网关侧只要配同一个 secret：
+ * **HTTP 状态码表达传输层结果，code 表达业务结果** —— 两个都要，别只用一个。
  *
- *   "server": { "auth": { "require": true, "secret": "<和这里一致>" } }
+ * ## token
+ *
+ * `TokenAuth::sign($uid, $ttl)` 签，网关侧 `resolve()` 验，**是同一个类**，
+ * 所以不会出现两边算法对不上。网关配置里填同一个 secret 即可。
  */
 function main(): void
 {
@@ -32,69 +38,50 @@ function main(): void
     Bootstrap::boot($base, "app");
     Bootstrap::ensureDirs([$base . "/var/log"]);
 
-    // 配置直读（AppConfig 没有 login 段的方法，用通用的 Config 静态接口）
-    $login = [
-        "host" => \TSF\Kernel\Config::getString("login.host", "0.0.0.0"),
-        "port" => (int) \TSF\Kernel\Config::getInt("login.port", 9101),
-        "secret" => \TSF\Kernel\Config::getString("login.secret", ""),
-        "token_ttl" => (int) \TSF\Kernel\Config::getInt("login.token_ttl", 300),
-        "gateway" => \TSF\Kernel\Config::getString("login.gateway", ""),
-    ];
+    $secret = Config::getString("login.secret", "");
+    $ttl = Config::getInt("login.token_ttl", 300);
+    $gateway = Config::getString("login.gateway", "");
+    $auth = new TokenAuth([], $secret);
 
-    $auth = new TokenAuth([], (string) $login["secret"]);
-    $ttl = (int) $login["token_ttl"];
+    $app = new App(
+        Config::getString("login.host", "0.0.0.0"),
+        Config::getInt("login.port", 9101),
+    );
 
-    $server = new \Swoole\Http\Server((string) $login["host"], (int) $login["port"]);
-
-    $server->on("request", function (\Swoole\Http\Request $req, \Swoole\Http\Response $res) use ($auth, $ttl, $login): void {
-        $path = $req->server["request_uri"] ?? "/";
-        $method = $req->server["request_method"] ?? "GET";
-
-        if ($path === "/health") {
-            $res->header("Content-Type", "application/json");
-            $res->end("{\"ok\":true}");
-            return;
-        }
-
-        if ($path !== "/login" || $method !== "POST") {
-            $res->status(404);
-            $res->header("Content-Type", "application/json");
-            $res->end("{\"error\":\"not found\"}");
-            return;
-        }
-
-        // 账号来源：这个模板只演示"怎么签票"，鉴权逻辑按你们的账号系统换掉
-        $name = (string) ($req->post["name"] ?? "");
-        if ($name === "") {
-            $res->status(400);
-            $res->header("Content-Type", "application/json");
-            $res->end("{\"error\":\"name required\"}");
-            return;
-        }
-
-        // 稳定 uid（真实项目应该查库拿自增 id）
-        $uid = crc32($name);
-        if ($uid < 0) {
-            $uid += 4294967296;
-        }
-        $uid = (int) ($uid % 900000000) + 100000000;
-
-        $token = $auth->sign($uid, $ttl);
-        $res->header("Content-Type", "application/json");
-        $res->end(json_encode([
-            "uid" => $uid,
-            "token" => $token,
-            "gateway" => (string) $login["gateway"],
-            "ttl" => $ttl,
-        ]));
-
-        Logger::info("login", ["uid" => $uid, "name" => $name]);
+    // ---- 存活检查 ----
+    $app->get("/health", function (Request $req): Response {
+        return Response::ok(["ok" => true]);
     });
 
-    Logger::info("login ready", [
-        "host" => $login["host"],
-        "port" => $login["port"],
-        "gateway" => $login["gateway"],
-    ]);
-    $server->start();
+    // ---- 登录 ----
+    $app->post("/login", function (Request $req) use ($auth, $ttl, $gateway): Response {
+        $name = $req->postOf("name");
+        if ($name === "") {
+            // 也支持 JSON body
+            $body = $req->json();
+            $name = (string) ($body["name"] ?? "");
+        }
+        if ($name === "") {
+            return Response::fail(1001, "name required", 400);
+        }
+
+        // 真实项目这里查库拿自增 id；示例用稳定 hash 派生
+        $h = crc32($name);
+        if ($h < 0) {
+            $h += 4294967296;
+        }
+        $uid = (int) ($h % 900000000) + 100000000;
+
+        $token = $auth->sign($uid, $ttl);
+        Logger::info("login", ["uid" => $uid, "name" => $name]);
+
+        return Response::ok([
+            "uid" => $uid,
+            "token" => $token,
+            "gateway" => $gateway,
+            "ttl" => $ttl,
+        ]);
+    });
+
+    $app->run();
 }
