@@ -85,6 +85,21 @@ final class Script
         return \interp_invoke($target, $obj);
     }
 
+    /**
+     * 用受限视图调用脚本 —— **推荐的生产用法**。
+     *
+     * 和 call() 的区别：call() 直接传业务对象（脚本有全部权限），
+     * callWithContext() 传 Context（只能按白名单读写）。
+     */
+    public function callWithContext(string $name, Context $ctx): mixed
+    {
+        $target = $this->resolve($name);
+        if ($target === null) {
+            return null;
+        }
+        return \interp_invoke($target, $ctx);
+    }
+
     /** 文件是否比上次加载时更新 */
     public function changed(): bool
     {
