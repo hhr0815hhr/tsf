@@ -67,6 +67,12 @@ final class Script
     /** 重新加载（热更）。 */
     public function reload(): bool
     {
+        // 必须清 opcache：否则 zend_compile_file 拿到的是缓存里的旧字节码，
+        // 文件改了也不生效。这是「同进程热更」和「重启进程」的关键区别 ——
+        // 重启时 opcache 是空的，改了就能读到；同进程就一定要显式失效。
+        if (function_exists("opcache_invalidate")) {
+            @opcache_invalidate($this->path, true);
+        }
         return $this->load();
     }
 
