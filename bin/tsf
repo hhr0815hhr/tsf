@@ -279,6 +279,59 @@ function runCmd(string $cmd, string $cwd): int
     return $code;
 }
 
+/**
+ * 跑命令并**边输出边收集**，返回 [退出码, 完整输出]。
+ *
+ * 为什么不用 `exec`：编译有进度条，攒到最后一次性打印等于 11 秒没有任何反馈。
+ * 为什么不用 `passthru`：它只回显不收集，判断不了"失败发生在哪个阶段"。
+ * proc_open + fgets 两者都要，且逐行 flush 后进度条能正常滚动。
+ *
+ * @return array{rc:int, out:string}
+ */
+function runCmdCapture(string $cmd, string $cwd): array
+{
+    $old = getcwd();
+    if ($old !== false) {
+        chdir($cwd);
+    }
+    $desc = [1 => ["pipe", "w"], 2 => ["pipe", "w"]];
+    $p = proc_open($cmd, $desc, $pipes);
+    if (!is_resource($p)) {
+        if ($old !== false) {
+            chdir($old);
+        }
+        return ["rc" => 1, "out" => ""];
+    }
+    // stderr 不读会阻塞子进程，所以先设为非阻塞并在最后一起取
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $out = "";
+    while (true) {
+        $st = proc_get_status($p);
+        $chunk = (string) stream_get_contents($pipes[1]);
+        if ($chunk !== "") {
+            echo $chunk;
+            $out .= $chunk;
+        }
+        $err = (string) stream_get_contents($pipes[2]);
+        if ($err !== "") {
+            echo $err;
+            $out .= $err;
+        }
+        if (!$st["running"]) {
+            break;
+        }
+        usleep(20000);
+    }
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $rc = proc_close($p);
+    if ($old !== false) {
+        chdir($old);
+    }
+    return ["rc" => $rc, "out" => $out];
+}
+
 /// 在 PATH 里找一个可执行文件；找不到返回 null。
 function findInPath(string $name): ?string
 {
@@ -813,7 +866,29 @@ function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin):
     }
     file_put_contents($projDir . "/project.yml", $yml);
     $cmd = $phpBin . " " . escapeshellarg($tpc) . " project.yml";
-    return runCmd($cmd, $projDir);
+    $r = runCmdCapture($cmd, $projDir);
+    if ($r["rc"] === 0) {
+        return 0;
+    }
+
+    // 只有 **g++ 阶段** 的失败需要重试：并行编译（默认 4 job）会把 g++ 的
+    // stderr 吞掉，只留一句 `Compilation failed for: .../main.cc` + Translator 堆栈，
+    // 真正的错误（`error: 'server' is not captured`）看不到。
+    //
+    // 而 PHP→C++ 转换阶段的失败（`Fatal error: The variable $a is undefined ...`）
+    // 本来就打得很清楚，重试只会把同样的错误打第二遍，白等一次编译。
+    if (strpos($r["out"], "Compilation failed for:") === false) {
+        return $r["rc"];
+    }
+
+    // 串行重试的代价很小：已成功的文件命中增量缓存（会输出 [cached]），
+    // 只会真正编译出错的那几个。
+    say("");
+    say(c("  编译失败。", "y") . "并行模式吞掉了 g++ 的错误，改用串行模式重试以显示真实原因：");
+    say(c("  （已成功的文件走增量缓存，只重编出错的）", "d"));
+    say("");
+    $cmd2 = $phpBin . " " . escapeshellarg($tpc) . " project.yml -j 1";
+    return runCmd($cmd2, $projDir);
 }
 
 function findBinary(string $projDir): string
