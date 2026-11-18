@@ -5,14 +5,28 @@ namespace TSF\Gateway;
 use TSF\Kernel\Logger;
 
 /**
- * 简单的 token → uid 判定。
+ * token → uid 判定，兼签发。
  *
- * 现在支持两种来源：
+ * 支持三种来源：
  *   1. 配置文件里的静态表（server.auth.tokens，形如 {"tok-1001": 1001}）
- *   2. HMAC 签名：token = uid . "." . hmac_sha256(uid, secret)
+ *   2. HMAC 签名（无过期）：`uid . "." . hmac_sha256(uid, secret)`
+ *   3. HMAC 签名（带过期）：`uid . "." . exp . "." . hmac_sha256("uid.exp", secret)`
  *
- * 生产环境应该换成"登录服签发 + 网关验签"的短时票据；这里的实现是为了
- * 把登录链路打通，验证"验签 → 绑定 uid → 顶号"这条流程。
+ * ## 谁签谁验
+ *
+ * 生产链路是「**登录服签发 → 网关验签**」：登录服 `sign($uid, 300)` 出票，
+ * 网关用同一个 secret `resolve()` 验。两边是同一个类，所以格式不会写岔。
+ *
+ * ```php
+ * // 登录服（普通 PHP 或 AOT 都行）
+ * $auth = new TokenAuth([], $secret);
+ * $token = $auth->sign($uid, 300);      // 5 分钟有效
+ *
+ * // 网关（配置 server.auth.secret）
+ * $uid = $auth->resolve($token);        // 0 = 无效或过期
+ * ```
+ *
+ * 无过期格式保留是为了兼容已有部署；**新签发一律带上 ttl**。
  */
 final class TokenAuth
 {
@@ -45,30 +59,63 @@ final class TokenAuth
         if ($this->secret === "") {
             return 0;
         }
-        // 形如 "1001.<hex>"
-        $dot = strpos($token, ".");
-        if ($dot === false) {
+
+        $parts = explode(".", $token);
+        $n = count($parts);
+
+        if ($n === 2) {
+            // 旧格式：uid.sig（无过期）。保留是为了不打断已有部署。
+            $uidStr = $parts[0];
+            $sig = $parts[1];
+            if ($uidStr === "" || !is_numeric($uidStr)) {
+                return 0;
+            }
+            $expect = hash_hmac("sha256", $uidStr, $this->secret);
+            if (hash_equals($expect, $sig)) {
+                return (int) $uidStr;
+            }
             return 0;
         }
-        $uidStr = substr($token, 0, $dot);
-        $sig = substr($token, $dot + 1);
-        if ($uidStr === "" || !is_numeric($uidStr)) {
-            return 0;
+
+        if ($n === 3) {
+            // 新格式：uid.exp.sig
+            $uidStr = $parts[0];
+            $expStr = $parts[1];
+            $sig = $parts[2];
+            if ($uidStr === "" || !is_numeric($uidStr) || !is_numeric($expStr)) {
+                return 0;
+            }
+            // 签名覆盖 "uid.exp"，防止改 exp 延长有效期
+            $expect = hash_hmac("sha256", $uidStr . "." . $expStr, $this->secret);
+            if (!hash_equals($expect, $sig)) {
+                return 0;
+            }
+            if ((int) $expStr < time()) {
+                return 0;
+            }
+            return (int) $uidStr;
         }
-        $uid = (int) $uidStr;
-        $expect = hash_hmac("sha256", $uidStr, $this->secret);
-        if (hash_equals($expect, $sig)) {
-            return $uid;
-        }
+
         return 0;
     }
 
-    /** 供测试/工具生成签名 token */
-    public function sign(int $uid): string
+    /**
+     * 签发 token。
+     *
+     * @param int $uid
+     * @param int $ttl 有效秒数；<=0 表示不过期（兼容旧行为，不建议用于生产）
+     */
+    public function sign(int $uid, int $ttl = 0): string
     {
         if ($this->secret === "") {
             return "";
         }
-        return (string) $uid . "." . hash_hmac("sha256", (string) $uid, $this->secret);
+        $uidStr = (string) $uid;
+        if ($ttl <= 0) {
+            return $uidStr . "." . hash_hmac("sha256", $uidStr, $this->secret);
+        }
+        $expStr = (string) (time() + $ttl);
+        $payload = $uidStr . "." . $expStr;
+        return $payload . "." . hash_hmac("sha256", $payload, $this->secret);
     }
 }

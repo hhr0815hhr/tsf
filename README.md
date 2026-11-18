@@ -43,8 +43,8 @@ php-config 版本一致性、C++ 编译器（+ wasm 工具链可选项）。缺�
 
 ```bash
 tsf new my-server              # 1) 生成工程
-cd my-server && tsf serve .    # 2) 编译并启动（默认 9501）
-php85 client.php 9501          # 3) 另开终端验证
+cd my-server && tsf serve .    # 2) 编译并启动（默认 9001）
+php85 client.php 9001          # 3) 另开终端验证
 ```
 
 开发时 `tsf watch .`：改任何**构建输入**（`project.yml` 的 sources 里列的：`src/`、`gen/`、

@@ -901,6 +901,73 @@ function tplModulesReadme(): string
     return tplFile("modules.README.md.txt");
 }
 
+/**
+ * 生成登录服工程。
+ *
+ * 和游戏服的区别：**只有 HTTP，没有帧协议**。所以不生成 client.php、不生成
+ * modules/（wasm 热更和登录无关），config 里也没有 protocol 段。
+ */
+function cmdNewLogin(string $name, string $cwd, string $tsfRoot): int
+{
+    $projDir = $cwd . "/" . $name;
+    if (is_dir($projDir)) {
+        fail("目录已存在: " . $projDir);
+    }
+    if (!mkdir($projDir . "/config", 0777, true)) {
+        fail("创建目录失败: " . $projDir);
+    }
+    @mkdir($projDir . "/var/log", 0777, true);
+
+    $secret = bin2hex(random_bytes(16));
+
+    $cfg = [
+        "app" => ["name" => $name],
+        "log" => ["level" => "info", "file" => $projDir . "/var/log/app.log"],
+        "login" => [
+            "host" => "0.0.0.0",
+            "port" => 9101,
+            "secret" => $secret,
+            // token 有效期（秒）。网关侧不需要知道 ttl，它只验签和过期。
+            "token_ttl" => 300,
+            // 告诉客户端该连哪个网关（真实项目应该按大区/负载返回不同地址）
+            "gateway" => "127.0.0.1:9001",
+        ],
+    ];
+    file_put_contents(
+        $projDir . "/config/tsf.json",
+        json_encode($cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n"
+    );
+
+    $body = tplLogin();
+    if ($body === "") {
+        fail("找不到模板 tpl/login.main.php.txt");
+    }
+    file_put_contents($projDir . "/main.php", $body);
+
+    writeProjectJson($projDir, ["name" => $name, "packages" => []]);
+    file_put_contents($projDir . "/project.yml", genProjectYml($projDir, $tsfRoot));
+
+    ok("登录服已创建: " . $projDir);
+    say("");
+    say("下一步：");
+    say("  cd " . $name);
+    say("  tsf serve .                       # 编译并启动（默认 9101）");
+    say("  curl -X POST -d 'name=alice' \\");
+    say("    http://127.0.0.1:9101/login     # 拿 uid + token");
+    say("");
+    say("把 config/tsf.json 里的 secret 抄到游戏服的 server.auth.secret，");
+    say("两边一致网关才会认这个 token。");
+    return 0;
+}
+
+/** 登录服模板 */
+function tplLogin(): string
+{
+    $f = __DIR__ . "/../tpl/login.main.php.txt";
+    $s = @file_get_contents($f);
+    return is_string($s) ? $s : "";
+}
+
 function tplMain(): string
 {
     // 模板独立成文件（tsf/tpl/main.php.txt）：内容有一百多行、含多个顶层函数，
@@ -1279,7 +1346,11 @@ switch ($cmd) {
 
     case "new":
         if ($arg === "") {
-            fail("用法: tsf new <name>");
+            fail("用法: tsf new <name> [--login]");
+        }
+        $isLogin = in_array("--login", $argvv, true);
+        if ($isLogin) {
+            exit(cmdNewLogin($arg, getcwd(), $tsfRoot));
         }
         $projDir = getcwd() . "/" . $arg;
         if (is_dir($projDir)) {
