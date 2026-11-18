@@ -393,6 +393,114 @@ function docMinor(string $ver): string
  *
  * 退出码：必要项齐全返回 0，缺任何一项返回 1（可直接用在 CI 里）。
  */
+/**
+ * 列出 tsf 进程的内存占用。
+ *
+ * 为什么从 /proc 读而不是进程内统计：这是**外部**命令，拿不到别的进程的内存数据。
+ * 应用级的（服务数 / 信箱 / 定时器）要看 `Scheduler::stats()`，那个得由服务自己
+ * 通过 HTTP 接口吐出来（登录服的 /admin/mem）。
+ *
+ * 用法：
+ *   tsf mem              # 默认找命令行里带 typephp 的进程
+ *   tsf mem mygame       # 指定关键字
+ */
+function cmdMem(string $pattern): int
+{
+    $pat = $pattern === "" ? "typephp" : $pattern;
+
+    $pids = [];
+    @exec("pgrep -f " . escapeshellarg($pat) . " 2>/dev/null", $pids);
+    $pids = array_values(array_filter($pids, static fn ($x) => trim($x) !== ""));
+
+    if ($pids === []) {
+        say("没找到命令行匹配 [" . $pat . "] 的进程");
+        say("试试: tsf mem <你的工程名>");
+        return 1;
+    }
+
+    printf("%-8s %10s %8s %12s  %s\n", "PID", "RSS", "线程", "运行时长", "命令行");
+
+    foreach ($pids as $pid) {
+        $pid = (int) trim($pid);
+
+        // 只看真正的可执行文件：pgrep -f 会匹配到 bash -c "...hi..." 这类命令行，
+        // 用 /proc/{pid}/exe 指向的真实路径才能真正区分"这是不是一个 tsf 程序"。
+        $exe = @readlink("/proc/" . $pid . "/exe");
+        if (!is_string($exe) || $exe === "") {
+            continue;
+        }
+        $base = basename($exe);
+        if ($pat !== "" && !str_contains($exe, $pat) && !str_contains($base, $pat)) {
+            continue;
+        }
+
+        $status = @file_get_contents("/proc/" . $pid . "/status");
+        if (!is_string($status)) {
+            continue;
+        }
+
+        $rssKb = 0;
+        $threads = 0;
+        foreach (explode("\n", $status) as $line) {
+            if (str_starts_with($line, "VmRSS:")) {
+                $parts = preg_split('/\s+/', trim($line));
+                $rssKb = isset($parts[1]) ? (int) $parts[1] : 0;
+            } elseif (str_starts_with($line, "Threads:")) {
+                $parts = preg_split('/\s+/', trim($line));
+                $threads = isset($parts[1]) ? (int) $parts[1] : 0;
+            }
+        }
+
+        // 运行时长：进程启动时刻到现在
+        $elapsed = "-";
+        $stat = @file_get_contents("/proc/" . $pid . "/stat");
+        if (is_string($stat)) {
+            // 第 22 个字段是 starttime（单位 jiffies）
+            $close = strrpos($stat, ")");
+            if ($close !== false) {
+                $rest = preg_split('/\s+/', trim(substr($stat, $close + 2)));
+                $start = isset($rest[19]) ? (int) $rest[19] : 0;
+                if ($start > 0) {
+                    $uptime = (float) @file_get_contents("/proc/uptime");
+                    $elapsed = fmtDuration((int) ($uptime - $start / 100.0));
+                }
+            }
+        }
+
+        $cmd = @file_get_contents("/proc/" . $pid . "/cmdline");
+        $cmdStr = is_string($cmd) ? str_replace("\0", " ", trim($cmd)) : "";
+        if (strlen($cmdStr) > 60) {
+            $cmdStr = substr($cmdStr, 0, 57) . "...";
+        }
+
+        printf("%-8d %8.1f MB %8d %12s  %s\n", $pid, $rssKb / 1024.0, $threads, $elapsed, $cmdStr);
+    }
+
+    return 0;
+}
+
+/** 秒数格式化成 1d2h / 3h4m / 5m6s */
+function fmtDuration(int $sec): string
+{
+    if ($sec < 0) {
+        return "-";
+    }
+    $d = intdiv($sec, 86400);
+    $h = intdiv($sec % 86400, 3600);
+    $m = intdiv($sec % 3600, 60);
+    $s = $sec % 60;
+    if ($d > 0) {
+        return $d . "d" . $h . "h";
+    }
+    if ($h > 0) {
+        return $h . "h" . $m . "m";
+    }
+    if ($m > 0) {
+        return $m . "m" . $s . "s";
+    }
+    return $s . "s";
+}
+
 function doctor(string $tsfRoot, string $tpc, string $phpBin): int
 {
     $need = 0;
@@ -1560,6 +1668,9 @@ switch ($cmd) {
     case "verify":
         $root = dirname(__DIR__, 2);
         exit(verifyRun($root, $argv));
+
+    case "mem":
+        exit(cmdMem($arg));
 
     case "doctor":
         exit(doctor($tsfRoot, $tpc, $phpBin));
