@@ -292,6 +292,247 @@ function findInPath(string $name): ?string
  *
  * 所以这一版把「检查 + 编译 + 预编译 + 记账」串成一条命令，产出可发布的 dist/。
  */
+/**
+ * 一行检查结果。
+ *
+ * @param string $level g=通过 y=提示 r=缺失
+ */
+function docLine(string $level, string $what, string $note): void
+{
+    $mark = "✓";
+    if ($level === "y") {
+        $mark = "!";
+    } elseif ($level === "r") {
+        $mark = "✗";
+    }
+    echo "  " . c($mark, $level) . " " . str_pad($what, 26) . " " . c($note, "d") . PHP_EOL;
+}
+
+/** 在 PATH 里找一个可执行文件，返回绝对路径或空串 */
+function docWhich(string $name): string
+{
+    $path = getenv("PATH");
+    if (!is_string($path)) {
+        return "";
+    }
+    foreach (explode(PATH_SEPARATOR, $path) as $dir) {
+        if ($dir === "") {
+            continue;
+        }
+        $full = $dir . "/" . $name;
+        if (is_file($full) && is_executable($full)) {
+            return $full;
+        }
+    }
+    return "";
+}
+
+/** 跑 `<bin> --version` 拿版本号（失败返回空串） */
+function docVersion(string $bin): string
+{
+    if (!is_executable($bin)) {
+        return "";
+    }
+    $out = [];
+    $rc = 1;
+    @exec(escapeshellarg($bin) . " --version 2>/dev/null", $out, $rc);
+    if ($rc !== 0 || $out === []) {
+        return "";
+    }
+    // "PHP 8.5.12 (cli) ..." 或 "8.5.12" 两种格式都见过
+    $line = trim($out[0]);
+    if (preg_match('/(\d+\.\d+\.\d+)/', $line, $m) === 1) {
+        return $m[1];
+    }
+    return "";
+}
+
+/** 取主次版本 "8.5" */
+function docMinor(string $ver): string
+{
+    $parts = explode(".", $ver);
+    if (count($parts) < 2) {
+        return $ver;
+    }
+    return $parts[0] . "." . $parts[1];
+}
+
+/**
+ * 环境自检。
+ *
+ * ## 为什么需要这个命令
+ *
+ * tsf 不是纯 PHP 框架 —— 它依赖四样 PHP 装不出来的东西：
+ *   编译器 tpc、C++ 后端（clang/g++）、特定版本的 PHP（ZTS + swoole + phpx）、
+ *   以及（写 wasm 模块时的）WASI 工具链。
+ *
+ * 缺任何一个，`tsf build` 都只会抛一句很难定位的错（比如
+ * "WASI toolchain check failed" 之后你并不知道到底缺什么）。
+ * doctor 把这些前置条件在报错**之前**说清楚，并给出修复命令。
+ *
+ * 退出码：必要项齐全返回 0，缺任何一项返回 1（可直接用在 CI 里）。
+ */
+function doctor(string $tsfRoot, string $tpc, string $phpBin): int
+{
+    $need = 0;
+    $optional = 0;
+
+    echo PHP_EOL . c("TSF 环境自检", "b") . "   tsf " . TSF_VERSION . PHP_EOL;
+    echo str_repeat("-", 62) . PHP_EOL;
+
+    // ---------------- 必要项 ----------------
+    echo PHP_EOL . "必要项（缺一个 tsf build 就跑不起来）" . PHP_EOL;
+
+    // 1. PHP 版本
+    if (version_compare(PHP_VERSION, "8.5.0", ">=")) {
+        docLine("g", "PHP " . PHP_VERSION, "需要 >= 8.5");
+    } else {
+        docLine("r", "PHP " . PHP_VERSION, "需要 >= 8.5（当前版本过低）");
+        $need++;
+    }
+
+    // 2. swoole
+    if (extension_loaded("swoole")) {
+        $v = phpversion("swoole");
+        docLine("g", "swoole", (is_string($v) ? $v : "已加载"));
+    } else {
+        docLine("r", "swoole 扩展", "未加载 —— 编辑产物以它为基础，必须装");
+        $need++;
+    }
+
+    // 3. phpx 运行时（typephp 编译产物链接的库）
+    $home = getenv("HOME");
+    $home = is_string($home) ? $home : "";
+    $phpx = $home . "/typephp-src/vendor/swoole/phpx/lib/libphpx.so";
+    if (is_file($phpx)) {
+        docLine("g", "phpx 运行时", $phpx);
+    } else {
+        docLine("r", "phpx 运行时", "缺 " . $phpx . " —— 先构建 typephp-src");
+        $need++;
+    }
+
+    // 4. tpc 编译器
+    if (is_file($tpc) && is_readable($tpc)) {
+        docLine("g", "tpc 编译器", $tpc);
+    } else {
+        docLine("r", "tpc 编译器", "缺 " . $tpc . " —— 设 TPC 环境变量指向它");
+        $need++;
+    }
+
+    // 5. 用来跑 tpc 的 PHP（必须是 ZTS + 与目标版本一致）
+    $phpPath = docWhich($phpBin);
+    if ($phpPath !== "") {
+        docLine("g", "编译用 PHP", $phpBin . " → " . $phpPath);
+    } else {
+        docLine("r", "编译用 PHP", "PATH 里找不到 " . $phpBin . " —— 设 TSF_PHP 或加到 PATH");
+        $need++;
+    }
+
+    // 6. php-config（tpc 要拿它查头文件和链接参数）
+    $phpConfig = "";
+    $realBin = "";
+    if ($phpPath !== "") {
+        // $phpBin 可能是 /usr/local/bin 下的包装脚本，dirname 推出来的 php-config 不存在。
+        // 用 PHP_BINDIR 拿真实安装目录（比如 /usr/local/php-8.5-zts/bin）。
+        $out = [];
+        @exec(escapeshellarg($phpPath) . " -r " . escapeshellarg('echo PHP_BINDIR;') . " 2>/dev/null", $out);
+        $realBin = isset($out[0]) ? trim($out[0]) : "";
+        if ($realBin !== "") {
+            $guess = $realBin . "/php-config";
+            if (is_file($guess) && is_executable($guess)) {
+                $phpConfig = $guess;
+            }
+        }
+        if ($phpConfig === "") {
+            $guess = dirname($phpPath) . "/php-config";
+            if (is_file($guess) && is_executable($guess)) {
+                $phpConfig = $guess;
+            }
+        }
+    }
+    if ($phpConfig === "") {
+        $w = docWhich("php-config");
+        if ($w !== "") {
+            $phpConfig = $w;
+        }
+    }
+    if ($phpConfig === "") {
+        docLine("r", "php-config", "找不到 —— 和编译用 PHP 装在同一目录");
+        $need++;
+    } else {
+        // 版本必须和"编译用 PHP"一致。不一致的后果很隐蔽：
+        // phpize 生成的 configure 会拿错版本的头文件，编译时报一堆
+        // "implicit declaration" / "unknown type name" —— 报错点和真正原因相距很远。
+        $cfgVer = docVersion($phpConfig);
+        $phpVer = $phpPath !== "" ? docVersion($phpPath) : "";
+        if ($cfgVer !== "" && $phpVer !== "" && docMinor($cfgVer) !== docMinor($phpVer)) {
+            docLine("r", "php-config", $phpConfig . " 是 " . $cfgVer
+                . "，和编译用 PHP " . $phpVer . " 不一致");
+            $hint = $realBin !== "" ? ($realBin . "/php-config") : (dirname($phpPath) . "/php-config");
+            echo "      " . c("→ 用同版本的 php-config：", "d") . c($hint, "d") . PHP_EOL;
+            $need++;
+        } else {
+            $note = $phpConfig;
+            if ($cfgVer !== "") {
+                $note = $cfgVer . "  " . $phpConfig;
+            }
+            docLine("g", "php-config", $note);
+        }
+    }
+
+    // 7. C++ 编译器
+    $cxx = docWhich("clang++");
+    if ($cxx === "") {
+        $cxx = docWhich("g++");
+    }
+    if ($cxx !== "") {
+        docLine("g", "C++ 编译器", $cxx);
+    } else {
+        docLine("r", "C++ 编译器", "clang++ / g++ 都没有 —— apt install build-essential");
+        $need++;
+    }
+
+    // ---------------- 可选项 ----------------
+    echo PHP_EOL . "可选项（只有写 wasm 热更模块才需要，见 docs/guide/09）" . PHP_EOL;
+
+    $wasmTools = [
+        "wasm32-wasip2-clang" => "wasi-sdk，clang 必须 >= 22",
+        "wasmtime" => "运行/验证 wasm 模块",
+        "wit-bindgen" => "0.60，生成接口绑定",
+        "tp-precompile" => "预编译成 .cwasm（不能用 wasmtime compile 代替）",
+    ];
+    foreach ($wasmTools as $tool => $why) {
+        $found = docWhich($tool);
+        if ($found !== "") {
+            docLine("g", $tool, $found);
+        } else {
+            docLine("y", $tool, "缺 —— " . $why);
+            $optional++;
+        }
+    }
+
+    // ---------------- 汇总 ----------------
+    echo PHP_EOL . str_repeat("-", 62) . PHP_EOL;
+    if ($need === 0) {
+        echo c("必要项全部通过", "g") . "，可以 tsf new / tsf build" . PHP_EOL;
+        if ($optional > 0) {
+            echo c("可选项缺 " . $optional . " 个", "d") . "：不影响 native，写 wasm 模块时再补" . PHP_EOL;
+        }
+        return 0;
+    }
+
+    echo c("还缺 " . $need . " 个必要项", "r") . "，tsf build 会失败" . PHP_EOL;
+    echo PHP_EOL . "修复思路：" . PHP_EOL;
+    echo "  1. 装 PHP 8.5（ZTS），带 swoole，并配上 phpx" . PHP_EOL;
+    echo "     → 见 docs/guide/00-quickstart.md「环境准备」" . PHP_EOL;
+    echo "  2. 构建 typephp-src 拿到 tpc：" . PHP_EOL;
+    echo "     cd \$HOME/typephp-src && cmake ... && make" . PHP_EOL;
+    echo "  3. 用环境变量覆盖默认路径（不想装在默认位置时）：" . PHP_EOL;
+    echo "     export TPC=/path/to/tpc.php" . PHP_EOL;
+    echo "     export TSF_PHP=php85" . PHP_EOL;
+    return 1;
+}
+
 function moduleBuild(string $projDir, string $tpc, string $phpBin): int
 {
     $ymlPath = $projDir . "/project.yml";
@@ -1353,6 +1594,9 @@ switch ($cmd) {
     case "verify":
         $root = dirname(__DIR__, 2);
         exit(verifyRun($root, $argv));
+
+    case "doctor":
+        exit(doctor($tsfRoot, $tpc, $phpBin));
 
     case "module":
         $sub = $argv[2] ?? "";
