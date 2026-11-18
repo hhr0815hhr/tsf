@@ -1568,6 +1568,16 @@ switch ($cmd) {
             fail("用法: tsf " . $cmd . " <package>");
         }
         $projDir = getcwd();
+        // 必须有 project.json 才动手。早先直接按 cwd 写，在工程父目录执行时
+        // 会新建一个空的 project.json 并"成功"提示已启用 —— 而真正的工程
+        // 配置一点没变，下次 build 依然没编进那个包，排查时完全想不到是这一步。
+        if (!is_file($projDir . "/project.json")) {
+            fail(
+                "当前目录没有 project.json，不能在" . "这里改包集合。" . PHP_EOL
+                . "  当前目录: " . $projDir . PHP_EOL
+                . "  请 cd 到工程目录再执行（含 main.php 与 project.json 的那一层）"
+            );
+        }
         $all = listPackages($tsfRoot);
         if (!isset($all[$arg])) {
             fail("没有这个包: " . $arg . "（用 tsf list 查看可用包）");
