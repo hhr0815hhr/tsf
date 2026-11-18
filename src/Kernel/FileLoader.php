@@ -31,6 +31,31 @@ namespace TSF\Kernel;
 final class FileLoader
 {
     /**
+     * 文件内容指纹（crc32）。用来判断"这次要不要重载"。
+     *
+     * ## 为什么不返回 mtime
+     *
+     * 框架里有条已经吃过两次亏的规矩：**判"内容有没有变"要看内容，不要看时间戳**。
+     * `filemtime()` 只到秒——一秒内改两次看不到；改一个等长的值（`12` → `45`）
+     * 连文件大小都不变。两个维度同时失效，现象就是"改了但不生效，日志里一次变更都没有"。
+     *
+     * 配置表那边（`TSF\Config\Watcher`）用的是导出端算好 crc32 的清单；
+     * 这里没有导出端，所以直接对文件内容算。PHP 配置文件通常几 KB，
+     * crc32 在微秒级，每帧算一次也不值得优化成增量。
+     *
+     * 返回空串表示文件不可读——调用方应当把它当成"这次不重载"，
+     * 而不是"内容变了"。
+     */
+    public static function hash(string $path): string
+    {
+        $raw = @file_get_contents($path);
+        if ($raw === false || $raw === "") {
+            return "";
+        }
+        return (string) crc32($raw);
+    }
+
+    /**
      * 加载一个返回 array 的文件（配置表的主力场景）。
      *
      * @return array<string, mixed>|array<int, mixed>|null
