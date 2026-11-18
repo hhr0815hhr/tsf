@@ -1,489 +1,136 @@
 # TSF — TypePHP Server Framework
 
-> 用 TypePHP（AOT）+ PHP 构建高性能游戏服务器，取代「C++ + Lua」。
-> 当前版本：**v0.7.0**（M0–M6 全交付；M7 的模块级热更 T7-01/02/03/05 已落地，T7-04 零件齐但未串联，L1 不做）
-> 上一版是 2026-11-12 的 v0.1.0-m0（只有骨架）。变更记录见 `../CHANGELOG.md`。
+> 用 TypePHP（AOT 编译）+ PHP 写游戏服务器，替代「C++ + Lua」。
+>
+> **性能**：单 worker 稳态 116 万 msg/s（echo）；8 worker 单机 3.4 万在线（10Hz 心跳）。
+> **代价**：AOT 之后改不了运行中的代码，热更靠「配置热更 + wasm 模块 + 滚动重启」三条轨道。
+
+```
+客户端 ──TCP/WS──> Gateway ──> Service（业务）──> pkg/db、pkg/redis、pkg/mail ...
+                     │                │
+                分帧+鉴权+心跳    Scheduler 调度
+```
 
 ---
 
-## 一、30 秒跑起来
+## 安装
+
+> **需要 PHP 8.5 ZTS（线程安全版）。** 8.4 及以下会被 composer 拒绝；NTS 版能装上，
+> 但会在**链接期**报一堆和版本无关的错误（phpx 依赖 ZTS 的线程模型）。
 
 ```bash
-# 1) 生成工程
-cd demo && tsf new my-server
+# 1) 框架（约 3.2MB，142 个文件）
+#    在 composer.json 里加这两项（包还没发到 Packagist）：
+#      "repositories": [{ "type": "vcs", "url": "https://github.com/hhr0815hhr/tsf" }],
+#      "require": { "hhr0815hhr/tsf": "^0.7" }
+composer install
 
-# 2) 编译并启动（会自动生成 project.yml 并调用 tpc）
-cd my-server && tsf serve .
+# 2) 工具链：typephp 编译器（约 42MB，解压 168MB）
+curl -fsSL https://raw.githubusercontent.com/hhr0815hhr/TypeServer/main/scripts/install-toolchain.sh | bash
+export TPC=~/.tsf/toolchain/typephp/bin/tpc.php
+export TSF_PHP=php85
 
-# 3) 另开终端验证 echo
-php85 client.php 9001
-# resp msgId=1002 body=hello-tsf-... 
-# OK: echo matched
+# 3) 自检
+./vendor/bin/tsf doctor
 ```
 
-开发时用 `tsf watch .`：改任何**构建输入**（`project.yml` 的 sources 里列的，
-含 `src/`、`gen/`、包目录、框架源码）后自动重编重启。改一行到看到效果 **1.4~1.9 s**（§24）。
+> **为什么不能只写 `composer require`**：包还没发到 Packagist，Composer 默认只查 Packagist，
+> 所以必须先声明 `repositories`。发到 Packagist 之后这一项就可以删了。
 
-提交前跑一遍 `tsf lint`：检查"无 `mixed` 类型声明、命名空间与目录一致、`ext/` 无框架类"，
-违反则返回非 0（可挂 CI）。标准见 §5.8。
+**为什么是两步**：tsf 不是纯 PHP 框架 —— 它调用 typephp 编译器（`tpc`）把 PHP 编成 C++。
+Composer 只能装 PHP 代码，装不了编译器本体和 C++ 后端（clang），所以工具链单独发。
+
+**`tsf doctor` 检查什么**：PHP 版本 + ZTS、swoole、phpx 运行时、tpc、编译用 PHP、
+php-config 版本一致性、C++ 编译器（+ wasm 工具链可选项）。缺什么直接给修复命令。
 
 ---
 
-## 二、当前能力（M0 ~ M6）
+## 30 秒跑起来
 
-| 能力 | 状态 | 说明 |
-|:--|:--|:--|
-| 依赖注入 | ✅ | **没有全局容器**：一律构造参数显式注入（见 §5.2）。曾经有个 `Container`，零调用者，已删 |
-| 分层配置 | ✅ | `tsf.json` → `tsf.{env}.json` → `tsf.local.json`，点号键访问 |
-| 配置运行期生效 | ✅ | 改端口/日志级别**不需要重编**，重启进程生效（配置在 `boot()` 时读入，不做文件热重载） |
-| 结构化日志 | ✅ | JSON Lines，error 额外写 stderr |
-| 启动序列 | ✅ | 配置 → 日志 → 建目录 → 业务 |
-| TCP 服务 | ✅ | 长度前缀帧（8 字节头），自动拆包/粘包 |
-| 帧异常处理 | ✅ | 非法帧头断开连接，服务继续可用 |
-| **编解码双实现** | ✅ | `protocol.frame: header/native`，运行期切换，实测 +13.3%（多次测量落在 +8%~+13%） |
-| **类型标准** | ✅ | 全框架无 `mixed` 类型声明，`tsf lint` 门禁 |
-| **会话管理** | ✅ | fd ↔ uid 双向索引，顶号（同 uid 二次登录踢旧连接） |
-| **鉴权** | ✅ | 静态 token 表 + HMAC 签名两种，`auth.require` 可关（仅压测） |
-| **心跳** | ✅ | PING/PONG + 服务端空闲扫描，实测阈值 3s → 4.6s 断开 |
-| **限流** | ✅ | 每连接令牌桶，**每帧 74 ns**（-O2），超出回 `TOO_FAST`（每秒最多提示一次） |
-| **背压** | ✅ | 发送失败累计 N 次断开慢客户端（实测阈值 20 生效） |
-| **WebSocket** | ✅ | `server.transport: ws`，payload 复用同一套二进制帧，7/7 用例通过 |
-| **连接规模** | ✅ | **8,500 连接零丢失**（68,005/68,005，CPU 35.8% 单核）；2 万连接需 2G `memory_limit`（自动抬高，见 §5.11） |
-| **Service 调度** | ✅ | 消息模型 + 按批让出 + 信箱上限；稳态 **116 万条/s**，p99 20 µs（见 §9） |
-| **定时器** | ✅ | 时间轮 + 远端堆；10 万定时器误差 **全部 0 ms**，cron 分钟粒度 |
-| **跨进程消息** | ✅ | UDS + 攒批 + 入站认领；2000 次往返 **p99 285 µs**（10 µs tick） |
-| **RPC** | ✅ | 请求-响应 + 超时；跨进程往返 **p99 377 µs**（单次，见 §13）；协议可插拔（JSON/Raw/自定义）；不做自动重试 |
-| **服务发现** | ✅ | 注册 + 心跳 + 变更通知；`kill -9` 后 **3016 ms** 收敛（TTL 3000，见 §14）；codec 不一致能在建连前发现 |
-| **分片路由** | ✅ | 一致性哈希 + 虚拟节点；扩容迁移 **24.8%**（理论 25%）、零跨老节点搬迁；查找 **705~1672 ns**（见 §15） |
-| **跨服路由** | ✅ | 按 uid 透明调用；本地 **58 µs** / 远端 **217 µs**（p50），200 个请求零失败、零节点不符（见 §16） |
-| **熔断降级** | ✅ | 三态 + 单探针 + 冷却翻倍；半死节点 **250 ms** 摘除（验收 5 s），摘除后 **30.6 µs** 返回；业务错误不误熔断（见 §17） |
-| **集群压测** | ✅ | 3 节点跨服混合 **16.9k req/s**、p99 **1.75 ms**；冻住一个节点后健康节点 p99 **4.19 ms**、零失败；容量拐点 ~20k req/s（见 §18） |
-| **单目标限流** | ✅ | 每目标在飞上限；冻节点过渡期吞吐 **763 → 20 992 req/s（27 倍）**，基线与稳态无变化（见 §18.8） |
-| **配置表** | ✅ | Excel 表头即 schema；外键/区间/主键校验失败即中断且不写产物；**末尾追加列不用重编**；1 万行加载 **63 ms**（见 §19） |
-| **配置热更** | ✅ | 盯 crc 清单（不看 mtime，秒级精度会漏）；小表 **34 ms** 生效、坏数据被拒仍服务旧值；万行表 71~106 ms（见 §20） |
-| **协议生成** | ✅ | proto3 子集 → 消息类 + 编解码，**字节与标准 protobuf 一致**（前端可直接用 protobuf.js）；59 项断言（见 §21） |
-| **指标** | ✅ | 指数分桶直方图（误差恒定 ≤19%）；慢调用自动打点且**限流**；`inc` **81 ns** / `observe` **390 ns**（见 §22） |
-| **GM 通道** | ✅ | 独立端口 + 迷你 HTTP；空 token 拒启动 / 只绑本机 / 头传 token / 爆破限流；审计由框架统一记（见 §23） |
-| **慢消息治理** | ✅ | 检测 + 告警 + 可选销毁；**不能中断**（实测 `cancel` 无效），开启代价 −13.8% |
-| **状态机** | 📦 包 | `pkg/fsm`：转移表 + 钩子；`fire()` **207 ns**，零依赖，可挂任意对象 |
-| **Room 与成员** | 📦 包 | `pkg/room`：状态机 + 成员表（身份/席位，**零坐标**）；观战不占席位 |
-| **坐标与视野同步** | 📦 包 | `pkg/entity` 的 `EntitySet`：只在位置真变时回调；200 实体 **258 ns/个/帧** |
-| **AOI 九宫格** | 📦 包 | `pkg/aoi`：无状态视野；格内移动 **322 ns**、跨格 21.5 µs |
-| **匹配器** | 📦 包 | `pkg/match`：排序 + 容差放宽；1000 人单轮 **2.4 ms**，配对率由池子密度决定（见 §10.7） |
-| **数据访问** | 📦 包 | `pkg/db`：Attribute 映射 + 懒连接 + 分库 + 版本化迁移；按主键读 **~4 µs**，全 AOT（见 §12） |
-| **房间快照** | 📦 包 | `pkg/snapshot`：带版本 JSON + 原子写；200 实体恢复 **0.4 ms**、60 房 **1.7 ms**，`kill -9` 后房间继续跑（见 §12.7） |
-| **事件日志** | 📦 包 | `pkg/eventlog`：追加写 + 两档持久性；**1,000 笔 kill -9 零丢失**，追加 2.6 µs/条（§12.9）。已接进 `demo/duel` 做金币结算：**5 轮随机 kill -9，余额与日志始终一致、无重复（§25）** |
-| CLI | ✅ | `new` / `build` / `serve` / `watch` / `migrate` / `migrate-status` / `list` / `add` / `remove` / `lint` / `version` |
-
-**wasm 热更（M7）**：模块级热更已可用——`tsf/pkg/wasm`（`Module::load / canary /
-swap / call2 / stats`，灰度用 hash(key) 确定性分流）、`tsf module build` 一条命令出包
-（cwasm + manifest）、全量与回滚双向可逆（3.5–5.5 ms）。**未做**：L1（C++ 函数级，
-工程上不可行）、T7-04 的「发布 → drain → 重启 → 恢复」一条命令串联（drain 与重连
-本身已验收）。详见 `../docs/DESIGN-WASM-HOTRELOAD.md`。
-其余曾列在这里的「RPC 框架、集群成员管理、配置表导出、监控指标、迁移工具、
-房间快照、事件日志」都已交付，见上表对应行——这段曾经漏改，一直写到 2026-11 才修。
-
-### 2.1 网关处理顺序
-
-```
-收帧
- └─ 1. 会话记账（touchFrame：活跃时间 + 帧计数）
- └─ 2. 限流检查（take：读-判断-写；补充由每秒 tick 批量做）
- └─ 3. 系统消息：PING → PONG ／ LOGIN → 鉴权 → 绑定 uid →（顶号踢旧）
- └─ 4. 业务消息：要求已登录 → 按 msgId 派发给处理器
+```bash
+tsf new my-server              # 1) 生成工程
+cd my-server && tsf serve .    # 2) 编译并启动（默认 9501）
+php85 client.php 9501          # 3) 另开终端验证
 ```
 
-顺序是设计出来的：**限流在鉴权之前**——未登录连接同样消耗 CPU，先挡洪泛；
-但登录帧本身也受限流，否则一个连接可以暴力撞 token。
+开发时 `tsf watch .`：改任何**构建输入**（`project.yml` 的 sources 里列的：`src/`、`gen/`、
+包目录、框架源码）后自动重编重启，改一行到看到效果 **1.4~1.9 s**。
 
-### 2.2 配置项
-
-| 键 | 默认 | 说明 |
-|:--|:--:|:--|
-| `protocol.frame` | `native` | `native`（C++）/ `header`（纯 PHP） |
-| `protocol.payload` | `raw` | `raw` / `json` / `msgpack` / `protobuf` / `registry` |
-| `server.transport` | `tcp` | `tcp` / `ws` |
-| `server.gateway` | `true` | `false` 仅用于压测对照（无会话/限流/心跳） |
-| `server.heartbeat_sec` | 30 | 空闲多久断开；实际断开 = 阈值 + 1~2s（秒级扫描） |
-| `server.rate_per_sec` | 50 | 每秒补充令牌；`0` 表示不限流（走快路径） |
-| `server.rate_burst` | 100 | 桶容量（允许的瞬时突发） |
-| `server.send_fail_limit` | 50 | 连续发送失败多少次断开该连接（背压） |
-| `server.auth.require` | `true` | `false` 仅用于压测/内网 |
-| `server.auth.secret` | `dev-secret-change-me` | HMAC 密钥；配合 `uid.hmac` 形式的 token |
-| `server.auth.tokens.*` | — | 静态 token → uid 映射 |
-
-> 早期版本用过 `server.codec` / `server.protocol`，已删除（不再是"兼容保留"）。
-> 配置键就是上面这些，多一个都会让人猜"到底哪个生效"。
+提交前 `tsf lint`：禁 `mixed`、命名空间与目录一致，违反返回非 0。
 
 ---
 
-## 三、目录结构
+## 能力一览
+
+### 框架（`tsf/src`）
+
+| 模块 | 内容 |
+|:--|:--|
+| `Kernel` | Bootstrap、AppConfig、Logger、Env |
+| `Transport` | TCP / WebSocket，分帧在传输层做 |
+| `Protocol` | 分帧 + 载荷两层独立可换（`native`/`header` × `raw`/`json`/`msgpack`/`protobuf`/`registry`） |
+| `Gateway` | 鉴权、限流、心跳、会话、断线保留、protobuf 编解码 |
+| `Service` | 单进程调度（`Scheduler`）：`spawnOf`、`deliver`、`self`、`interval`、`every` |
+| `Rpc` / `Discovery` / `Shard` / `Cluster` | 跨进程调用、服务发现、分片路由、跨服路由、熔断 |
+| `Proto` | protobuf 运行时（Reader / Wire / Message），供 `tsf proto build` 生成的类使用 |
+| `Config` | 配置表读取（`tsf config build` 产出的 bin） |
+| `Gm` / `Metrics` / `Breaker` | 管理命令、指标埋点、熔断 |
+
+### 功能包（`tsf/pkg`）
+
+| 包 | 内容 |
+|:--|:--|
+| `db` | `Repo`（声明式实体）+ `Db`（事务 / 分片）+ 三种驱动（sqlite / mysql / pgsql） |
+| `redis` | 连接封装（`\Redis` 的薄包装，不做 ORM） |
+| `schedule` | 定时任务（cron + 延迟 + 周期） |
+| `mail` | 站内信：发信 / 列表 / 已读 / 领取 / 过期清理，领取幂等 |
+| `room` / `match` / `fsm` / `aoi` | 玩法层：房间、匹配、状态机、视野 |
+| `entity` / `snapshot` | 实体管理与状态快照 |
+| `frameloop` | 固定帧循环（10Hz / 20Hz 玩法） |
+| `eventlog` | 事件日志（金币结算等） |
+| `wasm` | wasm 模块加载（`Module::load`）+ 接口声明（`Iface`） |
+
+### 工具链（`tsf/bin/tsf`）
+
+| 命令 | 作用 |
+|:--|:--|
+| `tsf new <name>` | 生成工程（含 `modules/` 目录和 wasm 示例） |
+| `tsf build [dir]` | 编译（生成 `project.yml` 并调 `tpc`） |
+| `tsf serve [dir]` | 编译并启动 |
+| `tsf watch [dir]` | 监听构建输入，变更自动重编重启 |
+| `tsf module add/build/build-all` | wasm 模块的创建与编译 |
+| `tsf proto build [dir]` | `.proto` → `gen/Proto/*.php` |
+| `tsf config build/check [dir]` | Excel → `gen/Config/*.php` + `build/config/*.bin` |
+| `tsf lint [dir]` | 静态检查（禁 `mixed`、命名空间与目录一致） |
+| `tsf doctor` | 环境自检（见上） |
+
+---
+
+## 目录结构
 
 ```
 tsf/
-├── bin/tsf                          CLI（解释执行，开发期工具）
-├── ext/
-│   └── codec/                       原生原语：只有 3 个 c_* 函数，无协议语义
-│       ├── cpp-src/codec.cc
-│       └── php-src/codec.stub.php
-└── src/
-    ├── Kernel/                      内核：与业务无关的基础设施
-    │   ├── Bootstrap.php            启动序列
-    │   ├── Config.php               分层配置（扁平化）
-    │   └── Logger.php               结构化日志
-    ├── Protocol/                    协议：把字节流变成消息
-    │   ├── Msg.php                  系统协议号
-    │   ├── ProtocolStack.php         两层组合入口（fromConfig）
-    │   ├── DecodedMessage.php       组合层的解码结果
-    │   ├── Contract/
-    │   │   ├── FrameCodec.php       interface：分帧
-    │   │   ├── PayloadCodec.php     interface：消息体
-    │   │   └── DecodedFrame.php     分帧结果（对象，不是混合数组）
-    │   ├── Frame/
-    │   │   ├── HeaderFrame.php      8 字节定长头（**唯一权威实现**）
-    │   │   └── NativeHeaderFrame.php 同一格式，逐字节操作走 C++
-    │   └── Payload/
-    │       ├── RawPayload.php       原样透传（默认，零成本）
-    │       ├── JsonPayload.php
-    │       ├── MsgpackPayload.php
-    │       ├── RegistryPayload.php  按 msgId 注册闭包
-    │       └── ProtobufPayload.php
-    ├── Transport/                   传输：只管收发字节和连接生命周期
-    │   ├── Server.php               抽象基类：拆包 + 派发
-    │   ├── ServerFactory.php        tcp / ws 装配（AOT 类型稳定）
-    │   ├── Tcp/TcpServer.php
-    │   └── Ws/WsServer.php
-    ├── Gateway/                     连接层业务：会话 / 鉴权 / 限流 / 背压
-    │   ├── Gateway.php
-    │   ├── Session.php
-    │   ├── SessionManager.php
-    │   ├── TokenAuth.php
-    │   └── RateLimiter.php
-    ├── Service/                     服务调度：消息 / 信箱 / 调度器
-    │   ├── Message.php              消息信封
-    │   ├── Mailbox.php              单消费者 FIFO（含积压上限）
-    │   ├── Service.php              服务基类（含定时器便捷入口）
-    │   └── Scheduler.php            注册表 + 就绪队列 + tick
-    ├── Timer/                       定时器：时间轮 + 远端堆
-    │   ├── Timer.php                定时器条目
-    │   ├── TimerHeap.php            远端小顶堆
-    │   ├── Timers.php               时间轮（4096 槽）+ 补位
-    │   └── Cron.php                 5 字段 cron 解析
-    ├── Cluster/                     跨进程：地址 / 线格式 / 链路
-    │   ├── Addr.php                 地址编码（node + id）
-    │   ├── Packet.php               跨节点线格式
-    │   ├── Link.php                 一条非阻塞 UDS 链路
-    │   └── Cluster.php              监听 / 连接 / 攒批 / 认领
-    ├── Rpc/                         请求-响应（调用端 + 方法表 + 可插拔协议）
-    │   ├── Rpc.php                  两个协议号：请求 / 响应
-    │   ├── Request.php              方法名 + 载荷
-    │   ├── Response.php             成功与否 + 内容
-    │   ├── Client.php               调用端（自己是个 Service，为了收回包）
-    │   ├── Router.php               服务端方法表（任何 Service 都能挂）
-    │   ├── Contract/RpcCodec.php    载荷协议接口
-    │   └── Codec/                   JsonCodec（默认）/ RawCodec（不解析 body）
-    ├── Discovery/                   服务发现（谁在、还活着吗、什么协议）
-    │   ├── NodeInfo.php             节点身份 + codec + 最后心跳
-    │   ├── LocalNode.php            本节点：自动注册 / 心跳 / 注销
-    │   ├── Contract/Registry.php    注册表抽象（文件 / Redis 可换）
-    │   └── FileRegistry.php         文件实现：身份与心跳分两个文件
-    ├── Shard/                       分片路由（key 该落在哪个节点）
-    │   ├── Ring.php                 一致性哈希环（虚拟节点 + 平行数组存储）
-    │   └── Router.php               按 uid 找节点并调用（本机/远端同一条路径）
-    ├── Breaker/                     熔断（"还在但不干活"的节点）
-    │   └── CircuitBreaker.php       三态 + 单探针 + 冷却翻倍
-    ├── Config/                      配置表（运行期）
-    │   ├── Reader.php               二进制读取器：行长 + 字段清单比对
-    │   └── Watcher.php              热更：盯 manifest 的 crc，变了按表重载
-    ├── Proto/                       协议编解码（运行期）
-    │   ├── Wire.php                 varint / zigzag / fixed / float 编码
-    │   ├── Reader.php               wire format 解码游标（含 skip 未知字段）
-    │   └── Message.php              生成的消息类的基类
-    ├── Metrics/                     指标（计数 / 瞬时值 / 耗时分布）
-    │   ├── Metrics.php              埋点入口 + 慢调用打点（限流）
-    │   ├── Histogram.php            指数分桶，误差恒定 ≤19%
-    │   └── Reporter.php             定期把表格打进日志
-    ├── Gm/                          GM / 后台管理通道（独立端口）
-    │   ├── Server.php               迷你 HTTP：只绑本机、必填 token、爆破限流
-    │   ├── Registry.php             指令注册 + 派发 + 审计日志
-    │   └── Result.php               强类型的执行结果
-    └── （到此为止：以上是"所有游戏都需要"的核心）
-
-tools/config/                       配置表工具链（**只在开发机跑，不进 AOT 产物**）
-├── Xlsx.php                        最小 xlsx 读取（只解 sharedStrings + sheet1）
-├── Field.php                       类型解析 / 校验 / 编码
-├── Bin.php                         chr/ord 二进制编码（不用 pack）
-└── Exporter.php                    Excel → gen/Config/*.php + build/config/*.bin
-
-tools/proto/                        协议工具链（同上，只在开发机跑）
-├── Parser.php                      proto3 子集解析（含 `// @id` 注释指令）
-└── Generator.php                   → gen/Proto/*.php（消息类 + 编解码）
-
-pkg/                                可选功能包：不启用就不参与编译
-├── fsm/                             状态机（房间/连接/战斗单位/订单都能用）
-│   ├── pkg.json
-│   └── src/Machine.php              转移表 + 进入/退出钩子，零依赖
-├── entity/                          坐标（不需要房间的玩法也能单独用）
-│   ├── pkg.json
-│   └── src/
-│       ├── Entity.php               整数坐标 + 速度，按 delta 推进
-│       └── EntitySet.php            集合：推进 + 「位置变了」回调（可接 AOI）
-├── frameloop/                       帧循环（要 50ms 帧同步的玩法才用）
-│   ├── pkg.json
-│   └── src/FrameLoop.php            定时投帧 + 可变 delta + 单帧耗时
-├── room/                            房间 = 状态机 + 成员表（**不含坐标**）
-│   ├── pkg.json                     requirements: fsm, frameloop
-│   └── src/
-│       ├── Member.php               成员：uid + 身份 + 席位（纯数据）
-│       ├── MemberTable.php          成员表：席位分配、观战不占座
-│       ├── Room.php                 组合 Machine 与 MemberTable，只加帧计数
-│       ├── RoomService.php          把 Room 包成 Service（autoFrame 可关）
-│       ├── RoomManager.php          roomId → 承载（独占/共享），创建与回收
-│       └── RoomHost.php             共享宿主：多个小房间共用一个 Service
-├── aoi/                             九宫格视野（只需要"附近的人"的玩法才用）
-│   ├── pkg.json
-│   └── src/
-│       ├── Grid.php                 格子索引（O(1) 进出）
-│       └── Scene.php                进出视野事件（不存视野表）
-└── match/                           匹配器（对战/棋牌用；MMO 用房间列表自选）
-    ├── pkg.json
-    └── src/
-        ├── MatchQueue.php           排序 + 容差随时间放宽（纯算法，可单测）
-        └── MatchService.php         挂到 Service 上的胶水层
-└── db/                              数据访问（需要持久化才用；见 §12）
-    ├── pkg.json
-    └── src/
-        ├── Table.php                #[Table("表名")]
-        ├── Id.php                   #[Id] / #[Id(true)] 自增
-        ├── Col.php                  #[Col] / #[Col("列名")]
-        ├── Meta.php                 一次反射，缓存列清单与 ReflectionProperty
-        ├── Db.php                   连接（懒建/重连/事务/语句复用）
-        ├── Source.php               抽象：按分片键取库
-        ├── Shards.php               分库：DSN 模板 + 取模路由
-        ├── Migrator.php             版本化迁移（SQL 文件 + 方言变体 + checksum 校验）
-        └── Repo.php                 增删改查 + hydrate
-└── snapshot/                        快照（要「崩了能恢复」才用；见 §12.7）
-    ├── pkg.json
-    └── src/
-        ├── Snapshot.php             带版本的 JSON 容器（**不认识任何业务对象**）
-        ├── Codec.php                编解码 + 版本校验 + 状态哈希
-        ├── Store.php                存储抽象
-        ├── MemoryStore.php          内存（单测 / 进程内热备）
-        ├── FileStore.php            文件（原子写，抗 kill -9）
-        └── Restorer.php             批量恢复（分批记账 + 坏数据清理 + 超时标记）
-└── eventlog/                        事件日志（交易/充值这类「丢了是事故」的写入）
-    ├── pkg.json
-    └── src/EventLog.php            追加写 + fflush/fsync 两档 + 半行修复 + 截断
+├── bin/tsf              工具链入口（PHP CLI）
+├── src/                 框架核心（会被编进产物）
+│   ├── Kernel/          Bootstrap / AppConfig / Logger
+│   ├── Transport/       TCP / WebSocket
+│   ├── Protocol/        分帧 + 载荷（可换）
+│   ├── Gateway/         鉴权 / 限流 / 心跳 / 会话
+│   ├── Service/         Scheduler / Message
+│   ├── Rpc/ Discovery/ Shard/ Cluster/   分布式
+│   ├── Proto/           protobuf 运行时
+│   └── Config/ Gm/ Metrics/ Breaker/
+├── pkg/                 功能包（可选，用 project.json 的 packages 启用）
+│   ├── db/ redis/ schedule/ mail/        数据与运营
+│   ├── room/ match/ fsm/ aoi/            玩法
+│   ├── entity/ snapshot/ frameloop/      实体与帧循环
+│   └── eventlog/ wasm/
+├── tpl/                 脚手架模板（main.php / client.php / module.*）
+├── tools/               config（Excel 导出）/ proto（协议生成）
+└── ext/codec/           原生帧编解码（C++，比 PHP 版快 11~14%）
 ```
 
-**核心与包的分界不是"重要程度"，而是"是否所有游戏都要"**：
-
-| 归属 | 判据 | 当前内容 |
-|:--|:--|:--|
-| 核心 `src/` | 任何服务端都要：进程、协议、连接、调度、跨进程 | Kernel / Protocol / Transport / Gateway / Service / Timer / Cluster |
-| 包 `pkg/` | 只有部分品类要 | entity（可移动实体）、frameloop（帧循环）、room（房间）、aoi（视野）、match（匹配）、db（数据访问） |
-
-棋牌不需要帧循环和视野，SLG 需要九宫格但不需要 50ms 帧同步，MMO 两个都要——
-所以这些不能焊在框架里。**包的源码由 `tsf build` 按工程声明选择性编入**，
-不启用就完全不存在于产物中（不是"编进去再关掉"）。
-
-`db` 也放在包里，虽然"要不要存库"看起来是必需项——但纯内存的对战服、
-单机模拟、压测端都不需要它，而 PDO 依赖会把二进制体积和部署约束都带进来。
-
-**为什么拆到这么细**：每个包都要能回答"什么场景下我会单独用它"。
-
-| 包 | 单独使用的场景 |
-|:--|:--|
-| `entity` | 只要"有坐标的东西"（单机模拟、视野测试），不要房间 |
-| `frameloop` | 要帧循环，但房间/场景逻辑自己写 |
-| `room` | 要房间状态机和成员管理，用事件驱动而不是帧驱动（`autoFrame=false`） |
-| `aoi` | 要"附近的人"，但没有房间概念（比如大地图分块） |
-
-`room` 依赖 `entity` + `frameloop`，但 `Room` 本身不碰定时器——
-帧驱动在 `RoomService` 里，可以关掉。这样"只要房间"的玩法装 `room` 也不会被强行塞一个帧循环。
-
-依赖方向**只能向下**，不允许反向或跨层回调：
-
-```
-Gateway  →  Transport  →  Protocol  →  Kernel
-Service  ──────────────────────────→  Kernel
-Service  →  Timer  （Timer 不依赖任何层，可独立测试）
-Service  →  Cluster  （Cluster 只依赖 Protocol 的 PayloadCodec）
-pkg/room →  Service  （包只能依赖核心，核心不认识任何包）
-pkg/room →  pkg/fsm, pkg/frameloop （包之间靠 pkg.json 的 requires 声明）
-pkg/fsm  →  （零依赖，谁都能用：房间、连接、订单、战斗单位）
-pkg/entity →  （零依赖，接不接 AOI 由玩法用闭包决定）
-```
-
-**包之间只在「确实离不开」时才连边**：`room` 需要 `fsm` 才有状态、需要 `frameloop`
-才能开箱即用地投帧，所以是硬依赖；而 `entity` 明明可以顺带把 AOI 同步做了，
-却只用闭包回调——因为 AoI 是可选能力，硬依赖等于让所有带坐标的玩法都背上九宫格。
-
-**可选包怎么用**：
-
-```bash
-tsf list                 # 看有哪些包、当前工程启用了哪些
-tsf add aoi              # 启用（连带启用 requires 声明的依赖）
-tsf remove aoi           # 移除
-tsf build .              # 重新装配：project.yml 里会多出 pkg/aoi/src
-```
-
-工程根目录的 `project.json` 就是构建清单（和运行期配置 `config/tsf.json` 分开）：
-
-```json
-{ "name": "my-server", "packages": ["room", "aoi"] }
-```
-
-`tsf build` 按它把 `pkg/<name>/src` 追加进 `project.yml` 的 sources。
-**没声明的包不会被编译**——不是运行时开关，是根本不进产物。
-
-包清单 `pkg/<name>/pkg.json`：
-
-```json
-{
-  "name": "aoi",
-  "ns": "TSF\\Aoi",
-  "desc": "九宫格视野（无状态，格子坐标的纯函数）",
-  "requires": [],
-  "hint": "只对需要\"视野/附近的人\"的玩法有意义；棋牌、回合制可完全不要"
-}
-```
-
-`ns` 让 `tsf lint` 知道这个包该用什么根命名空间（包的目录名和命名空间大小写可以不同）。
-
-`Service` 刻意**不依赖** `Transport`：调度器只认地址和消息，不关心消息是从网络来的、
-从定时器来的还是从别的服务来的。网络层要投递给服务，是在 `onFrame` 里调
-`Scheduler::deliver()`，依赖方向仍然是 Gateway → Service → Kernel。
-
-`Addr` 放在 `Cluster` 而不是 `Service`，也是为了让依赖单向：两者都要用地址，
-放 `Service` 会让 `Cluster` 反向依赖 `Service`（分层倒挂）。
-
-四条规则（改目录前先对照一下，避免又乱回去）：
-
-1. **一个概念只有一个实现位置。** 帧格式的字节布局、上限、合法性校验只在 `HeaderFrame` 定义；`NativeHeaderFrame` 是它的 C++ 孪生，必须字节级一致。
-2. **`ext/` 只放原生原语。** 里面不出现任何 `TSF\*` 命名空间的类——扩展负责"快"，不负责"懂协议"。
-3. **命名空间 = 目录路径。** `TSF\Protocol\Frame\HeaderFrame` 必须落在 `src/Protocol/Frame/HeaderFrame.php`，没有例外。
-4. **新增一层要能回答"它依赖谁、谁依赖它"。** 回答不出来就说明它该拆成两层或并进现有层。
-
-业务工程由 `tsf new` 生成：
-
-```
-my-server/
-├── main.php                入口（main() 函数）
-├── client.php              最小测试客户端（登录 + echo）
-├── config/tsf.json         配置
-├── src/                    业务代码（可选）
-├── var/log/                日志
-└── project.yml             由 tsf 生成，不要手改
-```
-
----
-
-## 四、协议：分帧 + 消息体（两层独立可换）
-
-协议被拆成两个正交的层，**换协议不改代码，只改配置**：
-
-| 层 | 职责 | 实现 | 配置 |
-|:--|:--|:--|:--|
-| **分帧** | 把 TCP 字节流切成消息 | `Frame\HeaderFrame`（PHP）/ `Frame\NativeHeaderFrame`（C++） | `protocol.frame` |
-| **消息体** | body 字节 ↔ 业务结构 | `Payload\{Raw,Json,Msgpack,Protobuf,Registry}Payload` | `protocol.payload` |
-
-```
-tsf/src/Protocol/
-├── Contract/
-│   ├── FrameCodec.php     interface：name / encode / decode
-│   └── PayloadCodec.php   interface：name / pack / unpack
-├── Frame/
-│   ├── HeaderFrame.php       8 字节定长头（纯 PHP，含客户端静态便捷方法）
-│   └── NativeHeaderFrame.php 同一格式，走 ext/codec（C++）
-├── Payload/
-│   ├── RawPayload.php        原样透传（默认，零成本）
-│   ├── JsonPayload.php
-│   ├── MsgpackPayload.php    （需扩展，当前环境未装）
-│   ├── RegistryPayload.php   按 msgId 注册闭包（protobuf / 自定义二进制都走它）
-│   └── ProtobufPayload.php   同上的 protobuf 命名版
-├── Msg.php                   系统协议号
-└── ProtocolStack.php         组合入口：encode / decode / fromConfig
-```
-
-### 4.1 帧格式（默认）
-
-```
-| len(4B, 含头) | msgId(2B) | flags(1B) | reserved(1B) | body |
-```
-
-- `len` 是整帧长度（含 8 字节头），单帧上限 1 MB；
-- 回调 `onFrame(fd, msgId, body, flags)` **只会收到完整帧**，业务不用处理半包。
-
-### 4.2 系统消息 vs 业务消息
-
-| 类型 | 是否走 payload 编解码 | 例子 |
-|:--|:--:|:--|
-| 系统消息 | ❌ 永远原样字符串 | 登录、心跳、踢下线、错误码 |
-| 业务消息 | ✅ 按 `protocol.payload` 处理 | 战斗、房间、聊天 |
-
-**为什么这么分**：登录/心跳这些握手消息必须与 payload 选择无关，否则换个 payload
-就得同步改客户端握手，毫无必要。所以对外只有一个业务发送入口，系统消息走内部路径：
-
-| 入口 | 参数 | 用途 |
-|:--|:--|:--|
-| `Gateway::send(fd, msgId, data)` | `string\|array\|object` | 业务消息：`raw` 时直接发字节串，其他 payload 按配置编码 |
-| `Gateway::sendSystem()`（内部） | `string` | 框架自己的消息（PONG / KICKED / ERR），永不走 payload |
-
-handler 的载荷参数按 payload 选具体类型——不是性能需要，是让类型把约定说清楚：
-
-```php
-// payload=raw：拿到字节串
-$gw->on(Msg::ECHO_REQ, function (int $fd, int $uid, string $body) use ($gw): void {
-    $gw->send($fd, Msg::ECHO_RESP, $body);
-});
-
-// payload=json/protobuf：拿到数组或消息对象
-$gw->on(Msg::ECHO_REQ, function (int $fd, int $uid, string|array|object $data) use ($gw): void {
-    $gw->send($fd, Msg::ECHO_RESP, $data);
-});
-```
-
-> 早期版本把这两个入口分成 `send(string)` / `sendData(mixed)`，理由是"mixed 装箱慢"。
-> 那个理由后来被证伪（见 §5.7），于是合并回一个 `send()`，用联合类型表达载荷范围。
-
-### 4.3 各实现的选择建议
-
-| 场景 | 建议 | 理由（实测，见 `bench/proto`） |
-|:--|:--|:--|
-| 高频战斗同步 | protobuf / 自定义二进制 | JSON 每帧往返多 1.9~5.7 µs（小消息~20字段） |
-| 后台 / GM / 调试 | json | 可读性优先，量小 |
-| 压测 / 自定义协议 | raw | 零开销（pack 169 ns，等于一次方法调用） |
-| 分帧 | native | 比 PHP 版快 2.4 倍（encode 280 vs 740 ns） |
-
-一帧完整往返（编码+解码）的微基准：
-
-| 协议 | 小消息(39B) | 大消息(184B/20字段) |
-|:--|:--:|:--:|
-| raw | 2217 ns | 2217 ns |
-| json | 4127 ns | 7912 ns |
-
-> 微基准对端到端会低估（codec 那次实测低估 2.6 倍），所以上表用于判断量级；
-> 真实占比要按"每帧总成本 28 µs"折算：JSON 小消息约 +7%，20 字段约 +20%。
-
-### 4.4 接入 protobuf
-
-`RegistryPayload` 用闭包注册，兼容 google/protobuf 生成类（它们不归我们管，加不了接口）：
-
-```php
-$p = new ProtobufPayload();
-$p->register(Msg::BATTLE_CMD,
-    fn ($m) => $m->serializeToString(),
-    fn (string $b) => (new BattleCmd())->mergeFromString($b));
-```
-
-业务处理器拿到的就是消息对象：
-
-```php
-$gw->on(Msg::BATTLE_CMD, function (int $fd, int $uid, mixed $cmd) use ($gw): void {
-    // $cmd 是 BattleCmd 实例
-});
-```
+**约定**：`src/` 编进可执行文件，`pkg/` 按需编入，`tools/` 只在开发机跑（不进产物）。
 
 ---
 
@@ -794,151 +441,6 @@ AOT 的全局作用域只接受声明（class / function / use / const），任�
 
 ---
 
-## 六、M0 验证记录（2026-11-12）
-
-| 项 | 结果 |
-|:--|:--|
-| `tsf new` 生成工程 | ✅ config / main.php / client.php / project.yml |
-| `tsf build` | ✅ 12 个文件编译，产物 **402 KB**，约 40 秒 |
-| 启动日志 | ✅ boot → app ready → server listen（JSON 结构化） |
-| echo 往返 | ✅ `resp msgId=1002` + `OK: echo matched` |
-| 分段发送（帧切两半） | ✅ 正确重组 |
-| 粘包（两帧一次写） | ✅ 拆成两条消息 |
-| 非法帧头 | ✅ 断开连接，进程不崩 |
-| 异常后仍可用 | ✅ 新连接正常 echo |
-| 配置运行期生效 | ✅ 改端口 9001 → 9010，**不重编**直接重启生效 |
-
----
-
-## 七、M1 验证记录（2026-11-12）
-
-功能测试 `demo/m1-test.php`，共 21 项断言：
-
-| 组 | 覆盖 | 结果 |
-|:--|:--|:--:|
-| 鉴权 | 未登录拒绝、错误 token、正确 token、uid 绑定、业务放行、PING/PONG | 6/6 |
-| 顶号 | 同 token 二次登录 → 旧连接收 KICKED 并断开，新连接可用 | 5/5 |
-| 心跳 | 空闲连接被断开（阈值 3s → 实测 4.6s）、保活连接存活（收到 35 次 PONG） | 5/5 |
-| 限流 | 突发 200 帧：放行 99、其余丢弃，提示不刷屏 | 5/5 |
-| WebSocket | 握手、未登录拒绝、登录、回显、心跳、一消息多帧拆分、非法帧断开 | 7/7 |
-| 背压 | 客户端只发不读，服务端堆满缓冲后断开（阈值 20 生效） | ✅ |
-
-**WebSocket 的定位**：只当传输层，payload 仍是 TSF 的 8 字节头 + body。这样 Gateway、业务处理器、压测端全部复用，
-协议不用写两份；浏览器端用 `ArrayBuffer` 收发即可。若将来要支持"浏览器直发 JSON"，应加一个可选的 JSON
-编解码层，而不是在传输层做分支——否则会分裂出两套派发逻辑。
-
-性能（`bench/harness`，交替采样 5 轮配对比较，-O2）：
-
-| 项 | 结果 |
-|:--|:--|
-| 裸转发吞吐 | 42,127~45,655 msg/s（≈4,200~4,500 连接 @10Hz） |
-| 网关层 vs 裸转发 | 34,504~35,900 msg/s，**−19.0%**（离散度 2.7%） |
-| 帧编解码 native vs php | **+13.9%**（离散度 1.1%） |
-| 每帧记账微基准 | **256 ns**（分项：touchFrame 168、take 74），占 25 µs/帧 的 1% |
-| 每秒补充令牌（10k 连接） | 1.12 ms/s → 0.11% CPU |
-| 空闲扫描（10k 连接） | 1.15 ms/s → 0.12% CPU |
-
-> ⚠️ 早期这张表写过「网关层吞吐 +0.7%，这层基本不花钱」——那是 **-O0** 且混入了
-> 代码重构前后对比的数据，**结论是错的**。多次配对测量一致显示网关层要付约 19% 的吞吐
-> （会话查找 + 令牌桶 + 心跳记账 + 鉴权）。这不是 bug，是这层功能本身的成本；
-> 需要更高的单机承载时，应该考虑把鉴权/限流前移到独立的接入层，而不是假装它免费。
-
-### 7.1 AOT 下的"小操作"到底多贵
-
-这轮测出一组基础成本，直接影响了热路径的写法：
-
-| 操作 | 成本 |
-|:--|:--:|
-| `isset($arr[$k])` | 205 ns |
-| 数组读 `$arr[$k]` | 153 ns |
-| 数组写 `$arr[$k] = v` | 174 ns |
-| `time()` | 129 ns |
-| `microtime(true)` | 233 ns |
-| 对象属性读/写 | ~150 ns |
-
-**含义**：一帧里做 10 次数组查找就是 1.5 µs。所以热路径的设计目标不是"少写几行"，
-而是**少做几次哈希查找**。第一版限流每次调用现算补充（2 读 2 写 + microtime），
-单次 949 ns；改成"每秒批量补充 + 每帧只递减"后降到 **74 ns**（-O2；这些早期数字是 -O0 测的，
-但结论方向不变：把补充搬到后台、每帧只做递减）。
-
-> 上表的绝对值也是 -O0 时代测的，-O2 下普遍快 30~60%（属性读 93 ns、属性写 104 ns、time() 69 ns）。
-
-### 7.2 这轮踩的三个坑
-
-1. **闭包参数个数必须与实际调用一致**。Swoole 的 `workerStart` 会传 workerId、
-   `Timer::tick` 会传 timerId，闭包声明成 0 参会直接抛 `ArgumentCountError`，
-   进程起不来。踩了两次。
-2. **`fread` 返回空串 ≠ 连接断开**。PHP 读超时也返回空串，于是"1 秒没数据"被误判成
-   "连接已断"，导致以为心跳 1.2s 就断开。正确做法是非阻塞读 + `feof()`。
-3. **限流会让压测结果失真**。加了 50/s 限流后，压测吞吐从 35k 掉到 808 msg/s——
-   不是性能退化，是所有请求都被限流丢了。压测场景必须显式 `rate_per_sec=0`。
-
-### 7.3 两个工程上的注意事项
-
-1. **`tsf build` 不会重新生成 `main.php`**。模板（`tsf new` 里那段）改了之后，
-   已有工程必须重新 `tsf new` 或手工同步 main.php，否则新加的装配代码不会生效。
-   这个坑在加背压时踩到了：配置写了 `send_fail_limit=20`，实际仍走默认 50。
-2. **AOT 不允许把子类赋给已推断为另一子类的变量**。`$server = new TcpServer(...)` 之后
-   再在另一分支赋 `new WsServer(...)` 会报 `Cannot re-assign typed object`。
-   解法是工厂方法带统一返回类型——现在是 `Transport\ServerFactory::make()`（框架内），
-   不再是模板里的 `make_server()`。
-
----
-
-## 八、结构重构记录（2026-11-12）
-
-M1 收口后发现两个结构问题，这轮专门清掉。
-
-### 8.1 三份分帧实现，其中两份是纯重复
-
-| 位置 | 形态 | 处置 |
-|:--|:--|:--|
-| `Network\Codec` | 静态方法 | 与 `Protocol\HeaderFrame` **同一套逻辑**，删除 |
-| `ext/codec/php-src/NativeCodec` | 返回闭包 | 与 `Protocol\NativeFrame` **逐字节相同**，且已无人引用，删除 |
-| `Protocol\{HeaderFrame,NativeFrame}` | 接口实现 | 保留，`NativeFrame` 改名 `NativeHeaderFrame` |
-
-顺带发现 `Server` 里有一条**双路径**：注入了 decoder 用闭包，没注入就 fallback 到 `Codec::tryDecode`。
-两条路径意味着"测试跑的是 A、线上跑的是 B"，这是最危险的一类重复。
-
-**根因是闭包注入**。当初这么写是为了"没编译扩展的工程也能过编译"——但探测发现
-**AOT 不会因为类里引用了未定义函数而编译失败**（只有真正调用时才炸），
-所以这层间接从来就不必要。现在 `Transport\Server` 直接持有 `FrameCodec`：
-
-```php
-public function __construct(string $host, int $port, FrameCodec $frame, array $options = [])
-```
-
-删掉的东西：`options["encoder"/"decoder"]`、`ProtocolStack::encoder()/decoder()`、
-`ServerBase` 这个类名（改叫 `Server`）、以及那条 fallback 分支。
-
-### 8.2 目录按"层"重排，而不是按"技术名词"
-
-原先是 `Framework` / `Network` / `Protocol` 三分，其中 `Network` 一个目录塞了 4 类东西
-（传输、分帧、会话、网关），`Framework` 成了"剩下的都放这"。M2 加 Service/Actor 只会更乱。
-
-现在是 `Kernel` / `Protocol` / `Transport` / `Gateway` 四层，依赖单向向下（见 §3）。
-`ext/` 里不再有 `TSF\*` 命名空间的类——扩展只提供 `c_*` 原语，适配类在 `src/Protocol/Frame/`。
-
-### 8.3 重构后的实测
-
-| 项 | 结果 |
-|:--|:--|
-| 功能回归 | TCP 21/21、WS 7/7、协议 raw 4/4 + json 5/5 |
-| 网关层成本（配对比较 5 轮） | **−8% ~ −18%**（随机器状态浮动，绝对值无退化：bare 从 32k 升到 39k） |
-| codec 收益（配对比较 5 轮） | **+13.3%**（离散度 6.2%；另一次测量 +7.8%） |
-| 接口分派 vs 闭包调用 | 262 ns vs 356 ns，**接口更快** |
-| `mixed` vs `string` 参数 | 1.002x，**无差异**（见 §5.7，旧结论已作废） |
-| 解码结果：对象 vs 4 元素数组 | 对象快约 150 ns/次 |
-
-说明两点，避免读者拿错数：
-
-1. codec 的比值在 +8%~+13% 之间浮动，不是精确值。单次测量不足以定论，
-   要看同一轮内的配对比值和离散度（`bench/harness` 会自动给）。
-2. 网关层那个比值是"固定 PHP 开销 / syscall 成本"，机器越快这个比值越大，
-   所以它天生比 codec 那个数更不稳。要判断有没有退化，看 **bare 的绝对吞吐**，
-   而不是看这个比值。
-
----
 
 ## 九、M2：Service 调度（单进程）
 
