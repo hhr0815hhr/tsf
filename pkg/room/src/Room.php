@@ -193,7 +193,7 @@ class Room
         return $this->closed;
     }
 
-    /** @return array<string, mixed> */
+    /** @return array<string, int|string|float|bool|array> */
     public function toArray(): array
     {
         return [

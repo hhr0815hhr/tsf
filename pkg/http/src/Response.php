@@ -30,7 +30,7 @@ final class Response
      *
      * @param mixed $data 会被 json_encode，建议传 array
      */
-    public static function ok(mixed $data = null): self
+    public static function ok(array|string|null $data = null): self
     {
         return self::json(0, "", $data, 200);
     }
@@ -45,7 +45,7 @@ final class Response
         return self::json($code, $msg, null, $status);
     }
 
-    public static function json(int $code, string $msg, mixed $data, int $status): self
+    public static function json(int $code, string $msg, array|string|null $data, int $status): self
     {
         $payload = ["code" => $code, "msg" => $msg];
         if ($data !== null) {
