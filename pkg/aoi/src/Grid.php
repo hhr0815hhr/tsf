@@ -347,6 +347,73 @@ final class Grid
         return $out;
     }
 
+    /**
+     * 按半径遍历候选，**不构造数组**。
+     *
+     * around() 每次调用都要 new 一个 uid 数组。在"每帧多次施法"的热路径上，
+     * 这些短命数组的分配 + 后续 foreach 是 p99 的主要来源之一。
+     * 回调式把"分配 + 遍历"压成"一次遍历"，代价是每个元素多一次闭包调用。
+     *
+     * 取舍依据：候选数远小于实体总数时（AOI 的适用场景），
+     * 少一次数组分配比少几次函数调用更值。
+     *
+     * 注意：回调里**不要**增删实体（会改动正在遍历的 cells），
+     * 需要改的话先收集，循环结束后再改。
+     *
+     * @param \Closure $cb (int $uid): void，含自己
+     * @return int 遍历到的实体数
+     */
+    public function eachAround(int $uid, int $radius, \Closure $cb): int
+    {
+        if (!isset($this->cellOf[$uid])) {
+            return 0;
+        }
+        return $this->eachRingOfKey($this->cellOf[$uid], $this->ringsFor($radius), $cb);
+    }
+
+    /** 按格子 key 版，语义同 eachAround */
+    public function eachRingOfKey(int $key, int $k, \Closure $cb): int
+    {
+        if ($k < 1) {
+            $k = 1;
+        }
+        $cx = $key % $this->cols;
+        $cy = intdiv($key, $this->cols);
+
+        $y0 = $cy - $k;
+        if ($y0 < 0) {
+            $y0 = 0;
+        }
+        $y1 = $cy + $k;
+        if ($y1 >= $this->rows) {
+            $y1 = $this->rows - 1;
+        }
+        $x0 = $cx - $k;
+        if ($x0 < 0) {
+            $x0 = 0;
+        }
+        $x1 = $cx + $k;
+        if ($x1 >= $this->cols) {
+            $x1 = $this->cols - 1;
+        }
+
+        $n = 0;
+        for ($y = $y0; $y <= $y1; $y++) {
+            $base = $y * $this->cols;
+            for ($x = $x0; $x <= $x1; $x++) {
+                $kk = $base + $x;
+                if (!isset($this->cells[$kk])) {
+                    continue;
+                }
+                foreach ($this->cells[$kk] as $other => $u) {
+                    $cb($other);
+                    $n++;
+                }
+            }
+        }
+        return $n;
+    }
+
     /** 某个格子里的人数（排障用） */
     public function cellSizeOf(int $key): int
     {

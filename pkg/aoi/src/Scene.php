@@ -153,6 +153,20 @@ final class Scene
         return $this->grid->around($uid, $radius);
     }
 
+    /**
+     * 按半径遍历候选，不构造数组 —— 命中判定的推荐入口。
+     *
+     * 与 around() 的唯一差别是"不分配候选数组"。热路径（每帧多次施法）用这个，
+     * 需要拿到完整候选集合再处理的场景用 around()。
+     *
+     * @param \Closure $cb (int $uid): void，含自己
+     * @return int 遍历到的实体数
+     */
+    public function eachAround(int $uid, int $radius, \Closure $cb): int
+    {
+        return $this->grid->eachAround($uid, $radius, $cb);
+    }
+
     /** @return array<int, int> uid => uid，不含自己 */
     public function viewOf(int $uid): array
     {
