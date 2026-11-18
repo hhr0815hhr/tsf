@@ -21,6 +21,12 @@ final class App
 {
     private Router $router;
 
+    /** @var list<\TSF\Http\Middleware> 前置中间件 */
+    private array $middlewares = [];
+
+    /** @var list<\Closure> 后置装饰器：function (Response): Response */
+    private array $afters = [];
+
     public function __construct(
         private string $host,
         private int $port,
@@ -31,6 +37,33 @@ final class App
     public function router(): Router
     {
         return $this->router;
+    }
+
+    /**
+     * 注册前置中间件。按注册顺序执行，任一返回 Response 即短路。
+     *
+     * 顺序很重要：CORS → 限流 → 鉴权。预检请求不带 Authorization，
+     * 限流要在验签之前（否则伪造 token 会白耗 CPU）。
+     *
+     */
+    public function use(\TSF\Http\Middleware $mw): self
+    {
+        $this->middlewares[] = $mw;
+        return $this;
+    }
+
+    /**
+     * 注册后置装饰器（拿到 Response 再加工，比如补 CORS 头）。
+     *
+     * 为什么需要它：CORS 不仅 OPTIONS 预检要带 Access-Control-Allow-Origin，
+     * 正常响应也必须带，否则浏览器还是会拦。前置中间件管不了这个。
+     *
+     * @param \Closure $fn function (Response): Response
+     */
+    public function after(\Closure $fn): self
+    {
+        $this->afters[] = $fn;
+        return $this;
     }
 
     public function get(string $path, \Closure|string $handler): self
@@ -51,7 +84,9 @@ final class App
         $server = new \Swoole\Http\Server($this->host, $this->port);
         $router = $this->router;
 
-        $server->on("request", function (\Swoole\Http\Request $req, \Swoole\Http\Response $res) use ($router): void {
+        $middlewares = $this->middlewares;
+        $afters = $this->afters;
+        $server->on("request", function (\Swoole\Http\Request $req, \Swoole\Http\Response $res) use ($router, $middlewares, $afters): void {
             $started = microtime(true);
             $path = (string) ($req->server["request_uri"] ?? "/");
             $method = (string) ($req->server["request_method"] ?? "GET");
@@ -74,13 +109,28 @@ final class App
             );
 
             try {
-                $resp = $router->dispatch($request);
+                $resp = null;
+                foreach ($middlewares as $mw) {
+                    $short = $mw->handle($request);
+                    if ($short !== null) {
+                        $resp = $short;
+                        break;
+                    }
+                }
+                if ($resp === null) {
+                    $resp = $router->dispatch($request);
+                }
             } catch (\Throwable $e) {
                 Logger::error("http handler threw", [
                     "path" => $path,
                     "err" => $e->getMessage(),
                 ]);
                 $resp = Response::fail(500, "internal error", 500);
+            }
+
+            // 后置装饰（CORS 头之类）
+            foreach ($afters as $fn) {
+                $resp = ($fn)($resp);
             }
 
             $res->status($resp->status);

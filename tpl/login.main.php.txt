@@ -2,6 +2,9 @@
 
 use TSF\Gateway\TokenAuth;
 use TSF\Http\App;
+use TSF\Http\Middleware\AuthMiddleware;
+use TSF\Http\Middleware\CorsMiddleware;
+use TSF\Http\Middleware\RateLimitMiddleware;
 use TSF\Http\Request;
 use TSF\Http\Response;
 use TSF\Kernel\Bootstrap;
@@ -47,6 +50,30 @@ function main(): void
         Config::getString("login.host", "0.0.0.0"),
         Config::getInt("login.port", 9101),
     );
+
+    // ---- 中间件：顺序很重要 ----
+    //
+    //   CORS  →  限流  →  鉴权
+    //
+    // 预检请求（OPTIONS）不带 Authorization，所以 CORS 必须最先；限流在鉴权之前，
+    // 否则伪造 token 的请求会先消耗一次验签 CPU 才被拒。
+    $cors = new CorsMiddleware("*");
+    $app->use($cors);
+    // 正常响应也要带 CORS 头，否则浏览器照样拦
+    $app->after(function (Response $r) use ($cors): Response {
+        return $cors->decorate($r);
+    });
+    $app->use(new RateLimitMiddleware(20, 40));
+    // 白名单：这两个接口不需要登录
+    $app->use(new AuthMiddleware($auth, ["/login", "/health"]));
+
+    // ---- 需要登录态的示例（AuthMiddleware 已经把 uid 填进 Request）----
+    $app->get("/player/info", function (Request $req): Response {
+        return Response::ok([
+            "uid" => $req->uid,
+            "nick" => "player-" . $req->uid,
+        ]);
+    });
 
     // ---- 存活检查 ----
     $app->get("/health", function (Request $req): Response {

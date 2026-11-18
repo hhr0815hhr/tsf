@@ -25,6 +25,8 @@ final class Request
         public string $rawBody,
         public array $params = [],
         public string $remoteIp = "",
+        // 由 AuthMiddleware 填入；0 表示未登录
+        public int $uid = 0,
     ) {
     }
 
