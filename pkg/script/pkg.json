@@ -1,0 +1,7 @@
+{
+  "name": "script",
+  "ns": "TSF\\Script",
+  "desc": "PHP 脚本热更：加载外部脚本、按名调用、检测变更后重载",
+  "requires": [],
+  "hint": "需要不停服改玩法逻辑时用。依赖 ext/interp 扩展（提供 interp_require_file / interp_invoke），不是 composer 包；扩展怎么装见 ext/interp/README.md。脚本必须 return 闭包或导出表，不能靠 function 定义（PHP 不允许重复定义）。"
+}
