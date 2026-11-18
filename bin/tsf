@@ -1106,7 +1106,7 @@ exit($r[1] === $payload ? 0 : 1);
 /**
  * @param array<int, string> $problems
  */
-function lintTree(string $base, string $nsPrefix, string $root, array &$problems): int
+function lintTree(string $base, string $nsPrefix, string $root, array &$problems, array &$hints): int
 {
     if (!is_dir($base)) {
         return 0;
@@ -1152,6 +1152,20 @@ function lintTree(string $base, string $nsPrefix, string $root, array &$problems
                 $problems[] = str_replace($root . "/", "", $path) . ":" . ($i + 1)
                     . "  出现 mixed 类型声明 → " . trim($codePart);
             }
+
+            // 规则 5（提示，不阻塞）：内置文件函数直接吃属性访问
+            //
+            // 踩过两次的坑：`filemtime($this->path)` 在 AOT 下会被编译成
+            // "不传参"的调用，运行到那一行才报
+            // `filemtime(): Argument #1 ($filename) not passed`，编译期无告警，
+            // 报错信息也完全看不出是编译器的问题。先取局部变量即可。
+            //
+            // 之所以只是"提示"而不是"错误"：框架自身就有十几处这种写法且运行正常，
+            // 说明触发条件比我理解的更窄。把不确定的东西做成阻塞会逼人写 --no-lint。
+            if (preg_match('/\b(filemtime|filesize|file_exists|is_file|is_readable|is_dir|file_get_contents|file_put_contents|opcache_invalidate|unlink)\s*\(\s*\$this->[A-Za-z_][A-Za-z0-9_]*\s*[,)]/', $codePart, $m)) {
+                $hints[] = str_replace($root . "/", "", $path) . ":" . ($i + 1)
+                    . "  " . $m[1] . "() 直接吃属性访问 → AOT 下可能编译成不传参，建议先取局部变量";
+            }
         }
     }
     return $checked;
@@ -1160,12 +1174,13 @@ function lintTree(string $base, string $nsPrefix, string $root, array &$problems
 function cmdLint(string $root): int
 {
     $problems = [];
+    $hints = [];
     $checked = 0;
 
     $pkgs = listPackages($root);
 
     // 核心
-    $checked += lintTree($root . "/src", "TSF", $root, $problems);
+    $checked += lintTree($root . "/src", "TSF", $root, $problems, $hints);
 
     // 规则 4：核心不得引用可选包（依赖必须单向 src ← pkg）
     //
@@ -1193,7 +1208,7 @@ function cmdLint(string $root): int
     // 可选功能包：每个包自己声明根命名空间（pkg.json 的 ns 字段）
     foreach ($pkgs as $name => $d) {
         $ns = isset($d["ns"]) ? (string) $d["ns"] : "TSF\\" . ucfirst($name);
-        $checked += lintTree($root . "/pkg/" . $name . "/src", $ns, $root, $problems);
+        $checked += lintTree($root . "/pkg/" . $name . "/src", $ns, $root, $problems, $hints);
     }
 
     // 规则 3：ext/ 不出现 TSF 命名空间
@@ -1214,6 +1229,21 @@ function cmdLint(string $root): int
     if ($problems === []) {
         ok("结构检查通过：" . $checked . " 个源文件（核心 + " . count($pkgs) . " 个包），"
             . "无 mixed 类型、命名空间与目录一致、核心不依赖可选包");
+        // 提示不阻塞：它们指向"AOT 下可能出问题"的写法，但触发条件尚未完全摸清，
+        // 做成阻塞会逼人跳过 lint。最多列 8 条，避免刷屏。
+        if ($hints !== []) {
+            say("");
+            say("另有 " . count($hints) . " 条提示（不阻塞，供排查 AOT 怪问题时参考）：");
+            $shown = 0;
+            foreach ($hints as $h) {
+                if ($shown >= 8) {
+                    say("  · …… 还有 " . (count($hints) - 8) . " 条");
+                    break;
+                }
+                say("  · " . $h);
+                $shown++;
+            }
+        }
         return 0;
     }
 
