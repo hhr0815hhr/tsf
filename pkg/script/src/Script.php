@@ -76,7 +76,7 @@ final class Script
      * @param string $name 导出表里的键；脚本返回单个闭包时传 "" 或 "main"
      * @param object $obj  传给脚本的对象（脚本里改它，宿主侧同一对象跟着变）
      */
-    public function call(string $name, object $obj): mixed
+    public function call(string $name, object $obj): array|object|string|int|float|bool|null
     {
         $target = $this->resolve($name);
         if ($target === null) {
@@ -91,7 +91,7 @@ final class Script
      * 和 call() 的区别：call() 直接传业务对象（脚本有全部权限），
      * callWithContext() 传 Context（只能按白名单读写）。
      */
-    public function callWithContext(string $name, Context $ctx): mixed
+    public function callWithContext(string $name, Context $ctx): array|object|string|int|float|bool|null
     {
         $target = $this->resolve($name);
         if ($target === null) {

@@ -38,6 +38,17 @@ final class Scheduler
     /** @var array<string, \Closure> 名字 => 工厂（返回 Service） */
     private array $factories = [];
 
+    /**
+     * 受监督的服务：name => 配置。
+     *
+     * 只支持**单实例**语义（一个 name 一个实例）—— 适合世界、邮件、排行榜这类单例。
+     * 房间那种"一房一实例"的不该用监督：房间崩了就该销毁，玩家重连新建，
+     * 重启一个"同号房间"反而会把脏状态带回来。
+     *
+     * @var array<string, array{max:int, within:int, addr:int, count:int, since:int}>
+     */
+    private array $supervised = [];
+
     /** @var array<int, int> 就绪队列（服务 id），FIFO */
     private array $ready = [];
 
@@ -245,6 +256,114 @@ final class Scheduler
             throw new \RuntimeException("service: 未注册的服务类型 [" . $name . "]");
         }
         return $this->create($this->factories[$name]);
+    }
+
+    /**
+     * 注册并创建一个**受监督**的服务。
+     *
+     * ```php
+     * $s->supervise("world", fn () => new WorldService(), maxRestarts: 3, withinMs: 5000);
+     * ```
+     *
+     * 服务抛异常时：销毁 → 按 `maxRestarts / withinMs` 决定是否重建。
+     * 超过阈值就放弃（记 error 日志，不再重启），避免"崩—重启—崩"的死循环。
+     *
+     * **状态不保留**：重启是一个全新的实例（和 OTP 的 supervisor 一样，
+     * 状态要么在外部存储，要么可以重建）。这一点要在文档里说清楚，
+     * 否则用户会以为重启能"恢复现场"。
+     */
+    public function supervise(
+        string $name,
+        \Closure $factory,
+        int $maxRestarts = 3,
+        int $withinMs = 5000,
+    ): int {
+        $this->register($name, $factory);
+        $addr = $this->spawn($name);
+        $this->supervised[$name] = [
+            "max" => $maxRestarts,
+            "within" => $withinMs,
+            "addr" => $addr,
+            "count" => 0,
+            "since" => 0,
+        ];
+        return $addr;
+    }
+
+    /** 该地址当前是否处于受监督状态（测试和观测用） */
+    public function isSupervised(int $addr): bool
+    {
+        foreach ($this->supervised as $cfg) {
+            if ($cfg["addr"] === $addr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 受监督服务的当前地址（重启后会变）。没受监督时返回 0 */
+    public function supervisedAddr(string $name): int
+    {
+        if (!isset($this->supervised[$name])) {
+            return 0;
+        }
+        return $this->supervised[$name]["addr"];
+    }
+
+    /** @return array<string, int> name => 重启次数 */
+    public function restartCounts(): array
+    {
+        $out = [];
+        foreach ($this->supervised as $name => $cfg) {
+            $out[$name] = $cfg["count"];
+        }
+        return $out;
+    }
+
+    /**
+     * 服务因异常被销毁后的处理：先 kill，再按监督配置决定要不要重建。
+     *
+     * 和 kill() 的区别：kill() 是**主动**销毁（用户调用，不重启）；
+     * onCrashed() 是**异常**导致（可能重启）。
+     */
+    private function onCrashed(int $addr): void
+    {
+        $this->kill($addr);
+
+        foreach ($this->supervised as $name => $cfg) {
+            if ($cfg["addr"] !== $addr) {
+                continue;
+            }
+
+            $now = intdiv(hrtime(true), 1000000);
+            if ($cfg["since"] === 0 || $now - $cfg["since"] > $cfg["within"]) {
+                $cfg["since"] = $now;
+                $cfg["count"] = 0;
+            }
+            $cfg["count"]++;
+
+            if ($cfg["count"] > $cfg["max"]) {
+                Logger::error("supervisor gave up (too many restarts)", [
+                    "svc" => $name,
+                    "restarts" => $cfg["count"],
+                    "within_ms" => $cfg["within"],
+                ]);
+                $this->supervised[$name]["count"] = $cfg["count"];
+                $this->supervised[$name]["addr"] = 0;   // 放弃后不再对应任何实例
+                return;
+            }
+
+            $newAddr = $this->spawn($name);
+            $this->supervised[$name]["addr"] = $newAddr;
+            $this->supervised[$name]["count"] = $cfg["count"];
+            $this->supervised[$name]["since"] = $cfg["since"];
+            Logger::info("supervisor restarted", [
+                "svc" => $name,
+                "attempt" => $cfg["count"],
+                "new_addr" => $newAddr,
+            ]);
+            return;
+        }
     }
 
     /**
@@ -482,7 +601,7 @@ final class Scheduler
                     "err" => $e->getMessage(),
                 ]);
                 $this->setCurrentOf($prev);
-                $this->kill($id);
+                $this->onCrashed($id);
             }
             $this->setCurrentOf($prev);
             // 每条都做 $stat["handled"]++ 要 174 ns；按批累加等价，代价可忽略
@@ -556,7 +675,7 @@ final class Scheduler
                     "msgId" => $m === null ? 0 : $m->msgId,
                     "err" => $e->getMessage(),
                 ]);
-                $self->kill($id);
+                $self->onCrashed($id);
             } finally {
                 unset($self->busy[$id]);
             }
