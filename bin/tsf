@@ -383,11 +383,24 @@ function doctor(string $tsfRoot, string $tpc, string $phpBin): int
     // ---------------- 必要项 ----------------
     echo PHP_EOL . "必要项（缺一个 tsf build 就跑不起来）" . PHP_EOL;
 
-    // 1. PHP 版本
-    if (version_compare(PHP_VERSION, "8.5.0", ">=")) {
-        docLine("g", "PHP " . PHP_VERSION, "需要 >= 8.5");
+    // 1. PHP 版本 + 线程安全（ZTS）
+    //
+    // 两个条件缺一不可，而且 **ZTS 不能降级**：phpx 的线程模型建立在 ZTS 上，
+    // 编译产物链接的就是 ZTS 版的 libphp。装 8.5 NTS 会通过"版本够"的检查，
+    // 但到了编译阶段才以链接错误的形式失败 —— 所以这里必须一起看。
+    //
+    // 也不要支持 8.2/8.3：CLI 本身确实用不到 8.5 的新语法，但让它跑在旧版本上
+    // 会制造"CLI 一个版本、编译链另一个版本"的分裂，排查成本远高于统一要求的收益。
+    $verOk = version_compare(PHP_VERSION, "8.5.0", ">=");
+    $ztsOk = defined("PHP_ZTS") && PHP_ZTS === true;
+    if ($verOk && $ztsOk) {
+        docLine("g", "PHP " . PHP_VERSION . " (ZTS)", ">= 8.5 且线程安全");
+    } elseif (!$verOk) {
+        docLine("r", "PHP " . PHP_VERSION, "需要 >= 8.5" . ($ztsOk ? "（ZTS 已满足）" : "，且必须是 ZTS"));
+        $need++;
     } else {
-        docLine("r", "PHP " . PHP_VERSION, "需要 >= 8.5（当前版本过低）");
+        docLine("r", "PHP " . PHP_VERSION . " (NTS)", "必须是 ZTS 版 —— phpx 依赖线程安全模型");
+        echo "      " . c("→ 重装时加 --enable-zts；NTS 版编不出可用的产物", "d") . PHP_EOL;
         $need++;
     }
 
@@ -514,7 +527,8 @@ function doctor(string $tsfRoot, string $tpc, string $phpBin): int
     // ---------------- 汇总 ----------------
     echo PHP_EOL . str_repeat("-", 62) . PHP_EOL;
     if ($need === 0) {
-        echo c("必要项全部通过", "g") . "，可以 tsf new / tsf build" . PHP_EOL;
+        echo c("必要项全部通过", "g") . "（PHP " . PHP_VERSION
+            . (defined("PHP_ZTS") && PHP_ZTS ? " ZTS" : "") . "），可以 tsf new / tsf build" . PHP_EOL;
         if ($optional > 0) {
             echo c("可选项缺 " . $optional . " 个", "d") . "：不影响 native，写 wasm 模块时再补" . PHP_EOL;
         }
