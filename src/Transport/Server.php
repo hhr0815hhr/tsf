@@ -42,6 +42,9 @@ abstract class Server
     /** @var callable|null */
     protected $onClose = null;
 
+    /** worker 间消息钩子；见 onPipeMessage() */
+    protected ?\Closure $onPipe = null;
+
     /**
      * worker 启动钩子。**是列表，不是单个槽位**。
      *
@@ -80,6 +83,62 @@ abstract class Server
     public function onWorkerStart(callable $cb): void
     {
         $this->onWorkerStart[] = $cb;
+    }
+
+    /**
+     * worker 间消息钩子：`$cb(string $data, int $fromWorkerId): void`。
+     *
+     * 存在的理由：多 worker 时进程内存不共享，玩家归属、跨 worker 推送
+     * 都必须有一条显式的进程间通道。用 `?\Closure` 而不是 `callable`——
+     * AOT 下 callable 是联合类型，赋给属性会被转成 stdClass，运行时调用报
+     * `stdClass->{closure}()`（Gateway::onDisconnect 踩过这个坑）。
+     */
+    public function onPipeMessage(\Closure $cb): void
+    {
+        $this->onPipe = $cb;
+    }
+
+    /** 子类在 Swoole 的 pipeMessage 回调里调（TcpServer 已接好） */
+    protected function firePipeMessage(string $data, int $fromWorkerId): void
+    {
+        $cb = $this->onPipe;
+        if ($cb !== null) {
+            $cb($data, $fromWorkerId);
+        }
+    }
+
+    /**
+     * 发给指定 worker（进程间）。
+     *
+     * 默认返回 false 表示"这个传输没有跨 worker 能力"。这是刻意的：
+     * 单进程部署时调用方应当能区分"没发出去"和"发了但没回"。
+     */
+    public function pipeSend(int $workerId, string $data): bool
+    {
+        return false;
+    }
+
+    /** 当前传输是否支持跨 worker 投递 */
+    public function pipeSupported(): bool
+    {
+        return false;
+    }
+
+    /** worker 数量；子类按 Swoole 配置返回，默认单 worker */
+    public function workerNum(): int
+    {
+        return 1;
+    }
+
+    /**
+     * 当前 worker 编号。
+     *
+     * 必须在 worker 进程内调用才有效（master 进程里是 0 或 -1）。
+     * 用它来判断"这个玩家/这条连接归不归我管"。
+     */
+    public function workerId(): int
+    {
+        return 0;
     }
 
 

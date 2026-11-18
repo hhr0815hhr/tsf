@@ -64,6 +64,13 @@ final class TcpServer extends Server
             Logger::info("server shutdown");
         });
 
+        // worker 间消息：多 worker 时玩家归属、跨 worker 推送的唯一通道。
+        // 不注册这个回调时，sendMessage 的消息会被静默丢弃——
+        // 表现为"转发写了但对面没反应"，且没有任何日志。
+        $server->on("pipeMessage", function ($serv, int $srcWorkerId, $data) {
+            $this->firePipeMessage((string) $data, $srcWorkerId);
+        });
+
         $server->on("workerStart", function ($serv, int $workerId) {
             // Swoole 的事件循环是进程里唯一的循环，Scheduler 没有自己的线程，
             // 所以只能靠一个高频定时器把它"推"着走。缺了这一步，Service 的
@@ -101,6 +108,39 @@ final class TcpServer extends Server
     public function server(): ?\Swoole\Server
     {
         return $this->server;
+    }
+
+    /**
+     * 跨 worker 投递（进程间消息，走 Swoole 的 unix socket 管道）。
+     *
+     * 限制：只能在 worker 进程里调用。master 进程（start 之前）调会返回 false。
+     */
+    public function pipeSend(int $workerId, string $data): bool
+    {
+        if ($this->server === null) {
+            return false;
+        }
+        return $this->server->sendMessage($data, $workerId);
+    }
+
+    public function pipeSupported(): bool
+    {
+        return true;
+    }
+
+    public function workerNum(): int
+    {
+        return isset($this->options["worker_num"]) ? (int) $this->options["worker_num"] : 1;
+    }
+
+    public function workerId(): int
+    {
+        if ($this->server === null) {
+            return 0;
+        }
+        // 在 master 进程里是 -1；夹到 0 避免调用方拿到负数做取模
+        $id = (int) $this->server->worker_id;
+        return $id < 0 ? 0 : $id;
     }
 
     /**
