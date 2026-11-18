@@ -1,7 +1,0 @@
-{
-  "name": "wasm",
-  "ns": "TSF\\Wasm",
-  "desc": "wasm 模块热更：通用按名调用 + 接口成员自动枚举",
-  "requires": [],
-  "hint": "需要不停服改玩法逻辑才用；依赖宿主库 libtp_host，工程要在 project.json 的 ld-flags 里链接"
-}

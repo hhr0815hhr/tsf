@@ -3,7 +3,7 @@
 > 用 TypePHP（AOT 编译）+ PHP 写游戏服务器，替代「C++ + Lua」。
 >
 > **性能**：单 worker 稳态 116 万 msg/s（echo）；8 worker 单机 3.4 万在线（10Hz 心跳）。
-> **代价**：AOT 之后改不了运行中的代码，热更靠「配置热更 + wasm 模块 + 滚动重启」三条轨道。
+> **代价**：AOT 之后改不了运行中的代码，热更靠「配置热更 + 内嵌 PHP 脚本（pkg/script）+ 滚动重启」三条轨道。
 
 ```
 客户端 ──TCP/WS──> Gateway ──> Service（业务）──> pkg/db、pkg/redis、pkg/mail ...
@@ -35,7 +35,7 @@ export TSF_PHP=php85
 Composer 只能装 PHP 代码，装不了编译器本体和 C++ 后端（clang），所以工具链单独发。
 
 **`tsf doctor` 检查什么**：PHP 版本 + ZTS、swoole、phpx 运行时、tpc、编译用 PHP、
-php-config 版本一致性、C++ 编译器（+ wasm 工具链可选项）。缺什么直接给修复命令。
+php-config 版本一致性、C++ 编译器。缺什么直接给修复命令。
 
 ---
 
@@ -82,17 +82,15 @@ php85 client.php 9001          # 3) 另开终端验证
 | `entity` / `snapshot` | 实体管理与状态快照 |
 | `frameloop` | 固定帧循环（10Hz / 20Hz 玩法） |
 | `eventlog` | 事件日志（金币结算等） |
-| `wasm` | wasm 模块加载（`Module::load`）+ 接口声明（`Iface`） |
 
 ### 工具链（`tsf/bin/tsf`）
 
 | 命令 | 作用 |
 |:--|:--|
-| `tsf new <name>` | 生成工程（含 `modules/` 目录和 wasm 示例） |
+| `tsf new <name>` | 生成工程（写 `. 表示在当前目录生成） |
 | `tsf build [dir]` | 编译（生成 `project.yml` 并调 `tpc`） |
 | `tsf serve [dir]` | 编译并启动 |
 | `tsf watch [dir]` | 监听构建输入，变更自动重编重启 |
-| `tsf module add/build/build-all` | wasm 模块的创建与编译 |
 | `tsf proto build [dir]` | `.proto` → `gen/Proto/*.php` |
 | `tsf config build/check [dir]` | Excel → `gen/Config/*.php` + `build/config/*.bin` |
 | `tsf lint [dir]` | 静态检查（禁 `mixed`、命名空间与目录一致） |
@@ -118,7 +116,7 @@ tsf/
 │   ├── db/ redis/ schedule/ mail/        数据与运营
 │   ├── room/ match/ fsm/ aoi/            玩法
 │   ├── entity/ snapshot/ frameloop/      实体与帧循环
-│   └── eventlog/ wasm/
+│   └── eventlog/
 ├── tpl/                 脚手架模板（main.php / client.php / module.*）
 ├── tools/               config（Excel 导出）/ proto（协议生成）
 └── ext/codec/           原生帧编解码（C++，比 PHP 版快 11~14%）
@@ -213,7 +211,7 @@ AOT 抛 `ArgumentCountError`），而 Swoole 固定按自己的参数个调回�
 
 `embedded-files` 的运行时 `require` 是从**构建期生成的 opcode 表**加载，改磁盘文件不生效；`eval()` 与动态 `include` 对 AOT/Native Class 不可用。
 
-**热更只能走三条路**：配置数据（运行期读文件）、wasm 模块（E1 已验证）、滚动重启。详见 `../docs/FRAMEWORK-TASK.md` §1.4。
+**热更只能走三条路**：配置数据（运行期读文件）、内嵌 PHP 脚本（`pkg/script` + `ext/interp`，已实测）、滚动重启。详见 `../docs/research/hot-reload.md`。
 
 ### 5.4 静态调用的返回值直接用，不要链式下钻
 

@@ -526,24 +526,8 @@ function doctor(string $tsfRoot, string $tpc, string $phpBin): int
         $need++;
     }
 
-    // ---------------- 可选项 ----------------
-    echo PHP_EOL . "可选项（只有写 wasm 热更模块才需要，见 docs/guide/09）" . PHP_EOL;
-
-    $wasmTools = [
-        "wasm32-wasip2-clang" => "wasi-sdk，clang 必须 >= 22",
-        "wasmtime" => "运行/验证 wasm 模块",
-        "wit-bindgen" => "0.60，生成接口绑定",
-        "tp-precompile" => "预编译成 .cwasm（不能用 wasmtime compile 代替）",
-    ];
-    foreach ($wasmTools as $tool => $why) {
-        $found = docWhich($tool);
-        if ($found !== "") {
-            docLine("g", $tool, $found);
-        } else {
-            docLine("y", $tool, "缺 —— " . $why);
-            $optional++;
-        }
-    }
+    // 可选项已移除（wasm 路线废弃，见 docs/research/hot-reload.md）
+    $optional = 0;
 
     // ---------------- 汇总 ----------------
     echo PHP_EOL . str_repeat("-", 62) . PHP_EOL;
@@ -551,7 +535,7 @@ function doctor(string $tsfRoot, string $tpc, string $phpBin): int
         echo c("必要项全部通过", "g") . "（PHP " . PHP_VERSION
             . (defined("PHP_ZTS") && PHP_ZTS ? " ZTS" : "") . "），可以 tsf new / tsf build" . PHP_EOL;
         if ($optional > 0) {
-            echo c("可选项缺 " . $optional . " 个", "d") . "：不影响 native，写 wasm 模块时再补" . PHP_EOL;
+            echo c("可选项缺 " . $optional . " 个", "d") . "：不影响必要项" . PHP_EOL;
         }
         return 0;
     }
@@ -568,127 +552,7 @@ function doctor(string $tsfRoot, string $tpc, string $phpBin): int
     return 1;
 }
 
-function moduleBuild(string $projDir, string $tpc, string $phpBin): int
-{
-    $ymlPath = $projDir . "/project.yml";
-    if (!is_file($ymlPath)) {
-        fwrite(STDERR, "没有 project.yml：先跑 tsf build 生成一次，或手写一份" . PHP_EOL);
-        return 1;
-    }
-    $yml = (string) file_get_contents($ymlPath);
 
-    if (!preg_match("/^name:\s*(\S+)/m", $yml, $m)) {
-        fwrite(STDERR, "project.yml 里没有 name" . PHP_EOL);
-        return 1;
-    }
-    $name = $m[1];
-    if (!preg_match("/^wasm:\s*\S+/m", $yml)) {
-        fwrite(STDERR, "这不是 wasm 模块工程：project.yml 缺少 wasm: component" . PHP_EOL);
-        return 1;
-    }
-
-    // 工具链检查：缺什么就说什么，不要让 tpc 抛一句笼统的 check failed
-    $missing = [];
-    $tools = ["wasm32-wasip2-clang", "wasmtime", "wit-bindgen"];
-    foreach ($tools as $tool) {
-        if (findInPath($tool) === null) {
-            $missing[] = $tool;
-        }
-    }
-    if ($missing !== []) {
-        fwrite(STDERR, "缺 WASI 工具链：" . implode(", ", $missing) . PHP_EOL);
-        fwrite(STDERR, "  需要：wasi-sdk（clang >= 22）、wasmtime CLI、wit-bindgen-cli 0.60，且都在 PATH 里" . PHP_EOL);
-        fwrite(STDERR, "  注意 clang 版本：SDK 太旧 tpc 会直接拒绝（它要求 22+）" . PHP_EOL);
-        return 1;
-    }
-
-    $old = getcwd();
-    chdir($projDir);
-
-    echo "1/3 编译 wasm component ..." . PHP_EOL;
-    $cmd = $phpBin . " " . escapeshellarg($tpc) . " project.yml";
-    passthru($cmd, $rc);
-    if ($rc !== 0) {
-        chdir($old);
-        fwrite(STDERR, "编译失败" . PHP_EOL);
-        return 1;
-    }
-
-    $wasm = $projDir . "/" . $name . ".wasm";
-    if (!is_file($wasm)) {
-        chdir($old);
-        fwrite(STDERR, "没找到产物：" . $wasm . PHP_EOL);
-        return 1;
-    }
-
-    // 预编译工具：优先 TSF_PRECOMPILE，其次从 ld-flags 的 -L 目录里找。
-    // 必须用它，不能用 wasmtime CLI——fuel/epoch 是编译期插桩，产物带 fingerprint，
-    // 配置不一致宿主直接拒绝启动（现象是所有模块句柄变 -1000，极难联想到预编译参数）。
-    $pre = getenv("TSF_PRECOMPILE");
-    if (!is_string($pre) || $pre === "" || !is_executable($pre)) {
-        $pre = "";
-        // 模块工程通常没有 ld-flags（它不链接宿主库），所以先在 PATH 里找。
-        // 部署机上把宿主的 target/release 加进 PATH，或者设 TSF_PRECOMPILE 都行。
-        $found = findInPath("tp-precompile");
-        if ($found !== null) {
-            $pre = $found;
-        }
-        preg_match_all("/-L(\S+)/", $yml, $lm);
-        foreach ($lm[1] as $dir) {
-            if (is_executable($dir . "/tp-precompile")) {
-                $pre = $dir . "/tp-precompile";
-                break;
-            }
-        }
-    }
-    if ($pre === "") {
-        chdir($old);
-        fwrite(STDERR, "找不到 tp-precompile：" . PHP_EOL);
-        fwrite(STDERR, "  用 TSF_PRECOMPILE 指定，或在 project.yml 的 ld-flags 里保留 -L<目录>" . PHP_EOL);
-        return 1;
-    }
-
-    $dist = $projDir . "/dist";
-    if (!is_dir($dist)) {
-        mkdir($dist, 0775, true);
-    }
-    $cwasm = $dist . "/" . $name . ".cwasm";
-
-    echo "2/3 预编译（" . basename($pre) . "）..." . PHP_EOL;
-    // tp-precompile 的用法是 `tp-precompile <in> <out>`，没有 build 子命令
-    // （precompile.sh 里的 build/verify 是它自己的分支，不是工具的参数）
-    passthru(escapeshellarg($pre) . " " . escapeshellarg($wasm) . " " . escapeshellarg($cwasm), $rc);
-    chdir($old);
-    if ($rc !== 0 || !is_file($cwasm)) {
-        fwrite(STDERR, "预编译失败" . PHP_EOL);
-        return 1;
-    }
-
-    echo "3/3 写 manifest ..." . PHP_EOL;
-    $clang = trim((string) shell_exec("wasm32-wasip2-clang --version 2>/dev/null | head -1"));
-    $wtime = trim((string) shell_exec("wasmtime --version 2>/dev/null | head -1"));
-    $manifest = [
-        "name" => $name,
-        "wasm" => basename($wasm),
-        "wasm_sha256" => hash_file("sha256", $wasm),
-        "cwasm" => basename($cwasm),
-        "cwasm_sha256" => hash_file("sha256", $cwasm),
-        "cwasm_bytes" => filesize($cwasm),
-        "built_at" => date("c"),
-        "toolchain" => [
-            "clang" => $clang,
-            "wasmtime" => $wtime,
-        ],
-    ];
-    $mf = $dist . "/" . $name . ".manifest.json";
-    file_put_contents($mf, json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
-
-    echo "OK  " . $dist . PHP_EOL;
-    echo "    " . basename($cwasm) . "  " . number_format((int) $manifest["cwasm_bytes"]) . " 字节" . PHP_EOL;
-    echo "    " . basename($mf) . PHP_EOL;
-    echo "    校验和：" . substr((string) $manifest["cwasm_sha256"], 0, 16) . "..." . PHP_EOL;
-    return 0;
-}
 
 /**
  * 验证套件清单。
@@ -878,41 +742,8 @@ function tplFile(string $name): string
  * wasm-package / wasm-world 从 `pkg/wasm/src/Iface.php` 读 —— 那是唯一来源。
  * 之前模板里写死字符串，一旦上游的 world 名变了，所有工程的 project.yml 都要手工改。
  */
-function tplModuleYml(string $modName): string
-{
-    $pkg = "";
-    $world = "";
-    $ifaceFile = __DIR__ . "/../pkg/wasm/src/Iface.php";
-    if (is_file($ifaceFile)) {
-        $src = (string) file_get_contents($ifaceFile);
-        if (preg_match('/PACKAGE\s*=\s*"([^"]+)"/', $src, $m) === 1) {
-            $pkg = $m[1];
-        }
-        if (preg_match('/WORLD\s*=\s*"([^"]+)"/', $src, $m) === 1) {
-            $world = $m[1];
-        }
-    }
-    if ($pkg === "" || $world === "") {
-        // 读不到就报错，不要生成一个"看起来对、加载时 -1"的工程
-        fwrite(STDERR, "读不到 wasm 接口定义：" . $ifaceFile . PHP_EOL);
-        fwrite(STDERR, "  确认 pkg/wasm/src/Iface.php 里有 PACKAGE / WORLD 常量" . PHP_EOL);
-        return "";
-    }
 
-    $tpl = tplFile("module.project.yml.txt");
-    $tpl = str_replace(["{{name}}", "{{wasm_package}}", "{{wasm_world}}"], [$modName, $pkg, $world], $tpl);
-    return $tpl;
-}
 
-function tplModuleLib(): string
-{
-    return tplFile("module.lib.php.txt");
-}
-
-function tplModulesReadme(): string
-{
-    return tplFile("modules.README.md.txt");
-}
 
 /**
  * 生成登录服工程。
@@ -1410,16 +1241,6 @@ switch ($cmd) {
         ensureDir($projDir . "/src");
         ensureDir($projDir . "/var/log");
 
-        // wasm 热更模块单独一个目录：编译目标、产物、更新方式都和 src/ 不同，
-        // 混在一起用户分不清哪段代码是 native、哪段进沙箱（见 docs/guide/09）。
-        // 只给结构和一个能编译的示例，不预置任何业务逻辑。
-        $sampleYml = tplModuleYml("sample");
-        if ($sampleYml !== "") {
-            ensureDir($projDir . "/modules/sample");
-            file_put_contents($projDir . "/modules/README.md", tplModulesReadme());
-            file_put_contents($projDir . "/modules/sample/project.yml", $sampleYml);
-            file_put_contents($projDir . "/modules/sample/lib.php", tplModuleLib());
-        }
 
         // 构建清单：声明这个工程要用哪些可选功能包（默认一个都不用）
         writeProjectJson($projDir, ["name" => $arg, "packages" => []]);
@@ -1742,79 +1563,6 @@ switch ($cmd) {
 
     case "doctor":
         exit(doctor($tsfRoot, $tpc, $phpBin));
-
-    case "module":
-        $sub = $argv[2] ?? "";
-        $dir = isset($argv[3]) ? $argv[3] : ".";
-
-        // 新建模块：在工程根的 modules/ 下生成 project.yml + lib.php
-        if ($sub === "add") {
-            $modName = $argv[3] ?? "";
-            if (preg_match('/^[a-z][a-z0-9_-]*$/', $modName) !== 1) {
-                fwrite(STDERR, "用法: tsf module add <name>" . PHP_EOL);
-                fwrite(STDERR, "  name 小写字母开头，可含数字、下划线、连字符" . PHP_EOL);
-                exit(2);
-            }
-            $modulesDir = getcwd() . "/modules";
-            if (!is_dir($modulesDir)) {
-                fwrite(STDERR, "当前目录没有 modules/ —— 先 cd 到工程根目录（有 project.yml 那层）" . PHP_EOL);
-                exit(2);
-            }
-            $target = $modulesDir . "/" . $modName;
-            if (is_dir($target)) {
-                fwrite(STDERR, "模块已存在: " . $target . PHP_EOL);
-                exit(2);
-            }
-            $yml = tplModuleYml($modName);
-            if ($yml === "") {
-                fwrite(STDERR, "模板生成失败，已中止（不写半成品）" . PHP_EOL);
-                exit(1);
-            }
-            mkdir($target, 0777, true);
-            file_put_contents($target . "/project.yml", $yml);
-            file_put_contents($target . "/lib.php", tplModuleLib());
-            echo "已创建 modules/" . $modName . PHP_EOL;
-            echo "  编译: tsf module build modules/" . $modName . PHP_EOL;
-            echo "  接口声明已按 pkg/wasm/src/Iface.php 自动填好（不要手改）" . PHP_EOL;
-            exit(0);
-        }
-
-        // 批量编译 modules/ 下所有模块（每个子目录一个独立工程）
-        if ($sub === "build-all") {
-            $modulesDir = getcwd() . "/modules";
-            if (!is_dir($modulesDir)) {
-                fwrite(STDERR, "当前目录没有 modules/" . PHP_EOL);
-                exit(2);
-            }
-            $good = 0;
-            $bad = 0;
-            $dirs = glob($modulesDir . "/*", GLOB_ONLYDIR);
-            if (is_array($dirs)) {
-                foreach ($dirs as $one) {
-                    if (!is_file($one . "/project.yml")) {
-                        continue;
-                    }
-                    echo PHP_EOL . "== " . basename($one) . " ==" . PHP_EOL;
-                    if (moduleBuild($one, $tpc, $phpBin) === 0) {
-                        $good++;
-                    } else {
-                        $bad++;
-                    }
-                }
-            }
-            echo PHP_EOL . "完成：成功 " . $good . "，失败 " . $bad . PHP_EOL;
-            exit($bad > 0 ? 1 : 0);
-        }
-
-        if ($sub !== "build") {
-            fwrite(STDERR, "用法:" . PHP_EOL);
-            fwrite(STDERR, "  tsf module add <name>    新建模块（在工程根目录跑）" . PHP_EOL);
-            fwrite(STDERR, "  tsf module build <dir>   编译一个模块" . PHP_EOL);
-            fwrite(STDERR, "  tsf module build-all     编译 modules/ 下所有模块" . PHP_EOL);
-            fwrite(STDERR, "  什么时候该写 wasm 模块见 docs/guide/09-wasm-or-typephp.md" . PHP_EOL);
-            exit(1);
-        }
-        exit(moduleBuild(realpath($dir) ?: $dir, $tpc, $phpBin));
 
     case "serve":
         $projDir = $arg === "" ? getcwd() : realpath($arg);
