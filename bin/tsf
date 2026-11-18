@@ -103,6 +103,19 @@ function readProjectJson(string $projDir): array
 }
 
 /** @param array<string, string|array> $d */
+/**
+ * 建目录，已存在则跳过。
+ *
+ * 为什么不用 mkdir(..., true)：在已存在的目录上调它会返回 false 并打 warning，
+ * 而 tsf new . 的场景（当前目录已有 composer.json / vendor）正是"目录已存在"。
+ */
+function ensureDir(string $dir): void
+{
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
+    }
+}
+
 function writeProjectJson(string $projDir, array $d): void
 {
     file_put_contents(
@@ -909,14 +922,20 @@ function tplModulesReadme(): string
  */
 function cmdNewLogin(string $name, string $cwd, string $tsfRoot): int
 {
-    $projDir = $cwd . "/" . $name;
-    if (is_dir($projDir)) {
-        fail("目录已存在: " . $projDir);
+    // 和 case "new" 一样支持 "." （先 composer require 再 tsf new . --login）
+    if ($name === "." || $name === "./") {
+        $projDir = $cwd;
+        if (file_exists($projDir . "/main.php") || file_exists($projDir . "/project.json")) {
+            fail("当前目录已经是 tsf 工程（已有 main.php 或 project.json）: " . $projDir);
+        }
+    } else {
+        $projDir = $cwd . "/" . $name;
+        if (is_dir($projDir)) {
+            fail("目录已存在: " . $projDir);
+        }
     }
-    if (!mkdir($projDir . "/config", 0777, true)) {
-        fail("创建目录失败: " . $projDir);
-    }
-    @mkdir($projDir . "/var/log", 0777, true);
+    ensureDir($projDir . "/config");
+    ensureDir($projDir . "/var/log");
 
     $secret = bin2hex(random_bytes(16));
 
@@ -951,7 +970,9 @@ function cmdNewLogin(string $name, string $cwd, string $tsfRoot): int
     ok("登录服已创建: " . $projDir);
     say("");
     say("下一步：");
-    say("  cd " . $name);
+    if ($name !== "." && $name !== "./") {
+        say("  cd " . $name);
+    }
     say("  tsf serve .                       # 编译并启动（默认 9101）");
     say("  curl -X POST -d 'name=alice' \\");
     say("    http://127.0.0.1:9101/login     # 拿 uid + token");
@@ -1347,26 +1368,42 @@ switch ($cmd) {
 
     case "new":
         if ($arg === "") {
-            fail("用法: tsf new <name> [--login]");
+            fail("用法: tsf new <name> [--login]    （名字写 . 表示在当前目录生成）");
         }
         $isLogin = in_array("--login", $argvv, true);
+
+        // "." / "./"：在当前目录生成。
+        //
+        // 这是最重要的场景：先 composer require（目录里已经有 composer.json / vendor / lock），
+        // 再 tsf new . —— 用 is_dir 判断"已存在"会把当前目录永远判成冲突。
+        // 改成检查"关键产物是否已存在"，只拦真正的重复生成。
+        $inPlace = ($arg === "." || $arg === "./");
+
         if ($isLogin) {
-            exit(cmdNewLogin($arg, getcwd(), $tsfRoot));
+            exit(cmdNewLogin($inPlace ? "." : $arg, getcwd(), $tsfRoot));
         }
-        $projDir = getcwd() . "/" . $arg;
-        if (is_dir($projDir)) {
-            fail("目录已存在: " . $projDir);
+
+        if ($inPlace) {
+            $projDir = getcwd();
+            if (file_exists($projDir . "/main.php") || file_exists($projDir . "/project.json")) {
+                fail("当前目录已经是 tsf 工程（已有 main.php 或 project.json）: " . $projDir);
+            }
+        } else {
+            $projDir = getcwd() . "/" . $arg;
+            if (is_dir($projDir)) {
+                fail("目录已存在: " . $projDir);
+            }
         }
-        mkdir($projDir . "/config", 0777, true);
-        mkdir($projDir . "/src", 0777, true);
-        mkdir($projDir . "/var/log", 0777, true);
+        ensureDir($projDir . "/config");
+        ensureDir($projDir . "/src");
+        ensureDir($projDir . "/var/log");
 
         // wasm 热更模块单独一个目录：编译目标、产物、更新方式都和 src/ 不同，
         // 混在一起用户分不清哪段代码是 native、哪段进沙箱（见 docs/guide/09）。
         // 只给结构和一个能编译的示例，不预置任何业务逻辑。
         $sampleYml = tplModuleYml("sample");
         if ($sampleYml !== "") {
-            mkdir($projDir . "/modules/sample", 0777, true);
+            ensureDir($projDir . "/modules/sample");
             file_put_contents($projDir . "/modules/README.md", tplModulesReadme());
             file_put_contents($projDir . "/modules/sample/project.yml", $sampleYml);
             file_put_contents($projDir . "/modules/sample/lib.php", tplModuleLib());
@@ -1427,7 +1464,9 @@ switch ($cmd) {
         ok("工程已创建: " . $projDir);
         say("");
         say("下一步：");
-        say("  cd " . $arg);
+        if (!$inPlace) {
+            say("  cd " . $arg);
+        }
         say("  tsf serve .            # 编译并启动");
         say("  php85 client.php       # 另开终端验证 echo");
         break;
