@@ -1,5 +1,5 @@
 {
-    "name": "typephp/tsf",
+    "name": "hhr0815hhr/tsf",
     "description": "TSF — TypePHP Server Framework：用 TypePHP(AOT) + PHP 构建高性能游戏服务器",
     "type": "library",
     "license": "MIT",
