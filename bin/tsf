@@ -1367,7 +1367,19 @@ switch ($cmd) {
         break;
 
     case "new":
-        if ($arg === "") {
+        // name = 第一个不以 -- 开头的参数。
+        //
+        // 不能直接拿 $arg（= $argvv[2]）：`tsf new --login` 会把 flag 当成名字，
+        // 结果是生成一个叫 "--login" 的目录（实测过）。
+        $name = "";
+        $argc = count($argvv);
+        for ($i = 2; $i < $argc; $i++) {
+            if (strncmp($argvv[$i], "--", 2) !== 0) {
+                $name = $argvv[$i];
+                break;
+            }
+        }
+        if ($name === "") {
             fail("用法: tsf new <name> [--login]    （名字写 . 表示在当前目录生成）");
         }
         $isLogin = in_array("--login", $argvv, true);
@@ -1377,10 +1389,10 @@ switch ($cmd) {
         // 这是最重要的场景：先 composer require（目录里已经有 composer.json / vendor / lock），
         // 再 tsf new . —— 用 is_dir 判断"已存在"会把当前目录永远判成冲突。
         // 改成检查"关键产物是否已存在"，只拦真正的重复生成。
-        $inPlace = ($arg === "." || $arg === "./");
+        $inPlace = ($name === "." || $name === "./");
 
         if ($isLogin) {
-            exit(cmdNewLogin($inPlace ? "." : $arg, getcwd(), $tsfRoot));
+            exit(cmdNewLogin($inPlace ? "." : $name, getcwd(), $tsfRoot));
         }
 
         if ($inPlace) {
@@ -1389,7 +1401,7 @@ switch ($cmd) {
                 fail("当前目录已经是 tsf 工程（已有 main.php 或 project.json）: " . $projDir);
             }
         } else {
-            $projDir = getcwd() . "/" . $arg;
+            $projDir = getcwd() . "/" . $name;
             if (is_dir($projDir)) {
                 fail("目录已存在: " . $projDir);
             }
@@ -1465,7 +1477,7 @@ switch ($cmd) {
         say("");
         say("下一步：");
         if (!$inPlace) {
-            say("  cd " . $arg);
+            say("  cd " . $name);
         }
         say("  tsf serve .            # 编译并启动");
         say("  php85 client.php       # 另开终端验证 echo");
