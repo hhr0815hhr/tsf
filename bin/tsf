@@ -21,9 +21,23 @@
  *   tsf version
  */
 
-const TSF_VERSION = "0.7.0";
-
 $tsfRoot = dirname(__DIR__);
+
+// 版本号从 composer.json 读，不在这里维护第二份。
+//
+// 早先这里是 `const TSF_VERSION = "0.7.0";`，发到 0.9.0 时 cli 还在自报 0.7.0——
+// `tsf --version` 与 `composer show` 对不上，排查"装的到底是哪个版本"时很误导。
+// 这种"两处各写一遍的常量"迟早会分叉，索性让它只有一个来源。
+$__ver = "unknown";
+$__raw = @file_get_contents($tsfRoot . "/composer.json");
+if ($__raw !== false) {
+    $__cj = json_decode($__raw, true);
+    if (is_array($__cj) && isset($__cj["version"])) {
+        $__ver = (string) $__cj["version"];
+    }
+}
+define("TSF_VERSION", $__ver);
+
 $tpc = getenv("TPC");
 if ($tpc === false || $tpc === "") {
     // 探测顺序（用 getenv 而不是 "$HOME/..."——双引号里那是 PHP 变量插值，
