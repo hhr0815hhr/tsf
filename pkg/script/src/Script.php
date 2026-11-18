@@ -2,6 +2,8 @@
 
 namespace TSF\Script;
 
+use TSF\Kernel\FileLoader;
+
 /**
  * 一个热更脚本。
  *
@@ -37,6 +39,9 @@ final class Script
 
     private int $loadedMtime = 0;
 
+    /** 上一次加载时的内容指纹（crc32），判"变没变"用它，不看 mtime */
+    private string $loadedHash = "";
+
     private string $path;
 
     private int $versions = 0;
@@ -60,6 +65,9 @@ final class Script
 
         $this->exports = $r;
         $this->loadedMtime = $this->mtime();
+        // 内容指纹与 mtime 都记：前者判"变没变"，后者只用于日志和排查
+        $path = $this->path;
+        $this->loadedHash = FileLoader::hash($path);
         $this->versions++;
         return true;
     }
@@ -106,10 +114,29 @@ final class Script
         return \interp_invoke($target, $ctx);
     }
 
-    /** 文件是否比上次加载时更新 */
+    /**
+     * 文件内容是否与上次加载时不同。
+     *
+     * **不看 mtime**：这一条在框架里已经统一过两次（T5-02 服务发现、T6-02 配置表），
+     * 都是踩了坑才定的规矩 —— `filemtime()` 只到秒，同秒改两次看不见；
+     * 改一个等长值（`1.5` → `2.5`）连文件大小都不变。两个维度同时失效，
+     * 现象就是"脚本改了但不生效，日志里一次变更都没有"。
+     *
+     * 脚本通常很小，crc32 在微秒级；这里是每帧调一次（Manager 的轮询），
+     * 也完全撑得住。
+     */
     public function changed(): bool
     {
-        return is_file($this->path) && $this->mtime() > $this->loadedMtime;
+        $path = $this->path;
+        if (!is_file($path)) {
+            return false;
+        }
+        $h = FileLoader::hash($path);
+        if ($h === "") {
+            // 读不出来就当作"没变"，而不是"变了"——避免坏文件触发无限重载
+            return false;
+        }
+        return $h !== $this->loadedHash;
     }
 
     /** 变更时自动重载，返回是否重载了 */
