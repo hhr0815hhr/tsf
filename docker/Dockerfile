@@ -53,8 +53,8 @@ RUN if [ -n "$APT_MIRROR" ]; then \
             if [ -f "$f" ]; then sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f"; fi; \
         done; \
     fi; \
-    apt-get -o Acquire::Retries=5 update && \
-    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -y --no-install-recommends \
         build-essential autoconf bison re2c pkg-config \
         cmake git curl ca-certificates xz-utils \
         libxml2-dev libssl-dev libsqlite3-dev libcurl4-openssl-dev \
@@ -105,16 +105,34 @@ RUN set -eux; \
     "${PHP_PREFIX}/bin/php" -m | grep -qi swoole && echo "swoole loaded"
 
 # --- typephp 编译器（工具链包，约 42MB / 解压 168MB）---
+# 两个坑：
+# 1. 这个脚本在 **TypeServer** 仓库，不在 tsf 仓库（写错 URL 会 404）
+# 2. 不要用 `curl ... | bash` —— 404 时 curl -f 失败，但 bash 收到空输入照样
+#    "成功"，错误被拖到下一步（cd 到不存在的目录）才暴露。先落盘再执行。
+# 最后一句是补丁断言：tpc-patches/README.md 说「升级 tpc 之后这些补丁会丢」，
+# 而只有打了补丁的 tpc 才只重编变化部分（否则改一行重编整个聚合单元）。
+# v0.7.0 已含补丁；将来换版本时这条会拦住，提示需要重新应用。
+# （注释只能写在这里，不能写进 RUN 的续行 —— 会被 shell 当成与后续命令同一行的注释）
 RUN set -eux; \
-    curl -fsSL "https://raw.githubusercontent.com/hhr0815hhr/tsf/main/scripts/install-toolchain.sh" \
-      | TSF_TOOLCHAIN_VERSION="${TSF_TOOLCHAIN_VERSION}" bash
+    curl -fsSL -o /tmp/install-toolchain.sh \
+      "https://raw.githubusercontent.com/hhr0815hhr/TypeServer/main/scripts/install-toolchain.sh"; \
+    TSF_TOOLCHAIN_VERSION="${TSF_TOOLCHAIN_VERSION}" bash /tmp/install-toolchain.sh; \
+    test -f /root/.tsf/toolchain/typephp/bin/tpc.php; \
+    grep -q "Stub hash: <ignored>" /root/.tsf/toolchain/typephp/src/Translator.php \
+      || { echo "ERROR: tpc 补丁缺失，见 TypeServer/tpc-patches/README.md"; exit 1; }
 
 # --- phpx（AOT 运行时，源码在工具链 vendor 里，要现编）---
+# 工具链包里带着打包机器上的 build/ 目录，里面 CMakeCache.txt 记的是
+# /home/hhr/typephp-src/... 的路径，换个目录就会报
+# "CMakeCache.txt directory ... is different than the directory ... was created"。
+# 所以先删掉重建，别指望复用别人的缓存。
 RUN set -eux; \
     cd "$HOME/.tsf/toolchain/typephp/vendor/swoole/phpx"; \
+    rm -rf build; \
     cmake -B build -DCMAKE_BUILD_TYPE=Release \
           -DPHP_CONFIG="${PHP_PREFIX}/bin/php-config"; \
-    cmake --build build -j"$(nproc)"
+    cmake --build build -j"$(nproc)"; \
+    test -f lib/libphpx.so
 
 # 用字面路径而不是 $HOME：Dockerfile 的 ENV 里 $HOME 不一定有值（取决于基础镜像），
 # 展开成空串的话 TPC 会变成 /typephp/bin/tpc.php，直到 `tsf build` 才报错。
@@ -148,30 +166,36 @@ RUN if [ -n "$APT_MIRROR" ]; then \
             if [ -f "$f" ]; then sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f"; fi; \
         done; \
     fi; \
-    apt-get -o Acquire::Retries=5 update && \
-    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -y --no-install-recommends \
         libmpfr6 libgmp10 libssl3 libcurl4 libxml2 libsqlite3-0 libonig5 \
         libstdc++6 ca-certificates \
+        libgmp-dev libmpfr-dev \
+        curl xz-utils \
         build-essential cmake \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb /tmp/*
 
 COPY --from=builder /usr/local/php-8.5-zts /usr/local/php-8.5-zts
 COPY --from=builder /root/.tsf /root/.tsf
 
+# php85 是给 tsf 的约定名；php 是 composer / 各类工具 shebang 里写死的名字，
+# 两个都建上，否则 composer 装好也跑不起来（/usr/bin/env: 'php': No such file）
 RUN ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php85 \
+ && ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qi swoole \
  && echo "swoole ok"
 
 # 产物运行时要从这两个目录找 .so（rpath 写死的）
 ENV LD_LIBRARY_PATH=/usr/local/php-8.5-zts/lib:/root/.tsf/toolchain/typephp/vendor/swoole/phpx/lib
 
-# tsf 自己是 composer 包；镜像里预置一份，方便 `tsf new` 起新工程
-RUN mkdir -p /opt/tsf && cd /opt/tsf \
- && curl -fsSL -o tsf.tar.gz "https://github.com/hhr0815hhr/tsf/archive/refs/heads/main.tar.gz" \
- && tar -xzf tsf.tar.gz --strip-components=1 -C /opt/tsf \
- && rm -f tsf.tar.gz \
- && ln -sf /opt/tsf/bin/tsf /usr/local/bin/tsf \
- && tsf --version
+# 装 composer，不预置 tsf 源码：
+# 工程是靠 `-v` 挂进来的，框架本来就是 composer 包，工程自己带 vendor。
+# 镜像只负责「环境」——PHP/swoole/tpc/phpx/g++ —— 不掺进任何业务代码。
+RUN curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php \
+ && php85 /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer \
+ && rm -f /tmp/composer-setup.php \
+ && composer --version
 
 WORKDIR /app
 
