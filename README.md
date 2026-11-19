@@ -63,6 +63,17 @@
 
 ## 安装
 
+> **系统要求：Linux（WSL2 / 容器 / 真机）。Windows 跑不起来，macOS 未验证。**
+>
+> 不是配置问题，是三层硬约束：
+> - 传输层是 `new \Swoole\Server(...)`，而 Swoole 的**原生 Windows 版明确不提供
+>   `Swoole\Server`**（官方支持矩阵：它依赖 Unix Socket + 多进程 fork，Windows 只有
+>   单进程协程 `Swoole\Coroutine\Http\Server`）；
+> - AOT 产物要链接 `libphpx.so`（Linux ELF），Windows 加载不了；
+> - 实现里有 `posix_getpid()`、`/proc/self/limits`、`ulimit -n` 这些 POSIX 假设。
+>
+> 在 Windows 上**编辑**代码没问题（IDE 照常用），构建和运行放 WSL2 里。
+
 > **需要 PHP 8.5 ZTS（线程安全版）。** 8.4 及以下会被 composer 拒绝；NTS 版能装上，
 > 但会在**链接期**报一堆和版本无关的错误（phpx 依赖 ZTS 的线程模型）。
 
