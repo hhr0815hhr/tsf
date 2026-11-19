@@ -1,0 +1,15 @@
+# 只钉住被 shell 解释执行的文件（含无扩展名的 bin/tsf）。
+#
+# bin/tsf 首行是 `#!/usr/bin/env php85`。检出成 CRLF 后内核取到的解释器名是
+# `php85\r`，报错是 `No such file or directory` —— 看起来像文件不存在或 php85 没装，
+# 实际只是多了个 0x0D。
+#
+# 不设全局 `* text=auto eol=lf`：那会让整个仓库的行尾都变脏改动，噪音太大。
+
+*.sh   text eol=lf
+*.bash text eol=lf
+/bin/tsf text eol=lf
+
+*.so binary
+*.a  binary
+*.gz binary

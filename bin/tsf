@@ -610,13 +610,33 @@ function doctor(string $tsfRoot, string $tpc, string $phpBin): int
     }
 
     // 3. phpx 运行时（typephp 编译产物链接的库）
-    $home = getenv("HOME");
-    $home = is_string($home) ? $home : "";
-    $phpx = $home . "/typephp-src/vendor/swoole/phpx/lib/libphpx.so";
-    if (is_file($phpx)) {
+    //
+    // 位置**必须从 tpc 推导**，不能写死 `~/typephp-src`：tpc 装在
+    // `~/.tsf/toolchain/typephp/bin/` 时，phpx 在它的 `vendor/swoole/phpx/lib/` 下；
+    // 只有"源码树直装"才是 `~/typephp-src/...`。写死的结果是官方 Docker 镜像
+    // （装的是工具链版）第一次跑 doctor 就红，而 build 其实完全正常。
+    $phpxCandidates = [];
+    $phpxEnv = getenv("PHPX_LIB");
+    if (is_string($phpxEnv) && $phpxEnv !== "") {
+        $phpxCandidates[] = $phpxEnv;
+    }
+    $tpcRoot = dirname(dirname($tpc));
+    if ($tpcRoot !== "" && $tpcRoot !== ".") {
+        $phpxCandidates[] = $tpcRoot . "/vendor/swoole/phpx/lib/libphpx.so";
+    }
+    $phpx = "";
+    foreach ($phpxCandidates as $cand) {
+        if (is_file($cand)) {
+            $phpx = $cand;
+            break;
+        }
+    }
+    if ($phpx !== "") {
         docLine("g", "phpx 运行时", $phpx);
     } else {
-        docLine("r", "phpx 运行时", "缺 " . $phpx . " —— 先构建 typephp-src");
+        $hint = $phpxCandidates === [] ? "(无法从 TPC 推导)" : $phpxCandidates[0];
+        docLine("r", "phpx 运行时", "缺 " . $hint . " —— 先构建 typephp-src");
+        echo "      " . c("→ 按 TPC 位置推导；装在别处时用 PHPX_LIB 指定 .so 全路径", "d") . PHP_EOL;
         $need++;
     }
 
@@ -752,6 +772,7 @@ function verifySuites(): array
         ["id" => "settle", "desc" => "金币账本（91 项）", "sh" => "tests/settle-test/run.sh"],
         ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "tests/settle-crash/run.sh"],
         ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "tests/fd-test/run.sh"],
+        ["id" => "room", "desc" => "房间/成员/共享宿主（100 项）", "sh" => "tests/room-test/run.sh"],
         ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
