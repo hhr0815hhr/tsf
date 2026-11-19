@@ -4,16 +4,54 @@
 （`--enable-swoole-thread`）、typephp 编译器、phpx，外加 g++ 与 cmake。
 省掉手工搭环境那一轮（通常 30 分钟起，还容易漏 `-dev` 包）。
 
-## 状态：**未在本机 build 过**
+## 状态：语法检查通过，完整构建被本机网络卡住
 
-写这份 Dockerfile 时，本机的 Docker daemon 没在运行
-（`dockerDesktopLinuxEngine` 管道不存在，WSL 也没开集成），所以：
+**已确认的**：
 
-- ✅ 做过的：依赖版本与下载地址逐个 curl 验证（PHP 8.5.12 / swoole v6.2.5 均可达）、
-  构建参数从**当前能跑的机器**上抄的（`phpx/build/CMakeCache.txt` 里的 `PHP_CONFIG`）
-- ❌ 没做过的：真正的 `docker build`
+- ✅ `docker build --check` 通过（`Check complete, no warnings found`）
+- ✅ 依赖地址可达：PHP 8.5.12（24,469,403 字节）、swoole v6.2.5
+- ✅ 构建参数来自能跑的环境（phpx 的 `CMakeCache.txt` 里 `PHP_CONFIG`）
+- ✅ Dockerfile 前 10 步都过了：APT 索引拉取成功、**109 个包全部下载完成**
 
-首次构建预留 30 分钟（PHP 从源码编译占大头）。失败大概率出在下面三个点。
+**卡住的**：
+
+- ❌ `gcc-12` 的 .deb（约 40MB）在本机容器网络下拉不动，
+  连续 `Ign:` 重试后 `E: Unable to fetch some archives`
+
+判断依据：`docker run` 里单独装 `gcc-12` 也超时（150 秒未完成），
+所以**不是构建方式或 Dockerfile 的问题**，是本机到 Debian 镜像的线路对 40MB 文件不友好。
+
+## 构建时的两个网络坑（实测）
+
+这个镜像要拉约 200MB 的 deb + 24MB PHP 源码 + swoole + 42MB 工具链，
+网络不行的环境下失败是常态。两条经验：
+
+### 1. BuildKit 走 daemon 代理，可能 502
+
+`docker info` 里有 `HTTP Proxy: http.docker.internal:3128`（Docker Desktop 的代理）。
+代理不通时 `apt-get update` 报 `502 Bad Gateway`，**而 `docker run` 里同样的命令是通的**——
+因为容器运行时网络不走它。
+
+绕开方式（用旧构建器，走容器网络）：
+
+```bash
+DOCKER_BUILDKIT=0 docker build -f docker/Dockerfile -t tsf:latest .
+```
+
+另外 Dockerfile 开头原本有 `# syntax=docker/dockerfile:1.7`，它要从 Docker Hub 拉
+frontend 镜像——代理不通时连这一步都过不去，而本文件没用到 1.7 的任何特性，已删掉。
+
+### 2. 大文件包容易失败
+
+`apt-get` 卡在某个包的 `Ign:` 上反复重试，就是线路拉不动大文件。Dockerfile 里已经加了
+`-o Acquire::Retries=5`，但仍需一条能下 40MB 的线路。国内可选：
+
+```bash
+--build-arg APT_MIRROR=mirrors.aliyun.com
+```
+
+（注意：实测在**本机**环境里容器内官方源比 WSL 侧阿里云快，
+ 所以别急着换源，先看是哪一段卡住。）
 
 ## 用法
 

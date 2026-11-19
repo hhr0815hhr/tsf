@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # tsf 的构建/运行镜像。
 #
 # ## 为什么需要它
@@ -30,6 +28,11 @@ ARG PHP_VERSION=8.5.12
 ARG SWOOLE_VERSION=6.2.5
 ARG TSF_TOOLCHAIN_VERSION=v0.7.0
 
+# 国内网络建议换源，能省几分钟（Debian 官方源拉索引有时会卡在 Ign: 重试）：
+#   docker build --build-arg APT_MIRROR=mirrors.aliyun.com -f docker/Dockerfile -t tsf:latest .
+# 默认留空 = 用官方源，保持对所有人可用。
+ARG APT_MIRROR=""
+
 # ---------------------------------------------------------------------------
 # 阶段一：构建环境（含编译器、工具链、phpx）
 # ---------------------------------------------------------------------------
@@ -38,11 +41,20 @@ FROM debian:bookworm AS builder
 ARG PHP_VERSION
 ARG SWOOLE_VERSION
 ARG TSF_TOOLCHAIN_VERSION
+ARG APT_MIRROR
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PHP_PREFIX=/usr/local/php-8.5-zts
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 换源（可选）：Debian 12 的源可能是 deb822 格式（debian.sources），也可能是老的
+# sources.list，两处都试一次，省得因为镜像版本不同而失效。
+RUN if [ -n "$APT_MIRROR" ]; then \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+            if [ -f "$f" ]; then sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f"; fi; \
+        done; \
+    fi; \
+    apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         build-essential autoconf bison re2c pkg-config \
         cmake git curl ca-certificates xz-utils \
         libxml2-dev libssl-dev libsqlite3-dev libcurl4-openssl-dev \
@@ -51,8 +63,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- PHP 8.5 ZTS + embed ---
-# --enable-zts         phpx 的前置条件（多线程各自持有 PHP 请求上下文）
+# --enable-zts           phpx 的前置条件（多线程各自持有 PHP 请求上下文）
 # --enable-embed=shared  产出 libphp.so，AOT 产物要链它
+# --enable-pcntl         Swoole 的多进程 Server 依赖 fork/signal
+# --enable-posix         框架里用了 posix_getpid()（日志的 pid 字段）
 RUN set -eux; \
     curl -fsSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.gz" -o /tmp/php.tar.gz; \
     mkdir -p /src && tar -xzf /tmp/php.tar.gz -C /src; \
@@ -61,6 +75,8 @@ RUN set -eux; \
         --prefix="${PHP_PREFIX}" \
         --enable-zts \
         --enable-embed=shared \
+        --enable-pcntl \
+        --enable-posix \
         --disable-cgi --disable-phpdbg \
         --with-openssl --with-zlib --with-curl \
         --enable-sockets --enable-mbstring --enable-fileinfo \
@@ -69,7 +85,9 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install; \
     ln -sf "${PHP_PREFIX}/bin/php" /usr/local/bin/php85; \
-    "${PHP_PREFIX}/bin/php" -v
+    "${PHP_PREFIX}/bin/php" -v; \
+    "${PHP_PREFIX}/bin/php" -m | grep -qix posix && echo "posix ok"; \
+    "${PHP_PREFIX}/bin/php" -m | grep -qix pcntl && echo "pcntl ok"
 
 # --- swoole（--enable-swoole-thread 要求 ZTS）---
 RUN set -eux; \
@@ -82,8 +100,9 @@ RUN set -eux; \
                 --enable-openssl; \
     make -j"$(nproc)"; \
     make install; \
-    echo "extension=swoole.so" > "${PHP_PREFIX}/lib/php.d/swoole.ini" 2>/dev/null \
-      || echo "extension=swoole.so" > "${PHP_PREFIX}/etc/conf.d/swoole.ini"
+    mkdir -p "${PHP_PREFIX}/lib"; \
+    echo "extension=swoole.so" >> "${PHP_PREFIX}/lib/php.ini"; \
+    "${PHP_PREFIX}/bin/php" -m | grep -qi swoole && echo "swoole loaded"
 
 # --- typephp 编译器（工具链包，约 42MB / 解压 168MB）---
 RUN set -eux; \
@@ -97,7 +116,9 @@ RUN set -eux; \
           -DPHP_CONFIG="${PHP_PREFIX}/bin/php-config"; \
     cmake --build build -j"$(nproc)"
 
-ENV TPC=$HOME/.tsf/toolchain/typephp/bin/tpc.php \
+# 用字面路径而不是 $HOME：Dockerfile 的 ENV 里 $HOME 不一定有值（取决于基础镜像），
+# 展开成空串的话 TPC 会变成 /typephp/bin/tpc.php，直到 `tsf build` 才报错。
+ENV TPC=/root/.tsf/toolchain/typephp/bin/tpc.php \
     TSF_PHP=php85
 
 # ---------------------------------------------------------------------------
@@ -110,6 +131,7 @@ ENV TPC=$HOME/.tsf/toolchain/typephp/bin/tpc.php \
 FROM debian:bookworm
 
 ARG PHP_VERSION
+ARG APT_MIRROR
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PHP_PREFIX=/usr/local/php-8.5-zts \
@@ -117,10 +139,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TSF_PHP=php85
 
 # 运行期依赖：libmpfr / libgmp（phpx 链了）、libssl / libcurl / libxml2 / sqlite
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 另外保留 build-essential + cmake —— 这个镜像同时要能 `tsf build`，
+# 见文件顶部「为什么不做多阶段瘦身」。
+#
+# 注意：注释不能写在 RUN 的行继续（`\` 换行）里面，shell 会把它当参数传给 apt-get。
+RUN if [ -n "$APT_MIRROR" ]; then \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+            if [ -f "$f" ]; then sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f"; fi; \
+        done; \
+    fi; \
+    apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         libmpfr6 libgmp10 libssl3 libcurl4 libxml2 libsqlite3-0 libonig5 \
         libstdc++6 ca-certificates \
-        # 下面这几个是 tsf build 需要的（g++ 与 make）
         build-essential cmake \
     && rm -rf /var/lib/apt/lists/*
 
