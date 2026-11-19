@@ -452,7 +452,7 @@ tsf/
 这个 README 只讲"用框架必须知道的"。更细的内容在
 [TypeServer 仓库](https://github.com/hhr0815hhr/TypeServer)：
 
-### 教程（12 篇，按顺序读）
+### 教程（13 篇，按顺序读）
 
 | 篇目 | 内容 |
 |:--|:--|
