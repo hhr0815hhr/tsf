@@ -13,6 +13,54 @@
 
 ---
 
+## 能力一览
+
+三层：框架本体（编进产物）、可选功能包（按需启用）、开发机上的工具链。
+
+### 框架（`src/`）
+
+| 模块 | 内容 |
+|:--|:--|
+| `Kernel` | Bootstrap、AppConfig、Logger、Env、FileLoader |
+| `Transport` | TCP / WebSocket，分帧在传输层做 |
+| `Protocol` | 分帧 + 载荷两层独立可换（`native`/`header` × `raw`/`json`/`msgpack`/`protobuf`/`registry`） |
+| `Gateway` | 鉴权、限流、心跳、会话、断线保留、protobuf 编解码 |
+| `Service` | 单进程调度：`spawnOf`、`deliver`、`self`、`interval`、`every`、信箱上限 |
+| `Rpc` / `Discovery` / `Shard` / `Cluster` | 跨进程调用、服务发现、分片路由、跨服路由、熔断 |
+| `Proto` | protobuf 运行时（Reader / Wire / Message） |
+| `Config` | 配置表读取 + 热更监听（`Watcher`） |
+| `Gm` / `Metrics` / `Breaker` | 管理命令（含异步任务）、指标埋点、熔断 |
+
+### 功能包（`pkg/`）
+
+| 包 | 内容 |
+|:--|:--|
+| `db` | `Repo`（声明式实体）+ `Db`（事务 / 分片）+ 三种驱动（sqlite / mysql / pgsql） |
+| `redis` | 连接封装（`\Redis` 的薄包装，不做 ORM） |
+| `schedule` | 定时任务（cron + 延迟 + 周期） |
+| `mail` | 站内信：发信 / 列表 / 已读 / 领取 / 过期清理，领取幂等 |
+| `room` / `match` / `fsm` / `aoi` | 玩法层：房间、匹配、状态机、视野（`Scene::around()` 按半径查询，`viewOf()` 只用于"我能看到谁"） |
+| `entity` / `snapshot` | 实体管理与状态快照 |
+| `frameloop` | 固定帧循环（10Hz / 20Hz 玩法） |
+| `eventlog` | 事件日志（金币结算等） |
+| `script` | 脚本热更（`ext/interp`，替 Lua） |
+| `http` | 极简 HTTP 路由（登录服 / Web API） |
+
+### 工具链（`bin/tsf`）
+
+| 命令 | 作用 |
+|:--|:--|
+| `tsf new <name>` | 生成工程（`.` 表示在当前目录生成） |
+| `tsf build [dir]` | 编译（生成 `project.yml` 并调 `tpc`） |
+| `tsf serve [dir]` | 编译并启动 |
+| `tsf watch [dir]` | 监听构建输入，变更自动重编重启 |
+| `tsf proto build [dir]` | `.proto` → `gen/Proto/*.php` |
+| `tsf config build/check [dir]` | Excel → `gen/Config/*.php` + `build/config/*.bin` |
+| `tsf lint [dir]` | 静态检查（禁 `mixed`、命名空间一致、核心不依赖 pkg） |
+| `tsf doctor` | 环境自检 |
+
+---
+
 ## 安装
 
 > **需要 PHP 8.5 ZTS（线程安全版）。** 8.4 及以下会被 composer 拒绝；NTS 版能装上，
@@ -51,6 +99,30 @@ php85 client.php 9001          # 3) 另开终端验证
 包目录、框架源码）后自动重编重启，改一行到看到效果 **1.4~1.9 s**。
 
 提交前 `tsf lint`：禁 `mixed`、命名空间与目录一致、核心不依赖可选包，违反返回非 0。
+
+---
+
+## 目录结构
+
+```
+tsf/
+├── bin/tsf              工具链入口（PHP CLI）
+├── src/                 框架核心（会被编进产物）
+│   ├── Kernel/          Bootstrap / AppConfig / Logger / FileLoader
+│   ├── Transport/       TCP / WebSocket
+│   ├── Protocol/        分帧 + 载荷（可换）
+│   ├── Gateway/         鉴权 / 限流 / 心跳 / 会话
+│   ├── Service/         Scheduler / Message / Mailbox
+│   ├── Rpc/ Discovery/ Shard/ Cluster/   分布式
+│   ├── Proto/           protobuf 运行时
+│   └── Config/ Gm/ Metrics/ Breaker/
+├── pkg/                 功能包（可选，用 project.json 的 packages 启用）
+├── tpl/                 脚手架模板
+├── tools/               config（Excel 导出）/ proto（协议生成）
+└── ext/codec/           原生帧编解码（C++，比 PHP 版快 11~14%）
+```
+
+**约定**：`src/` 编进可执行文件，`pkg/` 按需编入，`tools/` 只在开发机跑（不进产物）。
 
 ---
 
@@ -136,7 +208,165 @@ $this->cancelTimer($timerId);
 
 ---
 
-## AOT 编码红线
+## 最容易卡住的三件事（先看这个）
+
+这三条都是"看起来没问题、实际没生效"的类型，排查成本远高于修的成本。
+
+### 1. 编译失败了，但看不到真正的错误
+
+`tsf build` 默认并行编译（4 job），并行池会把 g++ 的 stderr 吞掉，只剩：
+
+```
+PHP Fatal error: Uncaught Exception: Compilation failed for: .../main.cc
+```
+
+真正的 `error: 'server' is not captured` 看不到。
+
+**现在的行为**：检测到 g++ 阶段失败会自动用 `-j 1` 重试一次并打印完整错误
+（已成功的文件命中增量缓存，只重编出错的）。手动方式：
+
+```bash
+php85 ~/.tsf/toolchain/typephp/bin/tpc.php project.yml -j 1 -O2
+```
+
+只有 **g++ 阶段**的失败才会被吞。PHP→C++ 转换阶段的失败（如
+`Fatal error: The variable $a is undefined`）本来就打得很清楚。
+
+### 2. 改了配置文件，进程里不生效
+
+AOT 二进制里的 `include` 会命中 opcache，**不会**因为文件 mtime 变化自动失效，
+即使 `opcache.validate_timestamps=On` 也一样。
+
+症状极具误导性：文件监听正常、重载计数在涨、mtime 也变了，但读到的永远是旧值，
+而且没有任何报错。重启进程就好了（冷启动时 opcache 是空的），所以容易误判成"缓存没清干净"。
+
+**对策**：不要自己写 `include`，用 `TSF\Kernel\FileLoader`：
+
+```php
+$conf = \TSF\Kernel\FileLoader::array(__DIR__ . "/config/skill.php");   // 配置表
+$hash = \TSF\Kernel\FileLoader::hash(__DIR__ . "/config/skill.php");    // 内容指纹
+$fn   = \TSF\Kernel\FileLoader::closure(__DIR__ . "/hot/activity.php"); // 热更脚本
+```
+
+返回 `null` / 空串表示不可用，调用方应当**保留旧数据**而不是清空。
+
+**判"变没变"看内容，不看 mtime**：`filemtime` 只到秒，改一个等长值（`12` → `45`）
+连文件大小都不变。这个坑框架里踩过三次（服务发现判活、配置表、`Script::changed()`）。
+
+### 3. 想改 `pkg/` 里的源码，改了却被覆盖
+
+`vendor/hhr0815hhr/tsf` 是 composer 装的，直接改会被下一次 `composer update` 覆盖。
+要接成本地仓库：
+
+```json
+{
+    "repositories": [
+        { "type": "path", "url": "/path/to/tsf", "options": { "symlink": true } }
+    ]
+}
+```
+
+```bash
+composer update hhr0815hhr/tsf
+ls -la vendor/hhr0815hhr/tsf    # 应该看到 -> /path/to/tsf 的软链
+```
+
+如果 `composer update` 说 "Nothing to modify"，说明 lock 里记录的还是旧来源，
+需要先删掉软链再 `composer install`。
+
+---
+
+## 去哪里看更多
+
+这个 README 只讲"用框架必须知道的"。更细的内容在
+[TypeServer 仓库](https://github.com/hhr0815hhr/TypeServer)：
+
+### 教程（13 篇，按顺序读）
+
+| 篇目 | 内容 |
+|:--|:--|
+| [00 quickstart](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/00-quickstart.md) | 从零到跑通 |
+| [01 ingress](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/01-ingress.md) | 接入层：传输 / 协议 / 鉴权 / 限流 |
+| [02 service](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/02-service.md) | Service 调度模型 |
+| [03 gameplay](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/03-gameplay.md) | 房间 / 帧循环 / 状态机 / AOI |
+| [04 data](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/04-data.md) | db / redis / mail / schedule |
+| [05 distributed](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/05-distributed.md) | RPC / 发现 / 分片 / 跨服 / 熔断 |
+| [06 ops](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/06-ops.md) | 运维与工具链 |
+| [07 walkthrough](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/07-walkthrough.md) | 端到端实战 |
+| [08 aot-types](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/08-aot-types.md) | AOT 类型契约（本文 §AOT 的展开） |
+| [09 assembly](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/09-assembly.md) | 工程装配 |
+| [10 login-service](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/10-login-service.md) | 登录服 |
+| [11 http-api](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/11-http-api.md) | HTTP 接口 |
+| [12 hot-reload](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/12-hot-reload.md) | 脚本热更 |
+
+### 可跑的 demo
+
+| demo | 说明 |
+|:--|:--|
+| [demo-echo](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/demo-echo) | 最小 echo 服务（登录 → 发消息 → 回显） |
+| [battle](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/battle) | 战斗最小闭环：AOI + 帧循环 + 配置热更 + GM（1000 人压测报告见仓库根 `VERIFY-BATTLE.md`） |
+| [duel](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/duel) | 1v1 对战：房间 + 帧循环 + AOI |
+| [doudizhu](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/doudizhu) | 斗地主：回合制 + 状态机 |
+| [idle](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/idle) | 挂机玩法：定时结算 |
+| [mmo-mini](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/mmo-mini) | 小 MMO：AOI + 视野广播 |
+| [sharded-world](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/sharded-world) | 分片地图 + 跨 worker 转发 |
+
+### 项目 skill（给 AI 协作者）
+
+仓库里有 [`.workbuddy/skills/tsf-dev/`](https://github.com/hhr0815hhr/TypeServer/tree/main/.workbuddy/skills/tsf-dev)，
+是把上面这些内容按「什么时候该看什么」重新组织的操作手册。用 Claude Code / WorkBuddy
+这类工具做这个项目时挂上它，能省掉大量重新摸索——尤其是错误对照表和几条热更/ GM 的规矩。
+
+| 文件 | 内容 |
+|:--|:--|
+| `SKILL.md` | 导航、开工检查（`tsf doctor`）、三个典型场景的处理流程 |
+| `references/setup.md` | 新环境的 7 个卡点（composer → 工具链 → doctor） |
+| `references/error-codes.md` | 编译 / 链接 / 运行期错误对照表（最常用） |
+| `references/add-feature.md` | 加接口 / 玩法 / pkg / 定时任务的三步流程 |
+| `references/perf-baseline.md` | 性能基线 + "假性能问题"清单 + 怎么测才可信 |
+| `references/config-reload.md` | 配置热更：默认手动、crc32 判变更、两条路的边界 |
+| `references/gm.md` | GM 通道：同步/异步怎么选、`Task` 任务表、actor 边界 |
+| `references/hot-reload.md` | 脚本热更（`pkg/script` + `ext/interp`） |
+
+### 其他
+
+- **[热更完整研究记录](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/research/hot-reload.md)**
+  —— `ext/interp` 怎么做出来的、边界在哪
+- **[框架开发全过程存档](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/archive/tsf-readme-full.md)**
+  —— 本文精简前的完整版：各组的实测数据、测量方法、为什么否掉某些方案
+  （ECS、Open Match、快照增量、RPC 重试……）
+- **[性能基线](https://github.com/hhr0815hhr/TypeServer/tree/main/bench)** —— `bench/` 下每个工程都能单独跑
+
+---
+
+## 设计取舍：几件不做的事
+
+这些都是**实测否掉**或**语义上不该做**的，列出来避免重复踩：
+
+| 不做 | 为什么 |
+|:--|:--|
+| 引入 ECS | 实测比现有 Entity 方案慢 |
+| AOI 整帧 1000 人 p99 ≤ 50 µs | 物理下限约 200 µs（遍历 + 拷贝的内存带宽） |
+| 快照热增量 | 1 万实体的全量仍在预算内，增量带来的复杂度不值得 |
+| RPC 自动重试 | 幂等性只有业务知道，框架替它做决定会出事 |
+| 熔断后重路由 | 玩家数据在故障节点上，转过去只会把"明确失败"变成"数据是错的" |
+| ORM / 容器 / 反射装配 | AOT 编不过；依赖显式传入 |
+| 默认开自动热更 | 生效时机不由任何人决定，还可能读到半成品 |
+| 用 `viewOf()` 做命中判定 | 九宫格固定 3×3，技能半径大于格宽时**静默漏判 92.6%**（实测），命中判定要用 `Scene::around()` |
+
+**共同点**：多数"优化"是先量了才发现不需要（数字比直觉可靠），少数是语义上不该做。
+**结论可能过时，方法不会** —— 硬件变了、数据量变了，重新量一遍再决定。
+
+---
+
+## 版本
+
+当前 **v0.10.0**。发版记录与 changelog 见
+[Releases](https://github.com/hhr0815hhr/tsf/releases)。
+
+API 在 1.0 之前仍可能调整；`pkg/` 下的包是可选依赖，核心不引用它们。
+
+## 附录：AOT 编码红线（违反必踩，动手前过一遍）
 
 AOT 编译不是解释执行，**PHP 的宽松语义在这里会失效**。以下 13 条全是实测过的，
 违反的后果从编译失败到"静默不干活"都有。
@@ -308,213 +538,3 @@ Logger::levelFromName(Config::getString("log.level"));
 **判据**：如果某个测试只在慢实现上通过，它就是在依赖时序，不是真通过。
 
 ---
-
-## 最容易卡住的三件事（先看这个）
-
-这三条都是"看起来没问题、实际没生效"的类型，排查成本远高于修的成本。
-
-### 1. 编译失败了，但看不到真正的错误
-
-`tsf build` 默认并行编译（4 job），并行池会把 g++ 的 stderr 吞掉，只剩：
-
-```
-PHP Fatal error: Uncaught Exception: Compilation failed for: .../main.cc
-```
-
-真正的 `error: 'server' is not captured` 看不到。
-
-**现在的行为**：检测到 g++ 阶段失败会自动用 `-j 1` 重试一次并打印完整错误
-（已成功的文件命中增量缓存，只重编出错的）。手动方式：
-
-```bash
-php85 ~/.tsf/toolchain/typephp/bin/tpc.php project.yml -j 1 -O2
-```
-
-只有 **g++ 阶段**的失败才会被吞。PHP→C++ 转换阶段的失败（如
-`Fatal error: The variable $a is undefined`）本来就打得很清楚。
-
-### 2. 改了配置文件，进程里不生效
-
-AOT 二进制里的 `include` 会命中 opcache，**不会**因为文件 mtime 变化自动失效，
-即使 `opcache.validate_timestamps=On` 也一样。
-
-症状极具误导性：文件监听正常、重载计数在涨、mtime 也变了，但读到的永远是旧值，
-而且没有任何报错。重启进程就好了（冷启动时 opcache 是空的），所以容易误判成"缓存没清干净"。
-
-**对策**：不要自己写 `include`，用 `TSF\Kernel\FileLoader`：
-
-```php
-$conf = \TSF\Kernel\FileLoader::array(__DIR__ . "/config/skill.php");   // 配置表
-$hash = \TSF\Kernel\FileLoader::hash(__DIR__ . "/config/skill.php");    // 内容指纹
-$fn   = \TSF\Kernel\FileLoader::closure(__DIR__ . "/hot/activity.php"); // 热更脚本
-```
-
-返回 `null` / 空串表示不可用，调用方应当**保留旧数据**而不是清空。
-
-**判"变没变"看内容，不看 mtime**：`filemtime` 只到秒，改一个等长值（`12` → `45`）
-连文件大小都不变。这个坑框架里踩过三次（服务发现判活、配置表、`Script::changed()`）。
-
-### 3. 想改 `pkg/` 里的源码，改了却被覆盖
-
-`vendor/hhr0815hhr/tsf` 是 composer 装的，直接改会被下一次 `composer update` 覆盖。
-要接成本地仓库：
-
-```json
-{
-    "repositories": [
-        { "type": "path", "url": "/path/to/tsf", "options": { "symlink": true } }
-    ]
-}
-```
-
-```bash
-composer update hhr0815hhr/tsf
-ls -la vendor/hhr0815hhr/tsf    # 应该看到 -> /path/to/tsf 的软链
-```
-
-如果 `composer update` 说 "Nothing to modify"，说明 lock 里记录的还是旧来源，
-需要先删掉软链再 `composer install`。
-
----
-
-## 能力一览
-
-### 框架（`src/`）
-
-| 模块 | 内容 |
-|:--|:--|
-| `Kernel` | Bootstrap、AppConfig、Logger、Env、FileLoader |
-| `Transport` | TCP / WebSocket，分帧在传输层做 |
-| `Protocol` | 分帧 + 载荷两层独立可换（`native`/`header` × `raw`/`json`/`msgpack`/`protobuf`/`registry`） |
-| `Gateway` | 鉴权、限流、心跳、会话、断线保留、protobuf 编解码 |
-| `Service` | 单进程调度：`spawnOf`、`deliver`、`self`、`interval`、`every`、信箱上限 |
-| `Rpc` / `Discovery` / `Shard` / `Cluster` | 跨进程调用、服务发现、分片路由、跨服路由、熔断 |
-| `Proto` | protobuf 运行时（Reader / Wire / Message） |
-| `Config` | 配置表读取 + 热更监听（`Watcher`） |
-| `Gm` / `Metrics` / `Breaker` | 管理命令（含异步任务）、指标埋点、熔断 |
-
-### 功能包（`pkg/`）
-
-| 包 | 内容 |
-|:--|:--|
-| `db` | `Repo`（声明式实体）+ `Db`（事务 / 分片）+ 三种驱动（sqlite / mysql / pgsql） |
-| `redis` | 连接封装（`\Redis` 的薄包装，不做 ORM） |
-| `schedule` | 定时任务（cron + 延迟 + 周期） |
-| `mail` | 站内信：发信 / 列表 / 已读 / 领取 / 过期清理，领取幂等 |
-| `room` / `match` / `fsm` / `aoi` | 玩法层：房间、匹配、状态机、视野（`Scene::around()` 按半径查询，`viewOf()` 只用于"我能看到谁"） |
-| `entity` / `snapshot` | 实体管理与状态快照 |
-| `frameloop` | 固定帧循环（10Hz / 20Hz 玩法） |
-| `eventlog` | 事件日志（金币结算等） |
-| `script` | 脚本热更（`ext/interp`，替 Lua） |
-| `http` | 极简 HTTP 路由（登录服 / Web API） |
-
-### 工具链（`bin/tsf`）
-
-| 命令 | 作用 |
-|:--|:--|
-| `tsf new <name>` | 生成工程（`.` 表示在当前目录生成） |
-| `tsf build [dir]` | 编译（生成 `project.yml` 并调 `tpc`） |
-| `tsf serve [dir]` | 编译并启动 |
-| `tsf watch [dir]` | 监听构建输入，变更自动重编重启 |
-| `tsf proto build [dir]` | `.proto` → `gen/Proto/*.php` |
-| `tsf config build/check [dir]` | Excel → `gen/Config/*.php` + `build/config/*.bin` |
-| `tsf lint [dir]` | 静态检查（禁 `mixed`、命名空间一致、核心不依赖 pkg） |
-| `tsf doctor` | 环境自检 |
-
----
-
-## 目录结构
-
-```
-tsf/
-├── bin/tsf              工具链入口（PHP CLI）
-├── src/                 框架核心（会被编进产物）
-│   ├── Kernel/          Bootstrap / AppConfig / Logger / FileLoader
-│   ├── Transport/       TCP / WebSocket
-│   ├── Protocol/        分帧 + 载荷（可换）
-│   ├── Gateway/         鉴权 / 限流 / 心跳 / 会话
-│   ├── Service/         Scheduler / Message / Mailbox
-│   ├── Rpc/ Discovery/ Shard/ Cluster/   分布式
-│   ├── Proto/           protobuf 运行时
-│   └── Config/ Gm/ Metrics/ Breaker/
-├── pkg/                 功能包（可选，用 project.json 的 packages 启用）
-├── tpl/                 脚手架模板
-├── tools/               config（Excel 导出）/ proto（协议生成）
-└── ext/codec/           原生帧编解码（C++，比 PHP 版快 11~14%）
-```
-
-**约定**：`src/` 编进可执行文件，`pkg/` 按需编入，`tools/` 只在开发机跑（不进产物）。
-
----
-
-## 去哪里看更多
-
-这个 README 只讲"用框架必须知道的"。更细的内容在
-[TypeServer 仓库](https://github.com/hhr0815hhr/TypeServer)：
-
-### 教程（13 篇，按顺序读）
-
-| 篇目 | 内容 |
-|:--|:--|
-| [00 quickstart](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/00-quickstart.md) | 从零到跑通 |
-| [01 ingress](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/01-ingress.md) | 接入层：传输 / 协议 / 鉴权 / 限流 |
-| [02 service](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/02-service.md) | Service 调度模型 |
-| [03 gameplay](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/03-gameplay.md) | 房间 / 帧循环 / 状态机 / AOI |
-| [04 data](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/04-data.md) | db / redis / mail / schedule |
-| [05 distributed](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/05-distributed.md) | RPC / 发现 / 分片 / 跨服 / 熔断 |
-| [06 ops](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/06-ops.md) | 运维与工具链 |
-| [07 walkthrough](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/07-walkthrough.md) | 端到端实战 |
-| [08 aot-types](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/08-aot-types.md) | AOT 类型契约（本文 §AOT 的展开） |
-| [09 assembly](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/09-assembly.md) | 工程装配 |
-| [10 login-service](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/10-login-service.md) | 登录服 |
-| [11 http-api](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/11-http-api.md) | HTTP 接口 |
-| [12 hot-reload](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/guide/12-hot-reload.md) | 脚本热更 |
-
-### 可跑的 demo
-
-| demo | 说明 |
-|:--|:--|
-| [demo-echo](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/demo-echo) | 最小 echo 服务（登录 → 发消息 → 回显） |
-| [duel](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/duel) | 1v1 对战：房间 + 帧循环 + AOI |
-| [doudizhu](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/doudizhu) | 斗地主：回合制 + 状态机 |
-| [idle](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/idle) | 挂机玩法：定时结算 |
-| [mmo-mini](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/mmo-mini) | 小 MMO：AOI + 视野广播 |
-| [sharded-world](https://github.com/hhr0815hhr/TypeServer/tree/main/demo/sharded-world) | 分片地图 + 跨 worker 转发 |
-
-### 其他
-
-- **[热更完整研究记录](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/research/hot-reload.md)**
-  —— `ext/interp` 怎么做出来的、边界在哪
-- **[框架开发全过程存档](https://github.com/hhr0815hhr/TypeServer/blob/main/docs/archive/tsf-readme-full.md)**
-  —— 本文精简前的完整版：各组的实测数据、测量方法、为什么否掉某些方案
-  （ECS、Open Match、快照增量、RPC 重试……）
-- **[性能基线](https://github.com/hhr0815hhr/TypeServer/tree/main/bench)** —— `bench/` 下每个工程都能单独跑
-
----
-
-## 设计取舍：几件不做的事
-
-这些都是**实测否掉**或**语义上不该做**的，列出来避免重复踩：
-
-| 不做 | 为什么 |
-|:--|:--|
-| 引入 ECS | 实测比现有 Entity 方案慢 |
-| AOI 整帧 1000 人 p99 ≤ 50 µs | 物理下限约 200 µs（遍历 + 拷贝的内存带宽） |
-| 快照热增量 | 1 万实体的全量仍在预算内，增量带来的复杂度不值得 |
-| RPC 自动重试 | 幂等性只有业务知道，框架替它做决定会出事 |
-| 熔断后重路由 | 玩家数据在故障节点上，转过去只会把"明确失败"变成"数据是错的" |
-| ORM / 容器 / 反射装配 | AOT 编不过；依赖显式传入 |
-| 默认开自动热更 | 生效时机不由任何人决定，还可能读到半成品 |
-| 用 `viewOf()` 做命中判定 | 九宫格固定 3×3，技能半径大于格宽时**静默漏判 92.6%**（实测），命中判定要用 `Scene::around()` |
-
-**共同点**：多数"优化"是先量了才发现不需要（数字比直觉可靠），少数是语义上不该做。
-**结论可能过时，方法不会** —— 硬件变了、数据量变了，重新量一遍再决定。
-
----
-
-## 版本
-
-当前 **v0.10.0**。发版记录与 changelog 见
-[Releases](https://github.com/hhr0815hhr/tsf/releases)。
-
-API 在 1.0 之前仍可能调整；`pkg/` 下的包是可选依赖，核心不引用它们。
