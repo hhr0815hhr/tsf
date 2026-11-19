@@ -90,6 +90,20 @@ export TSF_PHP=php85
 ./vendor/bin/tsf doctor
 ```
 
+### 或者用 Docker（省掉上面这一套）
+
+环境依赖不轻（PHP 要 ZTS + embed、swoole 要开 thread、phpx 要现编），
+仓库里带了 [`docker/Dockerfile`](docker/Dockerfile) 把这些全装好：
+
+```bash
+docker build -f docker/Dockerfile -t tsf:latest .
+docker run --rm -v "$PWD":/app -w /app tsf:latest tsf doctor
+docker run --rm -v "$PWD":/app -w /app tsf:latest tsf build .
+```
+
+> 该镜像首次构建约 30 分钟（PHP 从源码编译占大头），且**尚未在本机验证过**——
+> 用法、已知风险与验证清单见 [`docker/README.md`](docker/README.md)。
+
 **为什么是两步**：tsf 不是纯 PHP 框架 —— 它调用 typephp 编译器（`tpc`）把 PHP 编成 C++。
 Composer 只能装 PHP 代码，装不了编译器本体和 C++ 后端（clang），所以工具链单独发。
 
