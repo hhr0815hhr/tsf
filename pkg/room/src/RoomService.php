@@ -125,11 +125,11 @@ class RoomService extends Service
                 break;
 
             case self::MSG_START:
-                $this->reply($m, $this->room->start() ? "ok" : "reject");
+                $this->reply($m, $this->fireRoom("start") ? "ok" : "reject");
                 break;
 
             case self::MSG_FINISH:
-                $this->reply($m, $this->room->finish() ? "ok" : "reject");
+                $this->reply($m, $this->fireRoom("finish") ? "ok" : "reject");
                 break;
 
             case self::MSG_TICK:
@@ -150,14 +150,37 @@ class RoomService extends Service
             // 没开自动帧（棋牌模式），外部却发了帧消息：忽略而不是崩
             return;
         }
+        // delta 必须每帧都算：`beginFrame()` 会推进 lastMs。跳过不调的话，
+        // 房间从 WAITING 进入 PLAYING 的第一帧会把整段等待算成一个 delta。
         $delta = $loop->beginFrame();
-        $this->room->tick($delta);
+        // 只在对局进行中推进。旧版这层判断在 `Room::tick()` 里（它认状态），
+        // 状态机外移后 `Room::tick` 明确"只拒绝已关闭和负 delta"，判断归调用方。
+        if ($this->room->state() === ThreeStage::PLAYING) {
+            $this->room->tick($delta);
+        }
         $loop->endFrame();
 
         // 结算完且没人了：顺手回收
         if ($this->room->state() === ThreeStage::SETTLED && $this->room->isEmpty()) {
             $this->shutdown();
         }
+    }
+
+    /**
+     * 触发房间状态机的约定事件（start / finish / close）。
+     *
+     * 状态机是**业务注入**的（见 `Room` 的类注释），所以可能为 null——那时
+     * 房间用的是一颗裸状态值，没有"约定事件"可言，一律视为不可转移。
+     * 之前这里直接调 `$room->start()`，而 `start()` 在状态机外移时被删了，
+     * 表现为房间一开就 `Invalid callback ... does not have a method "start"`。
+     */
+    protected function fireRoom(string $event): bool
+    {
+        $fsm = $this->room->fsm();
+        if ($fsm === null) {
+            return false;
+        }
+        return $fsm->fire($event);
     }
 
     protected function reply(Message $m, string $text): void

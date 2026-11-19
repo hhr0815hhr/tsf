@@ -131,7 +131,12 @@ class RoomHost extends Service
         // "Cannot assign value to variable of type php::Int with type php::Var"。
         // 直接用 $room->id() 拿 int 更省事（README §5.9 同类问题）。
         foreach ($this->rooms as $room) {
-            $room->tick($delta);
+            // 只推进进行中的房间：WAITING 没有可推进的东西，SETTLED 之后推进
+            // 只会让 elapsed 继续涨、快照一直变脏。旧版由 `Room::tick` 自带，
+            // 状态机外移后这个判断归调用方。
+            if ($room->state() === ThreeStage::PLAYING) {
+                $room->tick($delta);
+            }
             if ($room->state() === ThreeStage::SETTLED && $room->isEmpty()) {
                 $dead[] = $room->id();
             }
@@ -178,18 +183,34 @@ class RoomHost extends Service
         }
 
         if ($op === RoomManager::OP_START) {
-            $room->start();
+            $this->fireRoom($room, "start");
             return;
         }
 
         if ($op === RoomManager::OP_FINISH) {
-            $room->finish();
+            $this->fireRoom($room, "finish");
             return;
         }
 
         if ($op === RoomManager::OP_CLOSE) {
             $this->reap($roomId);
         }
+    }
+
+    /**
+     * 触发房间状态机的约定事件。
+     *
+     * 本类宿主里的房间都由 `ThreeStage::room()` 造（状态机非空），但 `Room` 允许
+     * 业务注入自己的状态机、也可能压根不用——所以这里按"可能为 null"处理，
+     * 而不是假定它一定在。
+     */
+    protected function fireRoom(Room $room, string $event): void
+    {
+        $fsm = $room->fsm();
+        if ($fsm === null) {
+            return;
+        }
+        $fsm->fire($event);
     }
 
     /** 摘掉一个房间：先关状态、再摘表、最后通知管理器（顺序不能反） */

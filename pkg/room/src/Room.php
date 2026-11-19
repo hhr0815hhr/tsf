@@ -129,6 +129,20 @@ class Room
         return $this->members->isEmpty();
     }
 
+    /**
+     * 全部成员 uid（含观战）。
+     *
+     * 纯委托，和其它成员表访问器（`has()` / `playerCount()` / `isEmpty()`）同类：
+     * 不解释任何状态语义，所以可以放在 Room 上。业务需要"遍历房间里的人"时
+     * 不该被迫先拿到 MemberTable 再调一次。
+     *
+     * @return array<int>
+     */
+    public function uids(): array
+    {
+        return $this->members->uids();
+    }
+
     /** 加入（玩家身份）。只有房间已关闭时才拒绝 —— 其余状态由业务判断 */
     public function add(int $uid, string $name = ""): bool
     {
@@ -183,9 +197,25 @@ class Room
         return $this->elapsedMs;
     }
 
+    /**
+     * 关房：置关闭标志，并让状态机走 `close`。
+     *
+     * 为什么这里要 fire 而不是只置标志：`ThreeStage` 从 WAITING / PLAYING / SETTLED
+     * 都声明了 `close` 边——如果没人触发，那三条边就是死代码，而且关闭之后的房间
+     * 仍然能 `fire("start")`（状态机不知道"关了吗"）。关闭本身是 Room 自己拥有的
+     * 生命周期概念（`$closed` 就在这个类里），所以由它触发是合理的。
+     *
+     * 不清成员：结算、快照、掉线补发都还要按 uid 遍历。要清请显式调 `members()->clear()`。
+     */
     public function close(): void
     {
+        if ($this->closed) {
+            return;
+        }
         $this->closed = true;
+        if ($this->fsm !== null) {
+            $this->fsm->fire("close");
+        }
     }
 
     public function isClosed(): bool
@@ -198,12 +228,46 @@ class Room
     {
         return [
             "id" => $this->id,
+            // 容量必须带上：不带的话恢复时只能猜默认值，
+            // 一个 2 人房会被恢复成 8 人房（多出来的人能进，是真正的越权）
+            "maxPlayers" => $this->members->capacity(),
             "state" => $this->state(),
             "frame" => $this->frame,
             "elapsedMs" => $this->elapsedMs,
             "closed" => $this->closed ? 1 : 0,
             "members" => $this->members->toArray(),
         ];
+    }
+
+    /**
+     * 静态工厂：从 `toArray()` 的结果造一个新房间。
+     *
+     * 和 `loadFrom()` 的分工容易混，这里说清：
+     *
+     *   loadFrom()  往**已有**房间灌数据，失败条件是"房间不空"；
+     *   fromArray() 造**新**房间，失败条件是"快照里没有合法 id"。
+     *
+     * 快照恢复必须走后者——先 `new Room()` 再 loadFrom 的话，容量已经按默认值
+     * 定死了，`maxPlayers` 就丢了。
+     *
+     * @param array<string, mixed> $d
+     * @param Machine|null $fsm 业务的状态机；不传则恢复成裸状态值
+     */
+    public static function fromArray(array $d, ?Machine $fsm = null): ?Room
+    {
+        $id = isset($d["id"]) ? (int) $d["id"] : 0;
+        if ($id <= 0) {
+            return null;
+        }
+        $max = isset($d["maxPlayers"]) ? (int) $d["maxPlayers"] : 8;
+        if ($max <= 0) {
+            $max = 8;
+        }
+        $room = new Room($id, $max, $fsm);
+        if (!$room->loadFrom($d)) {
+            return null;
+        }
+        return $room;
     }
 
     /**
@@ -225,6 +289,13 @@ class Room
 
         $this->frame = isset($d["frame"]) ? (int) $d["frame"] : 0;
         $this->elapsedMs = isset($d["elapsedMs"]) ? (int) $d["elapsedMs"] : 0;
+
+        // 关闭标志也要恢复：`toArray()` 写了它，不读回来就是"快照往返丢字段"——
+        // 一个已关的房间恢复后会重新收人
+        $closed = isset($d["closed"]) ? (int) $d["closed"] : 0;
+        if ($closed === 1) {
+            $this->closed = true;
+        }
 
         $rows = isset($d["members"]) && is_array($d["members"]) ? $d["members"] : [];
         $this->members->loadFrom($rows);
