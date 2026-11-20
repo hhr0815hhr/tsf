@@ -65,6 +65,12 @@ final class Handoff
     /** 目标 → 源：拒绝了（源侧要回滚） */
     public const MSG_REJECT = 64103;
 
+    /** 源 → 目标：撤销这次交接（源侧反悔了，比如租约丢了） */
+    public const MSG_ABORT = 64104;
+
+    /** 目标 → 源：撤销完成（装过的已卸掉，或者根本没装） */
+    public const MSG_ABORTED = 64105;
+
     /** 字段分隔符。状态本身是最后一段，可以包含任意字节 */
     private const SEP = "\x1f";
 
@@ -100,6 +106,23 @@ final class Handoff
     /** @var array<string, string> key => 回滚原因 */
     private array $resultWhy = [];
 
+    /** @var array<string, int> 正在撤销的 key => 版本（等 ABORTED） */
+    private array $aborting = [];
+
+    /** @var array<string, int> 撤销等待的截止时刻 */
+    private array $abortDeadline = [];
+
+    /**
+     * 目标侧墓碑：key => 被撤销过的最大版本。
+     *
+     * 必须有它。撤销消息和 MIGRATE 是两条独立链路，可能乱序：源侧发了 ABORT，
+     * 但先发的 MIGRATE 还在路上。没有墓碑的话，那条迟到的 MIGRATE 会把状态又装回去，
+     * 而源侧已经回滚成"我持有"——两份状态同时存在。
+     *
+     * @var array<string, int>
+     */
+    private array $aborted = [];
+
     /** @var \Closure|null function (string $key, int $version): void */
     private ?\Closure $onCommit = null;
 
@@ -108,6 +131,9 @@ final class Handoff
 
     /** @var \Closure|null function (string $key, string $state, int $version): bool */
     private ?\Closure $onInstall = null;
+
+    /** @var \Closure|null function (string $key, int $version): void 撤销时要卸掉已装的状态 */
+    private ?\Closure $onUninstall = null;
 
     /** @var array<string, int> */
     private array $stat = [
@@ -118,6 +144,10 @@ final class Handoff
         "installed" => 0,
         "dup" => 0,
         "ignored" => 0,
+        "uninstalled" => 0,
+        "abort_sent" => 0,
+        "aborted" => 0,
+        "abort_timeout" => 0,
     ];
 
     /**
@@ -158,6 +188,16 @@ final class Handoff
     }
 
     /**
+     * 目标侧卸掉已安装的状态。**只有撤销会走到这里。**
+     *
+     * 必须实现，否则撤销只是"源侧不认了"，目标侧那份还在——数据分家比不撤销更糟。
+     */
+    public function onUninstall(\Closure $cb): void
+    {
+        $this->onUninstall = $cb;
+    }
+
+    /**
      * 发起迁移。返回 false 表示发不出去（链路未握手 / 同 key 已有迁移在飞）。
      *
      * 注意：返回 true 只代表"已发出"，不代表成功——成功看 `onCommit`。
@@ -185,7 +225,42 @@ final class Handoff
         return true;
     }
 
-    /** 处理一条入站迁移消息（三个 msgId 都在这里收口） */
+
+    /**
+     * 撤销一次在飞的交接。返回 false 表示发不出去（没有在飞 / 链路断了）。
+     *
+     * 什么时候用：源侧反悔了。典型场景是**租约中途丢失**——别的节点已经接手这个 key，
+     * 你手上这次交接再继续走完，就等于两份状态同时存在。
+     *
+     * 撤销不是"本地不认"就完了：目标侧可能已经把状态装进去了，所以必须发 ABORT 让
+     * 对方卸掉并回 ABORTED。只有收到 ABORTED（或超时）才真正回滚本地，
+     * 这样"装过又卸"和"还没装"两种时序都能收敛。
+     */
+    public function abort(string $key, int $nowMs): bool
+    {
+        if (!isset($this->pending[$key])) {
+            return false;
+        }
+        $ver = $this->pending[$key][2];
+        $node = $this->pending[$key][0];
+        $entry = $this->pending[$key][1];
+        $dst = Addr::pack($node, $entry);
+        if (!$this->net->sendRaw($dst, $this->entryId, self::MSG_ABORT, $key . self::SEP . $ver)) {
+            return false;
+        }
+        unset($this->pending[$key]);
+        $this->aborting[$key] = $ver;
+        $this->abortDeadline[$key] = $nowMs + $this->timeoutMs;
+        $this->stat["abort_sent"]++;
+        return true;
+    }
+
+    public function isAborting(string $key): bool
+    {
+        return isset($this->aborting[$key]);
+    }
+
+    /** 处理一条入站迁移消息（所有协议号都在这里收口） */
     public function handle(Message $m): void
     {
         $msgId = $m->msgId;
@@ -203,6 +278,14 @@ final class Handoff
             $this->settle($raw, false);
             return;
         }
+        if ($msgId === self::MSG_ABORT) {
+            $this->acceptAbort($m, $raw);
+            return;
+        }
+        if ($msgId === self::MSG_ABORTED) {
+            $this->settleAbort($raw);
+            return;
+        }
         $this->stat["ignored"]++;
     }
 
@@ -212,6 +295,24 @@ final class Handoff
      */
     public function expire(int $nowMs): void
     {
+        // 撤销也可能等不到 ABORTED（对端崩了）。超时后照样回滚本地：
+        // 此时"目标侧可能还留着那份状态"是已知代价，比永远卡在 aborting 好
+        $stale = [];
+        foreach ($this->abortDeadline as $key => $dl) {
+            if ($nowMs >= $dl) {
+                $stale[] = (string) $key;
+            }
+        }
+        foreach ($stale as $key) {
+            $ver = $this->aborting[$key] ?? 0;
+            unset($this->aborting[$key]);
+            unset($this->abortDeadline[$key]);
+            $this->stat["abort_timeout"]++;
+            $this->result[$key] = "rolledback";
+            $this->resultWhy[$key] = "abort-timeout";
+            $this->fire($this->onRollback, $key, $ver, "abort-timeout");
+        }
+
         if ($this->pending === []) {
             return;
         }
@@ -256,6 +357,54 @@ final class Handoff
 
     // ---------------------------------------------------------------- 内部
 
+    /** 目标侧：收到撤销 */
+    private function acceptAbort(Message $m, string $raw): void
+    {
+        $parts = explode(self::SEP, $raw, 2);
+        if (count($parts) !== 2) {
+            $this->stat["ignored"]++;
+            return;
+        }
+        $key = $parts[0];
+        $ver = (int) $parts[1];
+
+        // 装过就卸掉。没装过也要记墓碑：MIGRATE 可能还在路上
+        if (($this->installed[$key] ?? 0) === $ver) {
+            $cb = $this->onUninstall;
+            if ($cb instanceof \Closure) {
+                $cb($key, $ver);
+            }
+            unset($this->installed[$key]);
+            $this->stat["uninstalled"]++;
+        }
+        if (($this->aborted[$key] ?? 0) < $ver) {
+            $this->aborted[$key] = $ver;
+        }
+        $this->reply($m->from, self::MSG_ABORTED, $key, $ver);
+    }
+
+    /** 源侧：收到 ABORTED，现在才能安全地回滚 */
+    private function settleAbort(string $raw): void
+    {
+        $parts = explode(self::SEP, $raw, 2);
+        if (count($parts) !== 2) {
+            $this->stat["ignored"]++;
+            return;
+        }
+        $key = $parts[0];
+        $ver = (int) $parts[1];
+        if (($this->aborting[$key] ?? 0) !== $ver) {
+            $this->stat["ignored"]++;
+            return;
+        }
+        unset($this->aborting[$key]);
+        unset($this->abortDeadline[$key]);
+        $this->result[$key] = "rolledback";
+        $this->resultWhy[$key] = "aborted";
+        $this->stat["aborted"]++;
+        $this->fire($this->onRollback, $key, $ver, "aborted");
+    }
+
     /** 目标侧：安装 */
     private function acceptMigrate(Message $m, string $raw): void
     {
@@ -267,6 +416,13 @@ final class Handoff
         $key = $parts[0];
         $ver = (int) $parts[1];
         $state = $parts[2];
+
+        if (($this->aborted[$key] ?? 0) >= $ver) {
+            // 这次交接已经被撤销过了，迟到的 MIGRATE 绝不能装
+            $this->stat["ignored"]++;
+            $this->reply($m->from, self::MSG_REJECT, $key, $ver);
+            return;
+        }
 
         $have = $this->installed[$key] ?? 0;
         if ($have >= $ver) {
@@ -302,6 +458,11 @@ final class Handoff
         }
         $key = $parts[0];
         $ver = (int) $parts[1];
+        if (isset($this->aborting[$key])) {
+            // 已经在撤销了：这个 ACK 是撤销前发出的，认了它就会留下两份状态
+            $this->stat["ignored"]++;
+            return;
+        }
         if (!isset($this->pending[$key])) {
             // 迟到的 ACK（已经超时回滚过了）。忽略是唯一正确的处理：
             // 这时候业务已经在本地继续跑，再"提交"会把状态凭空删掉

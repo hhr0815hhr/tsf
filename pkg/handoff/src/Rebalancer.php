@@ -189,7 +189,10 @@ final class Rebalancer
     {
         // 1) 先让 Handoff 处理超时（否则"卡住的"会一直占着 tracked）
         $this->handoff->expire($nowMs);
-        // 2) 收口上一轮的结果
+        // 2) 在飞的也要续租：交接可能跑好几秒，而它们不在下面的候选循环里
+        //    （那里一看到 pending 就 continue），不在这里续就会中途过期
+        $this->renewTracked($nowMs);
+        // 3) 收口上一轮的结果
         $this->collect($nowMs);
         // 3) 发起新的
         $started = 0;
@@ -202,7 +205,8 @@ final class Rebalancer
             if ($inflight >= $this->limit) {
                 break;
             }
-            if ($this->handoff->isPending($k)) {
+            if ($this->handoff->isPending($k) || $this->handoff->isAborting($k)) {
+                // 撤销还没收尾时也不能重新发起，否则同一份状态会有两次在飞
                 continue;
             }
             // 刚失败过的 key 先冷静一会儿：目标持续拒绝时，每轮重试一次就是热循环，
@@ -295,6 +299,39 @@ final class Rebalancer
         return $out;
     }
 
+    /**
+     * 给在飞的交接续租；续不上就撤销这次交接。
+     *
+     * 这是"租约中途丢失"的唯一处理点：别的节点已经接手这个 key，你这次交接再走完，
+     * 就等于两份状态同时存在。撤销会发 ABORT 让目标侧卸掉已装的部分。
+     */
+    private function renewTracked(int $nowMs): void
+    {
+        if ($this->lease === null || $this->tracked === []) {
+            return;
+        }
+        $lost = [];
+        foreach ($this->tracked as $key => $target) {
+            $k = (string) $key;
+            $exp = $this->leased[$k] ?? 0;
+            if ($exp - $nowMs >= intdiv($this->leaseTtlMs, 2)) {
+                continue;
+            }
+            if (!$this->lease->renew($k, $this->leaseTtlMs)) {
+                $lost[] = $k;
+                continue;
+            }
+            $this->leased[$k] = $nowMs + $this->leaseTtlMs;
+        }
+        foreach ($lost as $k) {
+            $this->stat["lease_lost"]++;
+            unset($this->leased[$k]);
+            if ($this->handoff->isPending($k)) {
+                $this->handoff->abort($k, $nowMs);
+            }
+        }
+    }
+
     /** 收口：把已出结果的交接通知业务，并清理跟踪表 */
     private function collect(int $nowMs): void
     {
@@ -304,7 +341,8 @@ final class Rebalancer
         $done = [];
         foreach ($this->tracked as $key => $target) {
             $k = (string) $key;
-            if ($this->handoff->isPending($k)) {
+            if ($this->handoff->isPending($k) || $this->handoff->isAborting($k)) {
+                // 撤销还没收尾时也不能重新发起，否则同一份状态会有两次在飞
                 continue;
             }
             $res = $this->handoff->lastResult($k);
