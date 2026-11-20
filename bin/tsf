@@ -776,6 +776,7 @@ function verifySuites(): array
         ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "tests/fd-test/run.sh"],
         ["id" => "room", "desc" => "房间/成员/共享宿主（100 项）", "sh" => "tests/room-test/run.sh"],
         ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
+        ["id" => "cluster-chan", "desc" => "集群通道/握手（TCP 11 项 + UDS 2000 往返）", "sh" => "tests/cluster-test/run.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
         ["id" => "script", "desc" => "脚本热更（加载/对象共享/越权/热更/异常）", "sh" => "tests/script-test/run.sh"],
