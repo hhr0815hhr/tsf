@@ -86,6 +86,18 @@ final class EventLog
     /** 重放时遇到的坏行数（>0 说明上次是崩溃退出，需要 repair） */
     private int $badLines = 0;
 
+    /**
+     * 高水位：**发出去过的最大序号**，存在 `{path}.seq` 里。
+     *
+     * 为什么不能只看文件：`truncate()` 把日志截空之后，文件里一个序号都没有了，
+     * 只看文件的话 `nextSeq` 会退回 1 —— 于是序号被复用，`replay($fromSeq)` 的坐标
+     * 和检查点的水位（"折到第 N 条"）同时失效。表现是重启后**检查点说折到 100，
+     * 而新事件又从 1 开始**，`replay(101)` 一条都读不到：静默丢数据。
+     *
+     * 序号是一次性资源，只能单调递增，不能因为删了历史就回收。
+     */
+    private int $hiWater = 0;
+
     private int $commits = 0;
 
     public function __construct(string $path, int $mode = self::MODE_FLUSH)
@@ -114,6 +126,7 @@ final class EventLog
     {
         $seq = $this->nextSeq;
         $this->nextSeq++;
+        $this->hiWater = $seq;
 
         $line = json_encode([
             "s" => $seq,
@@ -289,6 +302,9 @@ final class EventLog
             }
         }
 
+        // 先把高水位钉住，再重写文件：万一重写后文件里没有序号了，
+        // 下次 scan 还能从这里接上，而不是从 1 重来
+        $this->writeSeqFile($this->hiWater);
         $this->close();
         $tmp = $this->path . ".tmp";
         $buf = "";
@@ -306,7 +322,8 @@ final class EventLog
 
     public function lastSeq(): int
     {
-        return $this->lastGoodSeq;
+        // 高水位而不是"最后一行"：截断之后文件可能是空的，但序号不能回退
+        return $this->hiWater;
     }
 
     public function path(): string
@@ -382,13 +399,15 @@ final class EventLog
         $this->badLines = 0;
 
         if (!is_file($this->path)) {
-            $this->nextSeq = 1;
+            $this->hiWater = $this->readSeqFile();
+            $this->nextSeq = $this->hiWater + 1;
             return;
         }
 
         $raw = file_get_contents($this->path);
         if (!is_string($raw) || $raw === "") {
-            $this->nextSeq = $this->lastGoodSeq + 1;
+            $this->hiWater = $this->readSeqFile();
+            $this->nextSeq = $this->hiWater + 1;
             return;
         }
 
@@ -407,6 +426,38 @@ final class EventLog
                 $this->lastGoodSeq = $seq;
             }
         }
-        $this->nextSeq = $this->lastGoodSeq + 1;
+        $side = $this->readSeqFile();
+        $this->hiWater = $this->lastGoodSeq > $side ? $this->lastGoodSeq : $side;
+        $this->nextSeq = $this->hiWater + 1;
+    }
+
+    /** 读高水位侧车；不存在或内容坏掉返回 0（宁可从头，也不能读出个负数） */
+    private function readSeqFile(): int
+    {
+        $f = $this->path . ".seq";
+        if (!is_file($f)) {
+            return 0;
+        }
+        $raw = file_get_contents($f);
+        if (!is_string($raw)) {
+            return 0;
+        }
+        $t = trim($raw);
+        if ($t === "" || preg_match('/^\d+$/', $t) !== 1) {
+            return 0;
+        }
+        return (int) $t;
+    }
+
+    private function writeSeqFile(int $seq): void
+    {
+        if ($seq <= 0) {
+            return;
+        }
+        $f = $this->path . ".seq";
+        $tmp = $f . ".tmp";
+        if (file_put_contents($tmp, (string) $seq) !== false) {
+            rename($tmp, $f);
+        }
     }
 }
