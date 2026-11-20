@@ -771,7 +771,7 @@ function verifySuites(): array
         // 于是"环境没装"被当成"代码有问题"——正是 needs 要拦掉的那种假红
         ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh", "needs" => ["python3"]],
         ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "tests/swoole-contract/run.sh"],
-        ["id" => "settle", "desc" => "金币账本（100 项）", "sh" => "tests/settle-test/run.sh"],
+        ["id" => "settle", "desc" => "金币账本（109 项）", "sh" => "tests/settle-test/run.sh"],
         ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "tests/settle-crash/run.sh"],
         ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "tests/fd-test/run.sh"],
         ["id" => "room", "desc" => "房间/成员/共享宿主（100 项）", "sh" => "tests/room-test/run.sh"],
