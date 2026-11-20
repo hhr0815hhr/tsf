@@ -1,7 +1,7 @@
 # Docker
 
 `Dockerfile` 提供一个装好的 tsf 环境：PHP 8.5 ZTS（含 `--enable-embed`）、swoole
-（`--enable-swoole-thread`）、typephp 编译器（**含 tpc 补丁**）、phpx、composer，
+（`--enable-swoole-thread`）、phpredis、typephp 编译器（**含 tpc 补丁**）、phpx、composer，
 外加 g++ 与 cmake。
 
 ## 状态：已验证
@@ -52,7 +52,7 @@ docker run --rm -v /path/to/TypeServer:/work -w /work/demo/battle tsf:latest \
 |:--|:--|
 | 基础 | `debian:bookworm` |
 | PHP | `/usr/local/php-8.5-zts`（ZTS + embed → `libphp.so`；pcntl / posix 已开） |
-| 扩展 | swoole 6.2.5（thread 模式） |
+| 扩展 | swoole 6.2.5（thread 模式）、phpredis 6.3.0（ZTS 版，`pkg/redis` 依赖） |
 | 工具链 | `~/.tsf/toolchain/typephp`（tpc + src + vendor），**含 tpc-patches 的改动** |
 | phpx | `~/.tsf/toolchain/typephp/vendor/swoole/phpx/lib/libphpx.so` |
 | 其他 | g++ / cmake / libgmp-dev / libmpfr-dev / composer |

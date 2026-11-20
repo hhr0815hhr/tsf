@@ -3,8 +3,8 @@
 # ## 为什么需要它
 #
 # 跑 tsf 要凑一套并不轻松的环境：PHP 8.5 **ZTS**（还要 `--enable-embed` 出 libphp.so）、
-# swoole 开 `--enable-swoole-thread`、typephp 编译器（42MB 工具链包）、phpx（要 cmake 现编）、
-# 外加 g++ 和 libmpfr。手工装一轮通常 30 分钟起，还容易漏掉某个 `-dev`。
+# swoole 开 `--enable-swoole-thread`、phpredis（ZTS 版 .so）、typephp 编译器（42MB 工具链包）、
+# phpx（要 cmake 现编）、外加 g++ 和 libmpfr。手工装一轮通常 30 分钟起，还容易漏掉某个 `-dev`。
 #
 # ## 用法
 #
@@ -26,6 +26,7 @@
 
 ARG PHP_VERSION=8.5.12
 ARG SWOOLE_VERSION=6.2.5
+ARG REDIS_VERSION=6.3.0
 ARG TSF_TOOLCHAIN_VERSION=v0.7.0
 
 # 国内网络建议换源，能省几分钟（Debian 官方源拉索引有时会卡在 Ign: 重试）：
@@ -40,6 +41,7 @@ FROM debian:bookworm AS builder
 
 ARG PHP_VERSION
 ARG SWOOLE_VERSION
+ARG REDIS_VERSION
 ARG TSF_TOOLCHAIN_VERSION
 ARG APT_MIRROR
 
@@ -103,6 +105,31 @@ RUN set -eux; \
     mkdir -p "${PHP_PREFIX}/lib"; \
     echo "extension=swoole.so" >> "${PHP_PREFIX}/lib/php.ini"; \
     "${PHP_PREFIX}/bin/php" -m | grep -qi swoole && echo "swoole loaded"
+
+# --- phpredis（pkg/redis 直接 `new \Redis()`，缺了它 AOT 产物启动即报 Class not found）---
+# 三个点，都会踩：
+# 1. 不用 pecl 命令装 —— 这里的 PHP 是 `./configure && make install` 编的，没带 pear
+#    （bin 目录里只有 php/phpize/php-config/phpdbg 那套），`pecl install redis` 不存在。
+#    直接拉源码包 phpize 编。
+# 2. 版本要挑支持 PHP 8.5 的：6.2.0（2025-03）前后才开始跟 8.5 兼容，
+#    6.3.0 是首个明确配 8.5 的稳定版。低版本编得过但跑起来可能出段错误。
+# 3. ZTS 不需要额外开关：phpize 从 php-config --configure-options 里读到 --enable-zts，
+#    自动带 -DZTS 编出 thread-safe 版本，产物落在 no-debug-zts-<apiversion> 目录。
+#    反过来说，如果哪天有人把它换成 NTS 的 php-config，这里不会报错，只会静默产出
+#    一个加载不上的 .so —— 所以下面留了一条 `php -m | grep -qi redis` 断言。
+# 网络兜底：pecl.php.net 偶发抽风，退到 GitHub release（两者都是 tar.gz，解压命令通用）。
+RUN set -eux; \
+    curl -fsSL "https://pecl.php.net/get/redis-${REDIS_VERSION}.tgz" -o /tmp/redis.tgz \
+      || curl -fsSL "https://github.com/phpredis/phpredis/archive/refs/tags/${REDIS_VERSION}.tar.gz" -o /tmp/redis.tgz; \
+    mkdir -p /src/redis && tar -xzf /tmp/redis.tgz -C /src/redis --strip-components=1; \
+    cd /src/redis; \
+    "${PHP_PREFIX}/bin/phpize"; \
+    ./configure --with-php-config="${PHP_PREFIX}/bin/php-config" --enable-redis; \
+    make -j"$(nproc)"; \
+    make install; \
+    echo "extension=redis.so" >> "${PHP_PREFIX}/lib/php.ini"; \
+    "${PHP_PREFIX}/bin/php" -m | grep -qix redis && echo "redis loaded"; \
+    "${PHP_PREFIX}/bin/php" -r 'exit(class_exists("Redis") ? 0 : 1);' && echo "Redis class ok"
 
 # --- typephp 编译器（工具链包，约 42MB / 解压 168MB）---
 # 两个坑：
@@ -184,7 +211,9 @@ COPY --from=builder /root/.tsf /root/.tsf
 RUN ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php85 \
  && ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qi swoole \
- && echo "swoole ok"
+ && /usr/local/php-8.5-zts/bin/php -m | grep -qix redis \
+ && /usr/local/php-8.5-zts/bin/php -r 'exit(class_exists("Redis") ? 0 : 1);' \
+ && echo "swoole ok / redis ok"
 
 # 产物运行时要从这两个目录找 .so（rpath 写死的）
 ENV LD_LIBRARY_PATH=/usr/local/php-8.5-zts/lib:/root/.tsf/toolchain/typephp/vendor/swoole/phpx/lib
