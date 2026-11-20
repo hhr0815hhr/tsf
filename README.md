@@ -263,8 +263,24 @@ $c->connect(2, "tcp://10.0.0.12:9100");
 
 1. **只校验不加密**。载荷仍是明文，能监听链路的人照样能看。要求更强得上 TLS。
 2. `secret` 为空时只校验结构不校验 mac —— 只适合单机调试。
-3. `Discovery`（服务发现）仍然是**本地文件**注册表，跨机需要换中心化注册表
-   （Redis/etcd）。也就是说：**传输层能跨机了，节点目录还没有。**
+3. **节点目录**：单机用 `Discovery\FileRegistry`（读本地目录），跨机用
+   `pkg/registry` 的 `RedisRegistry`（`TSF\Registry`）：
+
+```php
+// composer 工程里启用 packages: ["registry"]，或 project.json 里加 "registry"
+$reg = new TSF\Registry\RedisRegistry("127.0.0.1", 6379, "", 0, 3000, "tsf");
+$reg->connect();
+$reg->register(new NodeInfo(1, "tcp://10.0.0.11:9100", "raw", ["region" => "hz"]));
+$reg->heartbeat(1);                      // 每秒一次，TTL 3s 到期即判定死亡
+$alive = $reg->alive();                  // 跨机的节点目录
+```
+
+> 它**不用 php-redis 扩展**：扩展类在 AOT 产物里不可用（能编进去，运行时
+> `class \Redis is undefined`）。所以包内自带一个薄 RESP 客户端，走
+> `stream_socket_*`——和 Cluster 同一批原语，AOT 下已验证。
+>
+> 代价是**同步阻塞**：一次命令一个 RTT。跨机部署要开协程模式，否则一个慢 Redis
+> 会挡住整个 worker。
 
 ---
 

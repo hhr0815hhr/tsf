@@ -1,0 +1,7 @@
+{
+  "name": "registry",
+  "ns": "TSF\\Registry",
+  "desc": "Redis 版的节点注册表（跨机服务发现），自带最小 RESP 客户端",
+  "requires": [],
+  "hint": "单机继续用 src/Discovery/FileRegistry；要跨机才需要它。它不依赖 php-redis 扩展——扩展类在 AOT 产物里不可用"
+}
