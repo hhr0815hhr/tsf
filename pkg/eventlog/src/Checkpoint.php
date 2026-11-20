@@ -44,6 +44,9 @@ final class Checkpoint
     /** 文件头，用来一眼认出这不是普通 JSON 文件 */
     public const MAGIC = "TSFCKPT1";
 
+    /** 增量文件头（与基座区分：加载时一眼能看出这是差量而不是全量） */
+    public const MAGIC_DELTA = "TSFCKPD1";
+
     private string $path;
 
     /** 上次成功加载/保存的序号；0 表示没有可用检查点 */
@@ -161,7 +164,205 @@ final class Checkpoint
         }
         $this->seq = $seq;
         $this->state = $clean;
+
+        // 再叠增量。增量的存在是常态（每次检查点只写变化的部分），
+        // 所以这一步失败必须整体判失败：只加载基座会得到一个"半旧的"状态，
+        // 比完全加载不出来更危险
+        $deltas = $this->deltaFiles();
+        foreach ($deltas as $path) {
+            $d = $this->readDelta($path);
+            if ($d === null) {
+                $this->reason = "bad-delta:" . basename($path);
+                $this->seq = 0;
+                $this->state = [];
+                return false;
+            }
+            foreach ($d["set"] as $k => $v) {
+                $this->state[(string) $k] = $v;
+            }
+            foreach ($d["del"] as $k) {
+                unset($this->state[$k]);
+            }
+            if ($d["seq"] > $this->seq) {
+                $this->seq = $d["seq"];
+            }
+        }
         return true;
+    }
+
+    /**
+     * 写增量：只记录"变了什么"。
+     *
+     * 为什么需要它：全量检查点的写入量与状态大小成正比，而状态里有余额表
+     * （随账号数增长）和去重表（随事件数增长）。每 1 万条事件写一次几十 MB 的全量，
+     * 是从"能跑"变成"跑久了会痛"的那一步。
+     *
+     * 增量只写自上次检查点以来变化的键。代价是恢复时要按序叠加，所以
+     * **增量必须能排序**：文件名里带序号，加载时按升序应用。
+     *
+     * @param array<string, int|string|float|bool> $set 新增/修改的键
+     * @param array<int, string>                  $del 删除的键
+     */
+    public function saveDelta(int $seq, array $set, array $del): bool
+    {
+        if ($seq < 0) {
+            return false;
+        }
+        $body = json_encode(
+            ["seq" => $seq, "set" => $set, "del" => array_values($del)],
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
+        if (!is_string($body)) {
+            return false;
+        }
+        $doc = self::MAGIC_DELTA . " " . $seq . " " . hash("crc32b", $body) . "\n" . $body;
+        $path = $this->deltaPath($seq);
+        $tmp = $path . ".tmp";
+        if (file_put_contents($tmp, $doc) !== strlen($doc)) {
+            if (file_exists($tmp)) {
+                unlink($tmp);
+            }
+            return false;
+        }
+        if (!rename($tmp, $path)) {
+            if (file_exists($tmp)) {
+                unlink($tmp);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 压实：把当前完整状态写成新的基座，并删掉所有增量。
+     *
+     * 顺序必须是**先写基座、再删增量**：反过来的话，崩在中间就等于把状态删了，
+     * 而增量只是差量、重建不出来。
+     *
+     * @param array<string, int|string|float|bool> $state
+     */
+    public function compact(int $seq, array $state): bool
+    {
+        if (!$this->save($seq, $state)) {
+            return false;
+        }
+        foreach ($this->deltaFiles() as $path) {
+            // 删不掉不算失败：下次压实还会再试，而且增量叠加是幂等的
+            if (is_file($path)) {
+                unlink($path);
+            }
+        }
+        return true;
+    }
+
+    /** 当前有多少个增量文件（观测：应该在 compactEvery 附近，不该无限增长） */
+    public function deltaCount(): int
+    {
+        return count($this->deltaFiles());
+    }
+
+    /**
+     * 写增量 + 截断日志，顺序同样固化在这里（先增量、后截断）。
+     *
+     * @param array<string, int|string|float|bool> $set
+     * @param array<int, string>                  $del
+     *
+     * @return int 截断后保留的条数；-1 表示拒绝执行
+     */
+    public function saveDeltaAndPrune(EventLog $log, int $seq, array $set, array $del): int
+    {
+        if ($seq <= 0 || $seq > $log->lastSeq()) {
+            return -1;
+        }
+        if (!$this->saveDelta($seq, $set, $del)) {
+            return -1;
+        }
+        return $log->truncate($seq);
+    }
+
+    /** @return array<int, string> 按序号升序的增量文件 */
+    private function deltaFiles(): array
+    {
+        $files = glob($this->path . ".d*");
+        if (!is_array($files)) {
+            return [];
+        }
+        $out = [];
+        foreach ($files as $f) {
+            $name = (string) $f;
+            if (str_ends_with($name, ".tmp")) {
+                continue;       // 写了一半的增量不是有效记录
+            }
+            $out[] = $name;
+        }
+        // 文件名里带的是十进制序号，但字典序会把 d100 排在 d9 前面，
+        // 所以按解析出来的整数排。这里用 ksort 而不是 usort+闭包：
+        // 闭包捕获 $this 在 AOT 下不可靠
+        $map = [];
+        foreach ($out as $f) {
+            $map[$this->seqOfDelta($f)] = $f;
+        }
+        ksort($map);
+        return array_values($map);
+    }
+
+    private function deltaPath(int $seq): string
+    {
+        return $this->path . ".d" . $seq;
+    }
+
+    private function seqOfDelta(string $path): int
+    {
+        $base = basename($path);
+        $pos = strrpos($base, ".d");
+        if ($pos === false) {
+            return 0;
+        }
+        $num = substr($base, $pos + 2);
+        return preg_match('/^\d+$/', $num) === 1 ? (int) $num : 0;
+    }
+
+    /** @return array{seq: int, set: array<string, int|string|float|bool>, del: array<int, string>}|null */
+    private function readDelta(string $path): ?array
+    {
+        $raw = file_get_contents($path);
+        if (!is_string($raw) || $raw === "") {
+            return null;
+        }
+        $nl = strpos($raw, "\n");
+        if ($nl === false) {
+            return null;
+        }
+        $header = substr($raw, 0, $nl);
+        $body = substr($raw, $nl + 1);
+        $parts = explode(" ", $header);
+        if (count($parts) !== 3 || $parts[0] !== self::MAGIC_DELTA) {
+            return null;
+        }
+        if (hash("crc32b", $body) !== $parts[2]) {
+            return null;
+        }
+        $d = json_decode($body, true);
+        if (!is_array($d)) {
+            return null;
+        }
+        $set = [];
+        if (isset($d["set"]) && is_array($d["set"])) {
+            foreach ($d["set"] as $k => $v) {
+                if (is_int($v) || is_string($v) || is_float($v) || is_bool($v)) {
+                    $set[(string) $k] = $v;
+                }
+            }
+        }
+        $del = [];
+        if (isset($d["del"]) && is_array($d["del"])) {
+            foreach ($d["del"] as $k) {
+                if (is_string($k) && $k !== "") {
+                    $del[] = $k;
+                }
+            }
+        }
+        return ["seq" => (int) $parts[1], "set" => $set, "del" => $del];
     }
 
     public function exists(): bool
