@@ -276,6 +276,19 @@ function genProjectYml(string $projDir, string $tsfRoot): string
             }
         }
     }
+    // **每个工程一个构建目录**，不能共用 toolchain 下的全局缓存。
+    //
+    // 依据（实测报错）：共用的 `.o` 里带着**工程名**符号——
+    //   Rpc.o: undefined reference to `typephp_project_shard_test::get_str(unsigned int)`
+    // 也就是 `timer-test` 复用了为 `shard-test` 编译的目标文件，链接必然失败。
+    // 这就是那些"随机 ld returned 1"的真因：不是并发竞争，是跨工程缓存污染，
+    // 谁先编译谁污染，红的是后面那个，所以看起来毫无规律。
+    //
+    // 代价是每个工程各有一份缓存（首轮冷编译），换来的是"构建结果只取决于本工程"。
+    $cacheKey = substr(hash("crc32b", $projDir), 0, 8);
+    $home = getenv("HOME");
+    $home = is_string($home) && $home !== "" ? $home : "/tmp";
+    $lines[] = "build-dir: " . $home . "/.tsf/proj/" . basename($projDir) . "-" . $cacheKey . "/build";
     return implode("\n", $lines) . "\n";
 }
 
@@ -818,9 +831,50 @@ function cmdTest(string $root, string $tsfRoot, string $tpc, string $phpBin, arr
 {
     $filter = "";
     $unwiredOnly = false;
-    foreach (array_slice($argv, 2) as $a) {
+    $one = "";
+    $shard = 0;
+    $shards = 1;
+    $listOnly = false;
+    $args = array_slice($argv, 2);
+    $n = count($args);
+    for ($i = 0; $i < $n; $i++) {
+        $a = $args[$i];
         if ($a === "--unwired") {
             $unwiredOnly = true;
+            continue;
+        }
+        if ($a === "--jobs" || $a === "-j" || strpos($a, "--jobs=") === 0) {
+            // 并行在本机**不划算**：tpc 每个构建内部已经 -j4，4 核机器上再开多个 worker
+            // 只是把 4 核超售成 16 线程（实测 6:56 vs 串行 6:00，CPU 时间反而多 5 分钟）。
+            // 真正要扩的是**机器数**，用 --shard 分片到多台 runner / 多个容器。
+            fwrite(STDERR, "注意：--jobs 已移除。tpc 内部已 -j4，本机并行只会超售；"
+                . "要扩规模请用 --shard i/N 分到多台机器或容器。" . PHP_EOL);
+            if ($a === "--jobs" || $a === "-j") {
+                $i++;
+            }
+            continue;
+        }
+        if ($a === "--list") {
+            $listOnly = true;
+            continue;
+        }
+        if ($a === "--shard") {
+            // 分片：`--shard 1/3` 表示第 1 片（从 0 开始）。给多机 CI 用——
+            // 每台 runner 拿一片，这才是能真正线性扩展的方式
+            $spec = isset($args[$i + 1]) ? (string) $args[$i + 1] : "";
+            $i++;
+            $sp = explode("/", $spec);
+            if (count($sp) === 2) {
+                $shard = (int) $sp[0];
+                $shards = (int) $sp[1] > 0 ? (int) $sp[1] : 1;
+            }
+            continue;
+        }
+        if ($a === "--one") {
+            // 内部用：父进程并行时按目录各起一个自己，复用全部逻辑（build 的串行重试、
+            // skip-auto、run.sh）。不用重写一套"并行版执行器"是这里最重要的取舍
+            $one = isset($args[$i + 1]) ? (string) $args[$i + 1] : "";
+            $i++;
             continue;
         }
         if ($a !== "" && $a[0] !== "-" && $a !== "test") {
@@ -828,93 +882,97 @@ function cmdTest(string $root, string $tsfRoot, string $tpc, string $phpBin, arr
         }
     }
 
-    $dirs = glob($root . "/tests/*", GLOB_ONLYDIR);
-    if (!is_array($dirs)) {
+    $dirs = [];
+    $raw = glob($root . "/tests/*", GLOB_ONLYDIR);
+    if (!is_array($raw)) {
         fail("找不到 tests/ 目录");
     }
-    sort($dirs);
-
-    $rows = [];
-    $pass = 0;
-    $fail = 0;
-    $skip = 0;
-
-    foreach ($dirs as $dir) {
-        $d = (string) $dir;
-        if (!is_file($d . "/main.php")) {
+    sort($raw);
+    foreach ($raw as $d) {
+        $dir = (string) $d;
+        if (!is_file($dir . "/main.php")) {
             continue;
         }
-        $id = basename($d);
+        if ($one !== "" && $dir !== $one) {
+            continue;
+        }
+        $dirs[] = $dir;
+    }
+
+    // --one：子进程模式。只跑一个目录，把结果打一行给父进程解析
+    if ($one !== "") {
+        if ($dirs === []) {
+            echo "RESULT FAIL 0 目录不存在或没有 main.php" . PHP_EOL;
+            return 1;
+        }
+        $r = runOneTest($dirs[0], $tsfRoot, $tpc, $phpBin);
+        echo "RESULT " . $r["state"] . " " . $r["ms"] . " " . str_replace(PHP_EOL, " ", $r["tail"]) . PHP_EOL;
+        if ($r["state"] === "SKIP") {
+            return 77;
+        }
+        return $r["state"] === "PASS" ? 0 : 1;
+    }
+
+    // 过滤（先过滤再决定并行，避免子进程各自重复 glob）
+    $picked = [];
+    foreach ($dirs as $dir) {
+        $id = basename($dir);
         if ($filter !== "" && strpos($id, $filter) === false) {
             continue;
         }
-
-        $hasRun = is_file($d . "/run.sh");
-        // --unwired：只看那些没接进 verify 的（没有 run.sh）。CI 里最有价值的一条
+        $hasRun = is_file($dir . "/run.sh");
         if ($unwiredOnly && $hasRun) {
             continue;
         }
-
-        // `skip-auto` 标记文件：用例声明"我依赖外部服务/是交互式探测，别在自动集合里跑"。
-        // 用文件而不是代码判断，是为了让"为什么跳过"和用例放在一起、一眼能看到。
-        $skipFile = $d . "/skip-auto";
-        if (is_file($skipFile)) {
-            $why = trim((string) file_get_contents($skipFile));
-            if ($why === "") {
-                $why = "声明了 skip-auto";
-            }
-            $rows[] = ["id" => $id, "state" => "SKIP", "ms" => 0, "tail" => $why, "run" => $hasRun];
-            $skip++;
-            fwrite(STDERR, "→ " . $id . " ... SKIP（" . $why . "）" . PHP_EOL);
-            continue;
-        }
-        fwrite(STDERR, "→ " . $id . ($hasRun ? "" : "（无 run.sh，直接 build+run）") . " ... ");
-        $t0 = microtime(true);
-
-        if ($hasRun) {
-            $out = [];
-            $rc = 0;
-            exec("cd " . escapeshellarg($d) . " && timeout 300 bash run.sh 2>&1", $out, $rc);
-        } else {
-            // 没有脚本：先生成 project.yml 并编译，再跑产物
-            $rc = doBuild($d, $tsfRoot, $tpc, $phpBin);
-            if ($rc === 0) {
-                $bin = findBinary($d);
-                if ($bin === "") {
-                    $out = ["编译成功但找不到产物（目录名与二进制名对不上）"];
-                    $rc = 1;
-                } else {
-                    $out = [];
-                    exec("cd " . escapeshellarg($d) . " && timeout 300 " . escapeshellarg($bin) . " 2>&1", $out, $rc);
-                }
-            } else {
-                $out = ["编译失败"];
-            }
-        }
-
-        $ms = (int) ((microtime(true) - $t0) * 1000);
-        if ($rc === 77) {
-            $state = "SKIP";
-            $skip++;
-        } elseif ($rc === 0) {
-            $state = "PASS";
-            $pass++;
-        } else {
-            $state = "FAIL";
-            $fail++;
-        }
-        $tail = "";
-        if ($state === "FAIL") {
-            $tail = implode(" | ", array_slice($out, -3));
-        }
-        fwrite(STDERR, $state . PHP_EOL);
-        $rows[] = ["id" => $id, "state" => $state, "ms" => $ms, "tail" => $tail, "run" => $hasRun];
+        $picked[] = $dir;
     }
 
+    // 分片必须在过滤之后、排序之后做：否则同一片在不同机器上可能对不上
+    if ($shards > 1) {
+        $slice = [];
+        $idx = 0;
+        foreach ($picked as $dir) {
+            if ($idx % $shards === $shard) {
+                $slice[] = $dir;
+            }
+            $idx++;
+        }
+        $picked = $slice;
+    }
+
+    if ($listOnly) {
+        foreach ($picked as $dir) {
+            echo basename($dir) . PHP_EOL;
+        }
+        echo "共 " . count($picked) . " 个" . PHP_EOL;
+        return 0;
+    }
+
+    $rows = [];
+    {
+        foreach ($picked as $dir) {
+            $id = basename($dir);
+            fwrite(STDERR, "→ " . $id . (is_file($dir . "/run.sh") ? "" : "（无 run.sh，直接 build+run）") . " ... ");
+            $r = runOneTest($dir, $tsfRoot, $tpc, $phpBin);
+            fwrite(STDERR, $r["state"] . PHP_EOL);
+            $rows[] = ["id" => $id, "state" => $r["state"], "ms" => $r["ms"], "tail" => $r["tail"], "run" => is_file($dir . "/run.sh")];
+        }
+    }
+
+    $pass = 0;
+    $fail = 0;
+    $skip = 0;
     echo PHP_EOL;
     echo padWidth("结果", 6) . padWidth("用例", 20) . padWidth("入口", 10) . "耗时" . PHP_EOL;
     echo str_repeat("-", 64) . PHP_EOL;
     foreach ($rows as $r) {
+        if ($r["state"] === "PASS") {
+            $pass++;
+        } elseif ($r["state"] === "SKIP") {
+            $skip++;
+        } else {
+            $fail++;
+        }
         $sec = number_format($r["ms"] / 1000, 1) . "s";
         echo padWidth($r["state"], 6) . padWidth($r["id"], 20)
             . padWidth($r["run"] ? "run.sh" : "main.php", 10) . $sec . PHP_EOL;
@@ -926,6 +984,89 @@ function cmdTest(string $root, string $tsfRoot, string $tpc, string $phpBin, arr
     echo "通过 " . $pass . " / 失败 " . $fail . " / 跳过 " . $skip . PHP_EOL;
 
     return $fail === 0 ? 0 : 1;
+}
+
+/**
+ * 构建期互斥：拿一个全机文件锁再编译。
+ *
+ * `tpc` 的增量缓存（PCH、object cache）在 `~/.tsf` 下按内容寻址，多进程同时写会撞。
+ * 这不是"偶尔慢一点"，是**编译直接失败**——实测 4 路并行 26 个用例红了 20 个，
+ * 单独跑全过。所以并行只并行运行，不并行编译。
+ *
+ * @param \Closure $fn function (): int
+ */
+function withBuildLock(string $tsfRoot, \Closure $fn): int
+{
+    $home = getenv("HOME");
+    $home = is_string($home) && $home !== "" ? $home : "/tmp";
+    $lockPath = $home . "/.tsf/build.lock";
+    $dir = dirname($lockPath);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
+    }
+    $fh = @fopen($lockPath, "c");
+    if (!is_resource($fh)) {
+        // 拿不到锁文件也要能跑：退回串行语义（进程内只有我自己）
+        return $fn();
+    }
+    flock($fh, LOCK_EX);
+    $rc = $fn();
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    return $rc;
+}
+
+/**
+ * 跑一个用例目录，返回 {state, ms, tail}。
+ *
+ * @return array{state: string, ms: int, tail: string}
+ */
+function runOneTest(string $dir, string $tsfRoot, string $tpc, string $phpBin): array
+{
+    $hasRun = is_file($dir . "/run.sh");
+
+    // `skip-auto`：用例声明"我依赖外部服务/是交互式探测，别在自动集合里跑"。
+    // 用文件而不是代码判断，是为了让"为什么跳过"和用例放在一起、一眼能看到
+    $skipFile = $dir . "/skip-auto";
+    if (is_file($skipFile)) {
+        $why = trim((string) file_get_contents($skipFile));
+        return ["state" => "SKIP", "ms" => 0, "tail" => $why === "" ? "声明了 skip-auto" : $why];
+    }
+
+    $t0 = microtime(true);
+    $out = [];
+    if ($hasRun) {
+        $rc = 0;
+        exec("cd " . escapeshellarg($dir) . " && timeout 300 bash run.sh 2>&1", $out, $rc);
+    } else {
+        // **构建必须串行**：多个 tpc 同时跑会共用 `~/.tsf` 的 PCH 与增量缓存，
+        // 实测 4 路并行时 26 个用例有 20 个报"编译失败"（单独跑全过）。
+        // 所以并行的收益只在"运行"阶段，构建用文件锁排队。
+        ob_start();
+        $rc = withBuildLock($tsfRoot, function () use ($dir, $tsfRoot, $tpc, $phpBin): int {
+            return doBuild($dir, $tsfRoot, $tpc, $phpBin);
+        });
+        $buildOut = (string) ob_get_clean();
+        if ($rc === 0) {
+            $bin = findBinary($dir);
+            if ($bin === "") {
+                $out = ["编译成功但找不到产物（目录名与二进制名对不上）"];
+                $rc = 1;
+            } else {
+                exec("cd " . escapeshellarg($dir) . " && timeout 300 " . escapeshellarg($bin) . " 2>&1", $out, $rc);
+            }
+        } else {
+            $lines = array_values(array_filter(explode("\n", $buildOut), function (string $l): bool {
+                return trim($l) !== "";
+            }));
+            $out = $lines === [] ? ["编译失败（没有输出）"] : array_slice($lines, -3);
+        }
+    }
+    $ms = (int) ((microtime(true) - $t0) * 1000);
+
+    $state = $rc === 0 ? "PASS" : ($rc === 77 ? "SKIP" : "FAIL");
+    $tail = $state === "FAIL" ? implode(" | ", array_slice($out, -3)) : "";
+    return ["state" => $state, "ms" => $ms, "tail" => $tail];
 }
 
 function verifyRun(string $root, array $argv): int
