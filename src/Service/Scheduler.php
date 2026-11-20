@@ -4,6 +4,7 @@ namespace TSF\Service;
 
 use TSF\Cluster\Addr;
 use TSF\Cluster\Cluster;
+use TSF\Kernel\CrashDump;
 use TSF\Kernel\Logger;
 use TSF\Timer\Cron;
 use TSF\Timer\Timers;
@@ -63,6 +64,20 @@ final class Scheduler
      * 调小更公平但调度开销占比上升。200 在两者间比较平衡（实测见 bench/service）。
      */
     private int $budget = 200;
+
+    /**
+     * 崩溃取证：给每个服务留最近 N 条消息摘要。
+     *
+     * 默认**关闭**（热路径每批只多一次布尔判断）。打开后每条消息多付约 100ns，
+     * 换的是崩溃时能看出"挂之前在处理什么"——没有它，日志里只有一行 msgId，
+     * "玩家说卡了一下"这类问题只能靠时间戳猜。
+     */
+    private bool $traceOn = false;
+
+    private int $traceCap = 16;
+
+    /** 崩溃现场落盘目录。空串表示不落盘（仅日志） */
+    private string $crashDir = "";
 
     /** 每个信箱的积压上限；0 表示不限制（不推荐，见 Mailbox::$limit 注释） */
     private int $boxLimit = 262144;
@@ -302,6 +317,24 @@ final class Scheduler
     }
 
     /** 受监督服务的当前地址（重启后会变）。没受监督时返回 0 */
+    /** 打开崩溃取证（保留最近 `$cap` 条消息摘要）。已存在的服务也会被设置 */
+    public function enableTrace(int $cap = 16): void
+    {
+        $this->traceOn = true;
+        $this->traceCap = $cap > 0 ? $cap : 16;
+        foreach ($this->services as $svc) {
+            if ($svc instanceof Service) {
+                $svc->enableTrace($this->traceCap);
+            }
+        }
+    }
+
+    /** 崩溃现场落盘目录（不存在会自动建）。传空串表示只写日志 */
+    public function crashDir(string $dir): void
+    {
+        $this->crashDir = $dir;
+    }
+
     public function supervisedAddr(string $name): int
     {
         if (!isset($this->supervised[$name])) {
@@ -392,6 +425,10 @@ final class Scheduler
         }
 
         $svc->bindAddr($id);
+        if ($this->traceOn) {
+            // 取证开关在 spawn 之前就打开时，新服务也要立刻开始记录
+            $svc->enableTrace($this->traceCap);
+        }
         $this->services[$id] = $svc;
         $box = new Mailbox();
         $box->setLimit($this->boxLimit);
@@ -567,6 +604,9 @@ final class Scheduler
             // 看门狗阈值也提到局部：关闭时只多一次整数比较
             $wdNs = $this->watchdogNs;
             $m = null;
+            // 取证缓冲：开关提到局部，关闭时只多一次判断
+            $traceOn = $this->traceOn;
+            $traceNow = $traceOn ? self::nowMs() : 0;
             // try/catch 放在批外而不是每条外面：AOT 下每进一次 try 都要装一次
             // 异常跳转上下文（实测差 300+ ns/条）。代价是出错时无法精确定位到某一条，
             // 但语义上本来就是"服务出错即销毁"，剩下的积压消息随服务一起丢弃。
@@ -575,6 +615,9 @@ final class Scheduler
                     $m = $box->pop();
                     if ($m === null) {
                         break;
+                    }
+                    if ($traceOn) {
+                        $svc->traceRecord($m, $traceNow);
                     }
                     if ($wdNs === 0) {
                         $svc->onMessage($m);
@@ -595,10 +638,25 @@ final class Scheduler
             } catch (\Throwable $e) {
                 // 单个服务出错不该拖垮整个进程：记录后销毁它（状态可能已不一致）
                 $this->stat["errors"]++;
+                $label = Addr::label($id);
+                $dumpPath = "";
+                if ($this->crashDir !== "") {
+                    // 落盘失败不能影响"销毁这个服务"：崩溃路径上不该再抛
+                    $dumpPath = CrashDump::save(
+                        $this->crashDir,
+                        $label,
+                        $m === null ? 0 : $m->msgId,
+                        $e,
+                        $svc->traceRecent(),
+                        $svc->dumpState(),
+                        ["restarts" => $this->stat["errors"]]
+                    );
+                }
                 Logger::error("service error, killing", [
-                    "svc" => Addr::label($id),
+                    "svc" => $label,
                     "msgId" => $m === null ? 0 : $m->msgId,
                     "err" => $e->getMessage(),
+                    "dump" => $dumpPath,
                 ]);
                 $this->setCurrentOf($prev);
                 $this->onCrashed($id);

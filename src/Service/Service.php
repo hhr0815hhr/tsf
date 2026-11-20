@@ -46,6 +46,81 @@ abstract class Service
     abstract public function onMessage(Message $m): void;
 
     /**
+     * 崩溃取证用的环形缓冲（最近 N 条消息摘要）。
+     *
+     * 上面说过"不要放 per-message 统计"——所以这里是**默认关闭**的：
+     * `traceCap = 0` 时 `traceRecord()` 只有一次整数比较。打开后每条消息多付
+     * 约 100ns（拼一行字符串），换的是崩溃时能知道"挂之前在处理什么"。
+     *
+     * 生产上建议开着（几十 ns 换可定位），压测时关掉。
+     */
+    private int $traceCap = 0;
+
+    /** 已经记录过的条数（单调递增，用来算环形位置） */
+    private int $traceAt = 0;
+
+    /** @var array<int, string> 环形缓冲本体：下标是 traceAt % traceCap */
+    private array $traceLines = [];
+
+    /** 打开取证缓冲。`$cap` 是保留条数；传 0 关闭 */
+    public function enableTrace(int $cap = 16): void
+    {
+        $this->traceCap = $cap > 0 ? $cap : 0;
+        $this->traceAt = 0;
+        $this->traceLines = [];
+    }
+
+    public function traceCap(): int
+    {
+        return $this->traceCap;
+    }
+
+    /**
+     * 记一条消息摘要。由 `Scheduler` 在调用 `onMessage()` 之前调用。
+     *
+     * 摘要只留**结构化短字段**（时间、消息号、来源、会话、载荷长度），不留载荷本身：
+     * 载荷可能几十 KB，存 N 条就等于给每个服务挂了一份内存放大。
+     */
+    public function traceRecord(Message $m, int $nowMs): void
+    {
+        if ($this->traceCap <= 0) {
+            return;
+        }
+        $len = is_string($m->data) ? strlen($m->data) : -1;
+        $this->traceLines[$this->traceAt % $this->traceCap] =
+            $nowMs . "|" . $m->msgId . "|" . $m->from . "|" . $m->session . "|" . $len;
+        $this->traceAt++;
+    }
+
+    /** @return array<int, string> 最近的消息摘要，按时间正序 */
+    public function traceRecent(): array
+    {
+        if ($this->traceCap <= 0 || $this->traceAt === 0) {
+            return [];
+        }
+        $out = [];
+        $start = $this->traceAt > $this->traceCap ? $this->traceAt - $this->traceCap : 0;
+        for ($i = $start; $i < $this->traceAt; $i++) {
+            $v = $this->traceLines[$i % $this->traceCap] ?? null;
+            if (is_string($v)) {
+                $out[] = $v;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * 业务状态摘要，崩溃时随 dump 一起落盘。
+     *
+     * 默认空。子类覆写后返回 JSON（比如 `{"room":1001,"hp":{...},"stage":2}`），
+     * 崩溃现场就从"哪条消息出错"变成"出错时这局打到哪了"。
+     */
+    public function dumpState(): string
+    {
+        return "";
+    }
+
+    /**
      * 以自己身份发一条消息。
      *
      * 在 `onMessage` 里可以直接用 `Scheduler::instance()->deliver()`（更快，省两次调用）；
