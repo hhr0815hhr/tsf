@@ -282,6 +282,31 @@ $alive = $reg->alive();                  // 跨机的节点目录
 > 代价是**同步阻塞**：一次命令一个 RTT。跨机部署要开协程模式，否则一个慢 Redis
 > 会挡住整个 worker。
 
+### 状态交接（handoff）
+
+`Shard\Ring` 只回答"这个 key 该归谁"，**不搬数据**。扩缩容、故障摘除、负载再平衡
+真正缺的是后半步：归属变了，状态还在老节点上。`pkg/handoff` 补这一段：
+
+```php
+$h = new Handoff($nodeId, $entry, new ClusterTransport($cluster), 3000);
+
+// 目标侧：装状态，返回 false 表示拒绝（版本冲突 / 容量满 / 校验不过）
+$h->onInstall(function (string $key, string $state, int $ver): bool { /* ... */ return true; });
+// 源侧：交接成功 → 可以删本地了
+$h->onCommit(function (string $key, int $ver): void { /* ... */ });
+// 源侧：被拒或超时 → **必须**恢复本地服务
+$h->onRollback(function (string $key, int $ver, string $why): void { /* ... */ });
+
+$h->begin($targetNode, $targetEntry, "room:1", $version, $stateBytes, nowMs());
+$h->expire(nowMs());    // 超时扫描，由调用方周期性驱动（和 FrameLoop 一样）
+```
+
+三条不变量（测试就是照它们写的）：**失败必回滚**（交接失败不等于数据丢失）、
+**同版本不重复安装**（重发只回 ACK）、**同 key 同时只有一次在飞**。
+
+> 协议号必须落在 `0..65535`：跨节点包的 msgId 只有 2 字节，超了会被静默截断
+> ——发送端正常、接收端"没收到"、两端日志都干净。`Packet::encode()` 现在会直接抛错。
+
 ---
 
 ## 最容易卡住的三件事（先看这个）
