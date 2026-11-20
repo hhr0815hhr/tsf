@@ -86,6 +86,20 @@ final class Handoff
     /** @var array<string, int> key => 已安装的版本 */
     private array $installed = [];
 
+    /**
+     * 每个 key 最近一次交接的结局："committed" / "rolledback"。
+     *
+     * 为什么要它：自动重平衡（`Rebalancer`）需要"事后"知道结果，而回调槽位只有一个——
+     * 业务已经占了 `onCommit/onRollback`，调度器再抢就冲突了。留一份可查询的结局，
+     * 让调度器用轮询而不是回调，两者就不打架。
+     *
+     * @var array<string, string>
+     */
+    private array $result = [];
+
+    /** @var array<string, string> key => 回滚原因 */
+    private array $resultWhy = [];
+
     /** @var \Closure|null function (string $key, int $version): void */
     private ?\Closure $onCommit = null;
 
@@ -164,6 +178,9 @@ final class Handoff
             return false;
         }
         $this->pending[$key] = [$targetNode, $targetEntry, $version, $nowMs + $this->timeoutMs];
+        // 新一次交接开始，上一次的结局就作废了，避免调度器把旧结果当成新的
+        unset($this->result[$key]);
+        unset($this->resultWhy[$key]);
         $this->stat["sent"]++;
         return true;
     }
@@ -208,6 +225,8 @@ final class Handoff
             $ver = $this->pending[$key][2];
             unset($this->pending[$key]);
             $this->stat["timeout"]++;
+            $this->result[$key] = "rolledback";
+            $this->resultWhy[$key] = "timeout";
             $this->fire($this->onRollback, $key, $ver, "timeout");
         }
     }
@@ -296,11 +315,31 @@ final class Handoff
         unset($this->pending[$key]);
         if ($ok) {
             $this->stat["accepted"]++;
+            $this->result[$key] = "committed";
+            $this->resultWhy[$key] = "";
             $this->fire($this->onCommit, $key, $ver, "");
             return;
         }
         $this->stat["rejected"]++;
+        $this->result[$key] = "rolledback";
+        $this->resultWhy[$key] = "rejected";
         $this->fire($this->onRollback, $key, $ver, "rejected");
+    }
+
+    /**
+     * 最近一次交接的结局：`committed` / `rolledback` / 空串（没交接过）。
+     *
+     * 给自动重平衡用：它没法挤进 `onCommit` 回调槽位（业务已经占了），所以用轮询。
+     */
+    public function lastResult(string $key): string
+    {
+        return $this->result[$key] ?? "";
+    }
+
+    /** 回滚原因（`rejected` / `timeout`），成功或未交接时为空串 */
+    public function lastWhy(string $key): string
+    {
+        return $this->resultWhy[$key] ?? "";
     }
 
     private function reply(int $to, int $msgId, string $key, int $ver): void

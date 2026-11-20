@@ -325,6 +325,32 @@ $h->onRollback(function (string $k, int $v, string $why) use ($g) {
 > 队列满返回 `overflow`，由调用方明确拒绝；不做静默丢弃，也不做"丢最老的"——
 > 那等于悄悄吞掉一次操作，玩家只会觉得"点了没反应"。
 
+要让它在扩容时自动跑，用 `Rebalancer` 把三者串起来（它只做编排：扫差异、限并发、收口结果）：
+
+```php
+$rb = new Rebalancer($nodeId, $entry, $handoff, $gate, new RingOwnership($ring), 8);
+
+$rb->onExport(function (string $key): ?string {        // null = 这个 key 现在不能搬
+    return $stateOf[$key] ?? null;
+});
+$rb->onMoved(function (string $key, int $target, array $queued): void {
+    // 删本地状态；把 $queued 按原序转发给 $target
+});
+$rb->onFailed(function (string $key, int $target, string $why): void {
+    // 保持本地，闸门已回 OPEN
+});
+
+$rb->own("room:1");        // 业务创建时登记，销毁时 disown()
+$rb->scan(nowMs());        // 每轮：驱动超时 → 收口结果 → 发起新交接（受 limit 约束）
+```
+
+两个容易漏的点：
+
+- **目标侧 `onInstall` 里要 `own($key)`**，否则交接完成后新宿主不把它纳入后续重平衡，
+  下次扩容时它就成了"没人管"的孤儿。
+- 交接失败会进入 `retryMs` 退避（默认 1s）。没有退避，目标持续拒绝会变成每轮打一次的
+  热循环，同一份快照在链路上反复传。
+
 > 协议号必须落在 `0..65535`：跨节点包的 msgId 只有 2 字节，超了会被静默截断
 > ——发送端正常、接收端"没收到"、两端日志都干净。`Packet::encode()` 现在会直接抛错。
 
