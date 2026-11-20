@@ -2,6 +2,8 @@
 
 namespace TSF\Handoff;
 
+use TSF\Metrics\Metrics;
+
 /**
  * 自动重平衡：把"本地持有、但不该归本地"的 key 按限流节奏交出去。
  *
@@ -52,6 +54,22 @@ final class Rebalancer
     /** @var array<string, int> key => 最早可重试时刻 */
     private array $retryAt = [];
 
+    /**
+     * 已知"版本落后"的目标节点 => 重新试探的时刻。
+     *
+     * 为什么不是"换一个目标"：`Ownership` 指出的 owner 是**契约**，
+     * 搬到非 owner 会造出所有权分家（两个节点都认为自己该持有）——
+     * 那比"晚一点再搬"糟得多。滚动升级期间的正确行为是等对方升上来。
+     *
+     * 也不要每轮都去试：对方没升级，试一次被拒一次，白占限流槽位。
+     *
+     * @var array<int, int>
+     */
+    private array $staleNode = [];
+
+    /** 目标被判定为版本落后后，多久再试探一次 */
+    private int $staleTtlMs = 30000;
+
     /** 归属租约。为 null 时退化成"只信 Ring"（单机或测试） */
     private ?Lease $lease = null;
 
@@ -78,6 +96,7 @@ final class Rebalancer
     /** @var array<string, int> */
     private array $stat = [
         "scanned" => 0,
+        "skew_skipped" => 0,
         "started" => 0,
         "moved" => 0,
         "failed" => 0,
@@ -138,6 +157,24 @@ final class Rebalancer
      *
      * @param int $ttlMs 租约有效期；持有期间每轮 scan 会在剩余不足一半时续期
      */
+    /** 调整"版本落后"目标的重新试探间隔 */
+    public function setStaleTtl(int $ms): void
+    {
+        $this->staleTtlMs = $ms > 0 ? $ms : 30000;
+    }
+
+    /** 该节点当前是否被判定为版本落后（观测/告警用） */
+    public function isStale(int $node): bool
+    {
+        return isset($this->staleNode[$node]);
+    }
+
+    /** @return array<int, int> 节点 => 到期时刻（毫秒），给监控/排障看 */
+    public function staleNodes(): array
+    {
+        return $this->staleNode;
+    }
+
     public function useLease(Lease $lease, int $ttlMs = 30000): void
     {
         $this->lease = $lease;
@@ -218,6 +255,14 @@ final class Rebalancer
             $target = $this->ownership->ownerOf($k);
             if ($target <= 0 || $target === $this->nodeId) {
                 continue;
+            }
+            // 目标刚被判定版本落后：这轮别碰它，省下槽位也省一次被拒
+            if (isset($this->staleNode[$target])) {
+                if ($this->staleNode[$target] > $nowMs) {
+                    $this->stat["skew_skipped"]++;
+                    continue;
+                }
+                unset($this->staleNode[$target]);
             }
 
             // 动手之前先举手：拿不到租约说明别人认为这个 key 归他，
@@ -369,6 +414,10 @@ final class Rebalancer
                 // 对方要升级代码才会变。给一个长退避，别每秒打一次
                 if ($why === "version") {
                     $this->stat["version_blocked"]++;
+                    // 按**节点**记，不是按 key：同一个目标上所有 key 都会被拒，
+                    // 逐个 key 退避等于每轮都要把每个 key 撞一遍
+                    $this->staleNode[$target] = $nowMs + $this->staleTtlMs;
+                    Metrics::inc("rebalance.version_blocked");
                     $this->retryAt[$k] = $nowMs + $this->retryMs * 10;
                 } else {
                     $this->retryAt[$k] = $nowMs;
