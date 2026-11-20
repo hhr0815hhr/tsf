@@ -779,7 +779,7 @@ function verifySuites(): array
         ["id" => "cluster-chan", "desc" => "集群通道/握手（TCP 11 项 + UDS 2000 往返）", "sh" => "tests/cluster-test/run.sh"],
         // 需要 Redis；没有的话脚本自己打 SKIP 并返回 0（环境没装不该判红）
         ["id" => "registry", "desc" => "Redis 注册表+租约（38 项，无 Redis 则 SKIP）", "sh" => "tests/registry-test/run.sh"],
-        ["id" => "handoff", "desc" => "状态交接（101 项：交接/闸门/重平衡/租约/撤销）", "sh" => "tests/handoff-test/run.sh"],
+        ["id" => "handoff", "desc" => "状态交接（112 项：交接/闸门/重平衡/租约/撤销/版本）", "sh" => "tests/handoff-test/run.sh"],
         ["id" => "checkpoint", "desc" => "事件日志检查点（45 项：截断/等价/水位/增量/坏点被拒）", "sh" => "tests/checkpoint-test/run.sh"],
         ["id" => "schema", "desc" => "状态版本迁移链（19 项：缺 _v/拒绝降级/恢复集成）", "sh" => "tests/snapshot-migrate-test/run.sh"],
         ["id" => "prom", "desc" => "Prometheus 导出（22 项：格式/名字/TYPE 唯一/路由）", "sh" => "tests/prom-test/run.sh"],

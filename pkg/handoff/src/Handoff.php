@@ -74,6 +74,9 @@ final class Handoff
     /** 字段分隔符。状态本身是最后一段，可以包含任意字节 */
     private const SEP = "\x1f";
 
+    /** 载荷格式标签（v2 = 带状态版本段）。见 `begin()` 的注释 */
+    private const TAG_V2 = "M2";
+
     private int $nodeId;
 
     private int $entryId;
@@ -81,6 +84,15 @@ final class Handoff
     private Transport $net;
 
     private int $timeoutMs;
+
+    /**
+     * 本节点认识的状态版本（和 `Snapshot\Schema` 的 current 对齐）。
+     *
+     * 交接前双方要核对这个数：**目标比源旧就拒绝**。
+     * 否则会出现"交接成功、对方读不懂"——状态搬过去了，重建时字段缺失，
+     * 对新宿主来说是数据分家，对源节点来说是"我已交出去了"，两边都没法兜。
+     */
+    private int $stateVersion;
 
     /**
      * 在飞的迁移：key => [目标节点, 目标入口, 版本, 截止时刻]
@@ -148,6 +160,7 @@ final class Handoff
         "abort_sent" => 0,
         "aborted" => 0,
         "abort_timeout" => 0,
+        "version_denied" => 0,
     ];
 
     /**
@@ -156,12 +169,24 @@ final class Handoff
      * @param Transport $net       跨节点通道（用窄接口而不是直接依赖 Cluster，方便替换与测试）
      * @param int       $timeoutMs 等 ACK 的时限
      */
-    public function __construct(int $nodeId, int $entryId, Transport $net, int $timeoutMs = 3000)
-    {
+    public function __construct(
+        int $nodeId,
+        int $entryId,
+        Transport $net,
+        int $timeoutMs = 3000,
+        int $stateVersion = 1
+    ) {
         $this->nodeId = $nodeId;
         $this->entryId = $entryId;
         $this->net = $net;
         $this->timeoutMs = $timeoutMs > 0 ? $timeoutMs : 3000;
+        $this->stateVersion = $stateVersion > 0 ? $stateVersion : 1;
+    }
+
+    /** 本节点认识的状态版本 */
+    public function stateVersion(): int
+    {
+        return $this->stateVersion;
     }
 
     /** 迁移成功、源侧可以删本地状态了 */
@@ -213,7 +238,11 @@ final class Handoff
             return false;
         }
         $dst = Addr::pack($targetNode, $targetEntry);
-        $payload = $key . self::SEP . $version . self::SEP . $state;
+        // 载荷带显式标签 `M2`：状态是二进制，可能包含分隔符本身，
+        // 靠"数段数"区分新旧格式会误判（老格式的 state 里有一个 \x1f 就会被当成版本段）。
+        // 3 个字节换一个不会猜错的分支，值得。
+        $payload = self::TAG_V2 . self::SEP . $key . self::SEP . $version
+            . self::SEP . $this->stateVersion . self::SEP . $state;
         if (!$this->net->sendRaw($dst, $this->entryId, self::MSG_MIGRATE, $payload)) {
             return false;
         }
@@ -408,14 +437,40 @@ final class Handoff
     /** 目标侧：安装 */
     private function acceptMigrate(Message $m, string $raw): void
     {
-        $parts = explode(self::SEP, $raw, 3);
-        if (count($parts) !== 3) {
-            $this->stat["ignored"]++;
+        // 新格式带 `M2` 标签；没有标签的是滚动升级窗口里旧二进制发的老报文。
+        // 老报文按"状态版本未知"（0）放行——不能因为对方没报版本就拒绝，
+        // 那会让滚动窗口卡死在第一阶段
+        $body = $raw;
+        $peerState = 0;
+        if (strpos($raw, self::TAG_V2 . self::SEP) === 0) {
+            $body = substr($raw, strlen(self::TAG_V2) + 1);
+            $parts = explode(self::SEP, $body, 4);
+            if (count($parts) !== 4) {
+                $this->stat["ignored"]++;
+                return;
+            }
+            $key = $parts[0];
+            $ver = (int) $parts[1];
+            $peerState = (int) $parts[2];
+            $state = $parts[3];
+        } else {
+            $parts = explode(self::SEP, $body, 3);
+            if (count($parts) !== 3) {
+                $this->stat["ignored"]++;
+                return;
+            }
+            $key = $parts[0];
+            $ver = (int) $parts[1];
+            $state = $parts[2];
+        }
+
+        // 版本闸门：对方的状态比本节点新 → 装不了，回 REJECT 让源侧留着。
+        // 这是唯一能在"搬之前"拦住数据分家的位置
+        if ($peerState > 0 && $peerState > $this->stateVersion) {
+            $this->stat["version_denied"]++;
+            $this->reply($m->from, self::MSG_REJECT, $key, $ver, "version");
             return;
         }
-        $key = $parts[0];
-        $ver = (int) $parts[1];
-        $state = $parts[2];
 
         if (($this->aborted[$key] ?? 0) >= $ver) {
             // 这次交接已经被撤销过了，迟到的 MIGRATE 绝不能装
@@ -451,13 +506,16 @@ final class Handoff
     /** 源侧：收到 ACK/REJECT */
     private function settle(string $raw, bool $ok): void
     {
-        $parts = explode(self::SEP, $raw, 2);
-        if (count($parts) !== 2) {
+        // 第三段是可选的拒绝原因。带原因是为了让源侧区分"对方忙/满了"和
+        // "对方版本太旧"——后者重试多少次都没用，得换目标或升级对方
+        $parts = explode(self::SEP, $raw, 3);
+        if (count($parts) < 2) {
             $this->stat["ignored"]++;
             return;
         }
         $key = $parts[0];
         $ver = (int) $parts[1];
+        $reason = count($parts) === 3 && $parts[2] !== "" ? $parts[2] : "rejected";
         if (isset($this->aborting[$key])) {
             // 已经在撤销了：这个 ACK 是撤销前发出的，认了它就会留下两份状态
             $this->stat["ignored"]++;
@@ -483,8 +541,8 @@ final class Handoff
         }
         $this->stat["rejected"]++;
         $this->result[$key] = "rolledback";
-        $this->resultWhy[$key] = "rejected";
-        $this->fire($this->onRollback, $key, $ver, "rejected");
+        $this->resultWhy[$key] = $reason;
+        $this->fire($this->onRollback, $key, $ver, $reason);
     }
 
     /**
@@ -503,9 +561,17 @@ final class Handoff
         return $this->resultWhy[$key] ?? "";
     }
 
-    private function reply(int $to, int $msgId, string $key, int $ver): void
+    /**
+     * @param string $reason 拒绝原因。带原因是为了让源侧能区分"对方忙/满了"
+     *                       和"对方版本太旧"——后者重试多少次都没用
+     */
+    private function reply(int $to, int $msgId, string $key, int $ver, string $reason = ""): void
     {
-        $this->net->sendRaw($to, $this->entryId, $msgId, $key . self::SEP . $ver);
+        $payload = $key . self::SEP . $ver;
+        if ($reason !== "") {
+            $payload .= self::SEP . $reason;
+        }
+        $this->net->sendRaw($to, $this->entryId, $msgId, $payload);
     }
 
     private function fire(?\Closure $cb, string $key, int $ver, string $why): void

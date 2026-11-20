@@ -84,6 +84,7 @@ final class Rebalancer
         "skipped" => 0,
         "lease_denied" => 0,
         "lease_lost" => 0,
+        "version_blocked" => 0,
     ];
 
     public function __construct(
@@ -363,7 +364,15 @@ final class Rebalancer
                 }
             } elseif ($res === "rolledback") {
                 $this->gate->rollback($k);
-                $this->retryAt[$k] = $nowMs;
+                $why = $this->handoff->lastWhy($k);
+                // "version" = 目标比源旧，读不懂这份状态。重试没有意义——
+                // 对方要升级代码才会变。给一个长退避，别每秒打一次
+                if ($why === "version") {
+                    $this->stat["version_blocked"]++;
+                    $this->retryAt[$k] = $nowMs + $this->retryMs * 10;
+                } else {
+                    $this->retryAt[$k] = $nowMs;
+                }
                 $done[] = $k;
                 $this->stat["failed"]++;
                 $cb2 = $this->onFailed;
