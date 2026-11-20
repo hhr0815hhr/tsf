@@ -234,6 +234,38 @@ $this->cancelTimer($timerId);
 
 `kill` 会连带撤销该服务名下所有定时器，不用手动清理。
 
+### 跨节点通道（Cluster）
+
+同机多进程用 unix socket，跨机用 TCP，**API 完全一样**：
+
+```php
+// 同机（默认）：裸路径或 unix:// 都行
+$c = new Cluster(1, "/tmp/node1.sock", null, "shared-secret");
+$c->listen();
+
+// 跨机：tcp://host:port
+$c = new Cluster(1, "tcp://0.0.0.0:9100", null, "shared-secret");
+$c->listen();
+
+// 连对端（地址写法与监听一致）
+$c->connect(2, "tcp://10.0.0.12:9100");
+```
+
+每条连接先握手，校验三件事：**对方是谁**（hello 里的节点号）、**协议是否一致**
+（codec 名）、**密钥对不对**（sha256-HMAC，密钥不走线上）。任一项不过就断开并记
+`hs_fail`，日志里带原因（`bad-magic` / `bad-mac` / `codec-mismatch:json!=raw` /
+`node-is-self` / `dup`）——这几个原因的处理方式完全不同，只记数不记原因等于没记。
+
+**"连上了"不等于"能用了"**：握手没完成时 `hasPeer()` 为 false、`drain()` 返回空，
+消息只会排在写缓冲里。所以"连接建立"和"可投递"是两个状态，别混。
+
+三条边界：
+
+1. **只校验不加密**。载荷仍是明文，能监听链路的人照样能看。要求更强得上 TLS。
+2. `secret` 为空时只校验结构不校验 mac —— 只适合单机调试。
+3. `Discovery`（服务发现）仍然是**本地文件**注册表，跨机需要换中心化注册表
+   （Redis/etcd）。也就是说：**传输层能跨机了，节点目录还没有。**
+
 ---
 
 ## 最容易卡住的三件事（先看这个）
