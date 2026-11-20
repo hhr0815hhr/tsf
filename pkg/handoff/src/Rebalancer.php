@@ -52,6 +52,14 @@ final class Rebalancer
     /** @var array<string, int> key => 最早可重试时刻 */
     private array $retryAt = [];
 
+    /** 归属租约。为 null 时退化成"只信 Ring"（单机或测试） */
+    private ?Lease $lease = null;
+
+    private int $leaseTtlMs = 30000;
+
+    /** @var array<string, int> key => 本地认为的租约到期时刻 */
+    private array $leased = [];
+
     /** @var array<string, int> 本地持有的 key => 已用过的版本号 */
     private array $keys = [];
 
@@ -74,6 +82,8 @@ final class Rebalancer
         "moved" => 0,
         "failed" => 0,
         "skipped" => 0,
+        "lease_denied" => 0,
+        "lease_lost" => 0,
     ];
 
     public function __construct(
@@ -118,6 +128,21 @@ final class Rebalancer
         $this->onFailed = $cb;
     }
 
+    /**
+     * 启用归属租约。
+     *
+     * 开了之后，**只有拿到租约才允许发起交接**。这是防"两个节点同时认为自己是
+     * owner、于是同时往两个方向搬"的唯一手段——Ring 算出来的只是"应该归谁"，
+     * 不保证"实际是谁在跑"。
+     *
+     * @param int $ttlMs 租约有效期；持有期间每轮 scan 会在剩余不足一半时续期
+     */
+    public function useLease(Lease $lease, int $ttlMs = 30000): void
+    {
+        $this->lease = $lease;
+        $this->leaseTtlMs = $ttlMs > 0 ? $ttlMs : 30000;
+    }
+
     /** 登记一个本地持有的 key（业务在创建时调）。重复登记返回 false */
     public function own(string $key): bool
     {
@@ -128,10 +153,15 @@ final class Rebalancer
         return true;
     }
 
-    /** 业务自己销毁了这个 key（不再参与重平衡） */
+    /** 业务自己销毁了这个 key（不再参与重平衡）。顺手把租约还回去，别等它过期 */
     public function disown(string $key): void
     {
         unset($this->keys[$key]);
+        unset($this->retryAt[$key]);
+        if ($this->lease !== null) {
+            $this->lease->release($key);
+        }
+        unset($this->leased[$key]);
     }
 
     public function isOwned(string $key): bool
@@ -185,6 +215,13 @@ final class Rebalancer
                 continue;
             }
 
+            // 动手之前先举手：拿不到租约说明别人认为这个 key 归他，
+            // 此时搬过去只会制造两份状态
+            if (!$this->takeLease($k, $nowMs)) {
+                $this->stat["lease_denied"]++;
+                continue;
+            }
+
             $state = "";
             $ready = false;
             $cb = $this->onExport;
@@ -218,6 +255,37 @@ final class Rebalancer
         return $started;
     }
 
+    /**
+     * 取或续租约。没配租约时直接放行（单机部署不该被迫起一个 Redis）。
+     *
+     * 续期只在**剩余不足一半**时做：每轮都续会把 Redis 变成每键每轮的写放大。
+     */
+    private function takeLease(string $key, int $nowMs): bool
+    {
+        if ($this->lease === null) {
+            return true;
+        }
+        $exp = $this->leased[$key] ?? 0;
+        if ($exp <= $nowMs) {
+            if (!$this->lease->tryAcquire($key, $this->leaseTtlMs)) {
+                return false;
+            }
+            $this->leased[$key] = $nowMs + $this->leaseTtlMs;
+            return true;
+        }
+        if ($exp - $nowMs < intdiv($this->leaseTtlMs, 2)) {
+            if (!$this->lease->renew($key, $this->leaseTtlMs)) {
+                // 续不上说明已经过期被别人拿走：本地必须立刻放弃这个 key，
+                // 否则会出现"两个人各自拿着同一把锁"
+                unset($this->leased[$key]);
+                $this->stat["lease_lost"]++;
+                return false;
+            }
+            $this->leased[$key] = $nowMs + $this->leaseTtlMs;
+        }
+        return true;
+    }
+
     /** @return array<string, int> */
     public function stats(): array
     {
@@ -243,6 +311,12 @@ final class Rebalancer
             if ($res === "committed") {
                 $queued = $this->gate->commit($k);
                 unset($this->keys[$k]);
+                unset($this->retryAt[$k]);
+                // 交出去了就把租约放掉：新宿主会在 onInstall 里自己取
+                if ($this->lease !== null) {
+                    $this->lease->release($k);
+                }
+                unset($this->leased[$k]);
                 $done[] = $k;
                 $this->stat["moved"]++;
                 $cb = $this->onMoved;
