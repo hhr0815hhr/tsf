@@ -60,20 +60,22 @@ final class Restorer
      * 拿它来跳过别人的房间会把**别的节点的快照删掉**——多节点下这是数据丢失，
      * 而且不报错，只在那个节点的玩家回不来时才被发现。
      *
-     * @return array{done: int, skipped: int, not_mine: int, ms: int, slow: bool}
+     * @return array{done: int, migrate_failed: int, skipped: int, not_mine: int, ms: int, slow: bool}
      */
     public function restore(
         Store $store,
         string $kind,
         \Closure $rebuild,
         bool $dropBad = true,
-        ?\Closure $accept = null
+        ?\Closure $accept = null,
+        ?Schema $schema = null
     ): array {
         $t0 = hrtime(true);
         $keys = $store->keys($kind);
         $notMine = 0;
         $done = 0;
         $skipped = 0;
+        $migrateFailed = 0;
         $i = 0;
         $slow = false;
 
@@ -86,6 +88,23 @@ final class Restorer
             }
 
             $snap = $store->get($kind, $id);
+            if ($snap !== null && $schema !== null) {
+                // 先迁移再交给业务：业务看到的状态永远是"当前结构"，
+                // 不用在每个 rebuild 里写 if (isset(xxx))
+                try {
+                    $schema->migrateSnapshot($snap);
+                } catch (\Throwable $e) {
+                    // 迁移不了（版本比代码新 / 登记表漏了一段）→ 当作坏数据。
+                    // 不能"照原样交给业务"：那是把旧结构当新结构用，缺字段会在
+                    // 几十行之后以莫名其妙的错误爆出来
+                    $migrateFailed++;
+                    if ($dropBad) {
+                        $store->delete($kind, $id);
+                    }
+                    $skipped++;
+                    continue;
+                }
+            }
             if ($snap === null) {
                 // 版本不符或文件损坏：删掉，否则每次启动都要在这里卡一下
                 if ($dropBad) {
@@ -120,6 +139,7 @@ final class Restorer
 
         return [
             "done" => $done,
+            "migrate_failed" => $migrateFailed,
             "skipped" => $skipped,
             "not_mine" => $notMine,
             "ms" => $ms,
