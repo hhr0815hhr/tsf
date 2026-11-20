@@ -780,6 +780,7 @@ function verifySuites(): array
         // 需要 Redis；没有的话脚本自己打 SKIP 并返回 0（环境没装不该判红）
         ["id" => "registry", "desc" => "Redis 注册表+租约（38 项，无 Redis 则 SKIP）", "sh" => "tests/registry-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（101 项：交接/闸门/重平衡/租约/撤销）", "sh" => "tests/handoff-test/run.sh"],
+        ["id" => "checkpoint", "desc" => "事件日志检查点（23 项：截断/等价/坏点被拒）", "sh" => "tests/checkpoint-test/run.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
         ["id" => "script", "desc" => "脚本热更（加载/对象共享/越权/热更/异常）", "sh" => "tests/script-test/run.sh"],
@@ -864,6 +865,23 @@ function verifyRun(string $root, array $argv): int
         $rc = 0;
         exec("bash " . escapeshellarg($path) . " 2>&1", $out, $rc);
         $ms = (int) ((microtime(true) - $t0) * 1000);
+
+        // 77 = 脚本主动跳过（端口被占、本机有冲突服务……）。
+        // 和 needs 走同一条路：环境问题不该把整套判红，但必须在输出里留下痕迹，
+        // 不能让"没跑"看起来像"跑过了"。
+        if ($rc === 77) {
+            $why = "";
+            foreach (array_reverse($out) as $line) {
+                if (strpos($line, "SKIP") === 0) {
+                    $why = $line;
+                    break;
+                }
+            }
+            $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => "SKIP", "ms" => $ms, "tail" => $why];
+            $skip++;
+            fwrite(STDERR, "SKIP" . PHP_EOL);
+            continue;
+        }
 
         $tail = "";
         if ($rc !== 0) {
