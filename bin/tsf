@@ -777,6 +777,8 @@ function verifySuites(): array
         ["id" => "room", "desc" => "房间/成员/共享宿主（100 项）", "sh" => "tests/room-test/run.sh"],
         ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
         ["id" => "cluster-chan", "desc" => "集群通道/握手（TCP 11 项 + UDS 2000 往返）", "sh" => "tests/cluster-test/run.sh"],
+        // 需要 Redis；没有的话脚本自己打 SKIP 并返回 0（环境没装不该判红）
+        ["id" => "registry", "desc" => "Redis 注册表（25 项，无 Redis 则 SKIP）", "sh" => "tests/registry-test/run.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
         ["id" => "script", "desc" => "脚本热更（加载/对象共享/越权/热更/异常）", "sh" => "tests/script-test/run.sh"],
