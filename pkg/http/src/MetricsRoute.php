@@ -11,17 +11,29 @@ use TSF\Metrics\Prometheus;
  * `Prometheus::render()` 只吐字符串，谁把它塞进 HTTP 响应是调用方的事——
  * 这样接 gin 风格的自研框架、接 Swoole 原生回调、或者写进文件，都只是换个壳。
  *
- * ## 建议：这个路由挂在内网端口
+ * ## 来源限制是代码强制的，不是文档建议
  *
  * `/metrics` 会暴露进程内存和业务指标（房间数、在线人数、结算金额）。
- * 挂到公网端口上等于把这些数字送给任何人。示例里给它单独的路径前缀，
- * 真实部署应该分端口或用中间件限制来源 IP。
+ * 光写"挂内网"没用——部署时没人回头读文档，而默认暴露的代价是一次疏忽
+ * 就把运营数据公开。所以默认只放行**回环 + 私有网段**，放开要显式写 `["*"]`。
  */
 final class MetricsRoute
 {
-    public static function register(App $app, string $path = "/metrics", bool $withProcess = true): void
-    {
-        $app->get($path, function (Request $req) use ($withProcess): Response {
+    /**
+     * @param array<int, string> $allow 允许的来源（精确 IP / IPv4 CIDR / `*`）。
+     *                                  默认 `IpFilter::PRIVATE_ONLY`
+     */
+    public static function register(
+        App $app,
+        string $path = "/metrics",
+        bool $withProcess = true,
+        array $allow = IpFilter::PRIVATE_ONLY
+    ): void {
+        $app->get($path, function (Request $req) use ($withProcess, $allow): Response {
+            if (!IpFilter::allows($allow, $req->remoteIp)) {
+                // 403 而不是 404：让运维一眼看出"是被拒了"，不至于怀疑路由没注册
+                return new Response(403, ["content-type" => "text/plain; charset=utf-8"], "forbidden\n");
+            }
             return new Response(
                 200,
                 ["content-type" => Prometheus::CONTENT_TYPE],

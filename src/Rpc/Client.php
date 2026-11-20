@@ -96,6 +96,18 @@ final class Client extends Service
     /** @var array<int, int> 对端节点的载荷版本（从响应里学到） */
     private array $peerVer = [];
 
+    /** @var array<int, int> 节点 => `legacy` 标记的到期时刻 */
+    private array $legacyAt = [];
+
+    /**
+     * `legacy` 标记的有效期。
+     *
+     * 不设成永久：对方升级之后，我们不该永远用旧格式跟它说话——那样拿不到版本、
+     * 用不了新字段，而且**没有自愈能力**。到期后重新按新格式试一次，
+     * 成功就自动恢复正常；失败就再标记一段，成本只是每 TTL 一次多余的往返。
+     */
+    private int $legacyTtlMs = 60000;
+
     public function __construct(int $defaultTimeoutMs = 200, ?RpcCodec $codec = null, int $protoVersion = 1)
     {
         $this->defaultTimeoutMs = $defaultTimeoutMs > 0 ? $defaultTimeoutMs : 200;
@@ -115,10 +127,24 @@ final class Client extends Service
         return $this->peerVer[$node] ?? 0;
     }
 
-    /** 某个对端是否已被判定为旧二进制（只能收旧格式） */
+    /** `legacy` 标记的有效期（毫秒）。设 0 表示下次调用就重新试探 */
+    public function setLegacyTtl(int $ms): void
+    {
+        $this->legacyTtlMs = $ms >= 0 ? $ms : 60000;
+    }
+
+    /** 某个对端当前是否只能收旧格式。标记过期会自动失效并重新试探 */
     public function isLegacy(int $node): bool
     {
-        return $this->legacy[$node] ?? false;
+        if (!isset($this->legacy[$node])) {
+            return false;
+        }
+        $exp = $this->legacyAt[$node] ?? 0;
+        if ($exp > 0 && Scheduler::nowMs() >= $exp) {
+            unset($this->legacy[$node], $this->legacyAt[$node]);
+            return false;
+        }
+        return true;
     }
 
     public function codec(): RpcCodec
@@ -163,7 +189,7 @@ final class Client extends Service
 
         $ms = $timeoutMs > 0 ? $timeoutMs : $this->defaultTimeoutMs;
         $node = ($addr >> 24) & 0xFF;
-        $versioned = !($this->legacy[$node] ?? false);
+        $versioned = !$this->isLegacy($node);
         $this->pending[$id] = [
             "cb" => $cb,
             "deadline" => Scheduler::nowMs() + $ms,
@@ -244,6 +270,7 @@ final class Client extends Service
         if ($wasVersioned && !$resp->ok && $resp->body === "bad-request" && $p !== null) {
             $node = ($p["addr"] >> 24) & 0xFF;
             $this->legacy[$node] = true;
+            $this->legacyAt[$node] = Scheduler::nowMs() + $this->legacyTtlMs;
             $this->retryLegacy($m->session, $p);
             return;
         }
