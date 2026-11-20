@@ -2,6 +2,8 @@
 
 namespace TSF\Rpc;
 
+use TSF\Metrics\Metrics;
+
 use TSF\Rpc\Codec\JsonCodec;
 use TSF\Rpc\Contract\RpcCodec;
 use TSF\Service\Message;
@@ -59,8 +61,18 @@ final class Router
     /** 协议：必须和调用端的 codec 一致 */
     private RpcCodec $codec;
 
-    public function __construct(?RpcCodec $codec = null)
+    /** 本节点认识的载荷版本；请求版本比它新就拒绝 */
+    private int $protoVersion = 1;
+
+    /** 当前这条请求是不是版本化格式（回应要跟请求同风格） */
+    private bool $replyVersioned = false;
+
+    /** 因版本不足被拒绝的请求数（观测：滚动升级期间应短暂出现，之后归零） */
+    private int $versionRejected = 0;
+
+    public function __construct(?RpcCodec $codec = null, int $protoVersion = 1)
     {
+        $this->protoVersion = $protoVersion > 0 ? $protoVersion : 1;
         $this->codec = $codec !== null ? $codec : new JsonCodec();
     }
 
@@ -104,12 +116,38 @@ final class Router
             return false;
         }
 
+        $this->replyVersioned = false;
         $raw = $m->data;
         if (!is_string($raw)) {
             // 跨进程时 RawPayload 只搬 string；收到非 string 说明对端不是本 RPC 实现
             $this->unrouted++;
             $this->reply($m, false, "bad-envelope");
             return true;
+        }
+
+        // 版本化请求：`V1 \x1f 版本 \x1f codec 载荷`。
+        // 没有标签的就是老格式（滚动升级窗口里旧调用方还在发这种）
+        if (strpos($raw, Rpc::TAG_V1 . Rpc::SEP) === 0) {
+            $rest = substr($raw, strlen(Rpc::TAG_V1) + 1);
+            $cut = strpos($rest, Rpc::SEP);
+            if ($cut === false) {
+                $this->unrouted++;
+                $this->reply($m, false, "bad-request");
+                return true;
+            }
+            $peerVer = (int) substr($rest, 0, $cut);
+            $raw = substr($rest, $cut + 1);
+            $this->replyVersioned = true;
+
+            // 对方读得懂本节点的格式，但本节点读不懂对方的 → 只能拒绝。
+            // 回一个**明确的**错误（不是超时、不是 bad-request），
+            // 让调用方知道"这里是个旧节点"，可以降级或换个目标
+            if ($peerVer > $this->protoVersion) {
+                $this->versionRejected++;
+                Metrics::inc("rpc.version_rejected");
+                $this->reply($m, false, Rpc::ERR_VERSION);
+                return true;
+            }
         }
 
         $req = $this->codec->unpackRequest($raw);
@@ -155,6 +193,7 @@ final class Router
     public function stats(): array
     {
         return [
+            "version_rejected" => $this->versionRejected,
             "handled" => $this->handled,
             "errors" => $this->errors,
             "unrouted" => $this->unrouted,
@@ -168,6 +207,9 @@ final class Router
             return;   // 系统发来的请求没人收，不回
         }
         $payload = $this->codec->packResponse($ok, $body);
+        if ($this->replyVersioned) {
+            $payload = Rpc::TAG_V1 . Rpc::SEP . $this->protoVersion . Rpc::SEP . $payload;
+        }
         Scheduler::instance()->deliver($m->from, Rpc::MSG_RESP, $payload, $m->session);
     }
 }

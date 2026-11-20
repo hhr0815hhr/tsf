@@ -783,6 +783,7 @@ function verifySuites(): array
         ["id" => "checkpoint", "desc" => "事件日志检查点（45 项：截断/等价/水位/增量/坏点被拒）", "sh" => "tests/checkpoint-test/run.sh"],
         ["id" => "schema", "desc" => "状态版本迁移链（19 项：缺 _v/拒绝降级/恢复集成）", "sh" => "tests/snapshot-migrate-test/run.sh"],
         ["id" => "prom", "desc" => "Prometheus 导出（22 项：格式/名字/TYPE 唯一/路由）", "sh" => "tests/prom-test/run.sh"],
+        ["id" => "rpc", "desc" => "RPC（50 项：调用/超时/并发/codec/载荷版本协商）", "sh" => "tests/rpc-test/run.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
         ["id" => "script", "desc" => "脚本热更（加载/对象共享/越权/热更/异常）", "sh" => "tests/script-test/run.sh"],

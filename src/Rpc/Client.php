@@ -77,10 +77,48 @@ final class Client extends Service
     /** 协议：必须和服务端的 codec 一致，否则对方解不出来 */
     private RpcCodec $codec;
 
-    public function __construct(int $defaultTimeoutMs = 200, ?RpcCodec $codec = null)
+    /** 本节点认识的 RPC 载荷版本 */
+    private int $protoVersion = 1;
+
+    /**
+     * 已知是旧二进制的对端节点 => true。
+     *
+     * 判定方式是**乐观协商**：先按新格式发，旧对端的 codec 解不出来会立刻回
+     * `bad-request`（不是超时），据此标记并降级重发一次。之后对这个节点直接用旧格式。
+     *
+     * 为什么不做握手协商：hello 是 `count($parts) !== 4` 的硬校验，
+     * 加字段会让**旧节点直接判定 bad-hello、链路起不来**——滚动升级当场断。
+     *
+     * @var array<int, bool>
+     */
+    private array $legacy = [];
+
+    /** @var array<int, int> 对端节点的载荷版本（从响应里学到） */
+    private array $peerVer = [];
+
+    public function __construct(int $defaultTimeoutMs = 200, ?RpcCodec $codec = null, int $protoVersion = 1)
     {
         $this->defaultTimeoutMs = $defaultTimeoutMs > 0 ? $defaultTimeoutMs : 200;
         $this->codec = $codec !== null ? $codec : new JsonCodec();
+        $this->protoVersion = $protoVersion > 0 ? $protoVersion : 1;
+    }
+
+    /** 本节点的载荷版本 */
+    public function protoVersion(): int
+    {
+        return $this->protoVersion;
+    }
+
+    /** 某个对端节点的载荷版本；0 表示还不知道 */
+    public function peerVersion(int $node): int
+    {
+        return $this->peerVer[$node] ?? 0;
+    }
+
+    /** 某个对端是否已被判定为旧二进制（只能收旧格式） */
+    public function isLegacy(int $node): bool
+    {
+        return $this->legacy[$node] ?? false;
     }
 
     public function codec(): RpcCodec
@@ -124,11 +162,16 @@ final class Client extends Service
         }
 
         $ms = $timeoutMs > 0 ? $timeoutMs : $this->defaultTimeoutMs;
+        $node = ($addr >> 24) & 0xFF;
+        $versioned = !($this->legacy[$node] ?? false);
         $this->pending[$id] = [
             "cb" => $cb,
             "deadline" => Scheduler::nowMs() + $ms,
             "addr" => $addr,
             "method" => $method,
+            "body" => $body,
+            "versioned" => $versioned,
+            "retried" => false,
         ];
 
         // 载荷交给 codec 编。框架不关心它是 JSON、protobuf 还是裸二进制。
@@ -142,6 +185,11 @@ final class Client extends Service
             $this->failed++;
             $cb(null, "encode-failed");
             return 0;
+        }
+        if ($versioned) {
+            // 版本放在 codec 载荷之前：老对端的 codec 会立刻解不出并回 bad-request，
+            // 我们据此降级——这比等超时快一个数量级
+            $payload = Rpc::TAG_V1 . Rpc::SEP . $this->protoVersion . Rpc::SEP . $payload;
         }
 
         $this->sent++;
@@ -164,13 +212,65 @@ final class Client extends Service
         }
 
         $raw = is_string($m->data) ? $m->data : "";
-        $resp = $this->codec->unpackResponse($raw);
+        $body = $raw;
+
+        // 响应风格跟请求一致：我们发了版本化请求，对端才会带版本回（老对端回不了）
+        $p = $this->pending[$m->session] ?? null;
+        $wasVersioned = $p !== null && ($p["versioned"] ?? false);
+        $peerVer = 0;
+        if ($wasVersioned && strpos($raw, Rpc::TAG_V1 . Rpc::SEP) === 0) {
+            $rest = substr($raw, strlen(Rpc::TAG_V1) + 1);
+            $cut = strpos($rest, Rpc::SEP);
+            if ($cut === false) {
+                $this->settle($m->session, false, "bad-response");
+                return;
+            }
+            $peerVer = (int) substr($rest, 0, $cut);
+            $body = substr($rest, $cut + 1);
+            if ($peerVer > 0 && $p !== null) {
+                $this->peerVer[($p["addr"] >> 24) & 0xFF] = $peerVer;
+            }
+        }
+
+        $resp = $this->codec->unpackResponse($body);
         if ($resp === null) {
             // 解不出来也要结束这次调用：让调用方等超时是最难排查的故障
             $this->settle($m->session, false, "bad-response");
             return;
         }
+
+        // 老对端解不出新格式，会立刻回 bad-request。标记并降级重发一次——
+        // 这是唯一能"自动发现对方是旧二进制"的信道
+        if ($wasVersioned && !$resp->ok && $resp->body === "bad-request" && $p !== null) {
+            $node = ($p["addr"] >> 24) & 0xFF;
+            $this->legacy[$node] = true;
+            $this->retryLegacy($m->session, $p);
+            return;
+        }
+
         $this->settle($m->session, $resp->ok, $resp->body);
+    }
+
+    /**
+     * 用旧格式重发同一次调用。
+     *
+     * 复用同一个 session id：调用方拿到的仍是同一个回调，只是内部多了一次往返。
+     * 超时时间不重置——重试不该让调用方多等一个完整超时。
+     *
+     * @param array{cb: \Closure, deadline: int, addr: int, method: string, body: string, versioned: bool, retried: bool} $p
+     */
+    private function retryLegacy(int $id, array $p): void
+    {
+        $payload = $this->codec->packRequest($p["method"], $p["body"]);
+        if ($payload === "") {
+            $this->settle($id, false, "encode-failed");
+            return;
+        }
+        $p["versioned"] = false;
+        $p["retried"] = true;
+        $this->pending[$id] = $p;
+        $this->sent++;
+        Scheduler::instance()->deliverAs($this->addr(), $p["addr"], Rpc::MSG_REQ, $payload, $id);
     }
 
     public function pendingCount(): int

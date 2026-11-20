@@ -55,6 +55,21 @@ final class Rpc
     public const ERR_BAD_RESPONSE = "bad-response";
 
     /**
+     * 对端回的业务错误：它的代码比调用方旧，读不懂这份请求。
+     *
+     * 和 `bad-response` 的区别在于归属：此时对端**活得好好的**，只是版本落后。
+     * 所以不算对端不健康（`blamesPeer` 为 false），也不该熔断——该做的是
+     * 把那个节点升级，或者让调用方走降级路径。
+     */
+    public const ERR_VERSION = "version-mismatch";
+
+    /** 版本化载荷的标签（`V1 \x1f 版本 \x1f codec 载荷`） */
+    public const TAG_V1 = "V1";
+
+    /** 版本化载荷里的分隔符，和握手/迁移用同一个 */
+    public const SEP = "\x1f";
+
+    /**
      * 这次失败该不该算在**对端**头上（熔断用）。
      *
      * ## 为什么必须分类
