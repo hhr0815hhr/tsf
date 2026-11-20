@@ -29,7 +29,7 @@
 | `Rpc` / `Discovery` / `Shard` / `Cluster` | 跨进程调用、服务发现、分片路由、跨服路由、熔断 |
 | `Proto` | protobuf 运行时（Reader / Wire / Message） |
 | `Config` | 配置表读取 + 热更监听（`Watcher`） |
-| `Gm` / `Metrics` / `Breaker` | 管理命令（含异步任务）、指标埋点、熔断 |
+| `Gm` / `Metrics` / `Breaker` | 管理命令（含异步任务）、指标埋点 + Prometheus 导出、熔断 |
 
 ### 功能包（`pkg/`）
 
@@ -424,6 +424,33 @@ $cp->saveAndPrune($log, $log->lastSeq(), $ledger->export());
 > 它会把错误的余额当成起点，而日志里对不上的部分已经被截掉了。
 >
 > 实测（3 万条事件）：全量重放 81 ms，检查点 + 尾巴 1.9 ms，差 44 倍。
+
+
+### 指标导出（Prometheus）
+
+`Metrics::inc/gauge/observe` 走热路径，`Metrics::table()` 给人看，抓取给机器看：
+
+```php
+// 一行接上（pkg/http）
+\TSF\Http\MetricsRoute::register($app, "/metrics");
+
+// 或者只要文本，自己塞进任何响应/文件
+$txt = \TSF\Metrics\Prometheus::render();
+```
+
+| 埋点 | 导出成 |
+|:--|:--|
+| `Metrics::inc("room.created")` | `room_created 3` + `# TYPE ... counter` |
+| `Metrics::gauge("room.online", 7.5)` | `room_online 7.5` + `gauge` |
+| `Metrics::observe("net.rtt.us", 900)` | `summary` + `{quantile="0.5/0.9/0.99"}` + `_sum` + `_count` |
+
+三个必须知道的点：
+
+- **直方图导出成 `summary` 而不是 `histogram`**：我们的 `Histogram` 只存分位数，
+  没有桶边界；硬造 `le` 等于编数据。代价是 summary 的分位数**不能跨实例聚合**。
+- **名字里的点会被换成下划线**（`room.created` → `room_created`）。抓取端只认
+  `[a-zA-Z0-9_:]`，而且违规时是**整批 400**——一个名字写错，整个进程的指标全丢。
+- **`/metrics` 要挂内网**：它会暴露在线人数、结算金额、进程内存。
 
 ---
 
