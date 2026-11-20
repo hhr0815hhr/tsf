@@ -304,6 +304,27 @@ $h->expire(nowMs());    // 超时扫描，由调用方周期性驱动（和 Fram
 三条不变量（测试就是照它们写的）：**失败必回滚**（交接失败不等于数据丢失）、
 **同版本不重复安装**（重发只回 ACK）、**同 key 同时只有一次在飞**。
 
+交接要花一个 RTT 到几秒，这期间打到这个 key 的请求必须有去处——`Gate` 负责挡住并排队：
+
+```php
+$g = new Gate();
+$g->freeze("room:1", $targetNode, $targetEntry, 256);   // 先冻结，再取快照
+$g->submit("room:1", $opBytes);    // 四态：pass / queued / overflow / forward
+
+$h->onCommit(function (string $k, int $v) use ($g) {
+    $q = $g->commit($k);           // 队列按原序补交给**新宿主**
+});
+$h->onRollback(function (string $k, int $v, string $why) use ($g) {
+    $q = $g->rollback($k);         // 队列按原序在**本地**重放
+});
+```
+
+> **顺序不能反：先 `freeze()` 再 `export()` 快照。** 反了就有窗口——快照之后、
+> 冻结之前到达的请求既不在快照里也不在队列里，交接完成后凭空消失。
+>
+> 队列满返回 `overflow`，由调用方明确拒绝；不做静默丢弃，也不做"丢最老的"——
+> 那等于悄悄吞掉一次操作，玩家只会觉得"点了没反应"。
+
 > 协议号必须落在 `0..65535`：跨节点包的 msgId 只有 2 字节，超了会被静默截断
 > ——发送端正常、接收端"没收到"、两端日志都干净。`Packet::encode()` 现在会直接抛错。
 
