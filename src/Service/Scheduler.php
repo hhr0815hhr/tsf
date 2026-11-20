@@ -30,6 +30,9 @@ final class Scheduler
 {
     private static ?Scheduler $self = null;
 
+    /** 追踪 id 的进程内序号 */
+    private static int $traceSeq = 0;
+
     /** @var array<int, Service> id => 服务实例 */
     private array $services = [];
 
@@ -97,6 +100,80 @@ final class Scheduler
 
     /** 当前正在处理哪个服务（用于给发出的消息填 from） */
     private int $current = 0;
+
+    /**
+     * 当前链路追踪 id：**正在处理的消息属于哪条链路**。
+     *
+     * 它由 `deliver()` 自动写进消息信封，所以服务里 `send()` 出去的每一条都自然继承——
+     * 业务代码完全不用管。这正是追踪能落地的关键：不用记得带，才有人用。
+     *
+     * 只在**入口**生成（网络层收到客户端包时）。定时器/心跳这类没有外部来源的消息
+     * traceId 为 0，不生成——否则每条内部消息都要付一次生成成本。
+     */
+    private int $trace = 0;
+
+    /** 生成一个新的追踪 id：42 位毫秒时间 + 20 位进程内序号 */
+    public function newTrace(): int
+    {
+        self::$traceSeq++;
+        return (intdiv(hrtime(true), 1000000) << 20) | (self::$traceSeq & 0xFFFFF);
+    }
+
+    /**
+     * 读当前 trace。
+     *
+     * 协程模式下必须从**协程上下文**取，和 `currentOf()` 同理：多个协程并发时，
+     * 用一个全局属性会让 A 链路的 trace 粘到 B 链路的日志上——排障时最致命的
+     * 就是"看起来有链路，其实串错了"。
+     */
+    /**
+     * 网络入口用：生成一条新链路并把它设为当前。
+     *
+     * ```php
+     * // WS/TCP 收到客户端包时
+     * $s = Scheduler::instance();
+     * $prev = $s->currentTrace();
+     * $s->beginTrace();
+     * $s->deliver($roomAddr, MSG_MOVE, $payload);
+     * $s->setTrace($prev);          // 用完恢复，别让 trace 漏到别的链路
+     * ```
+     *
+     * 不放在传输层自动做，是因为"一个客户端包 = 一条链路"这个语义只有业务知道：
+     * 有的包是心跳（不值得建链路），有的包会扇出成几十条消息（更该建）。
+     */
+    public function beginTrace(): int
+    {
+        $t = $this->newTrace();
+        $this->setTrace($t);
+        return $t;
+    }
+
+    public function currentTrace(): int
+    {
+        if (!$this->coroutine) {
+            return $this->trace;
+        }
+        $ctx = \Swoole\Coroutine::getContext();
+        if (!is_object($ctx)) {
+            return $this->trace;
+        }
+        $v = $ctx["sched_trace"] ?? 0;
+        return is_int($v) ? $v : 0;
+    }
+
+    public function setTrace(int $trace): void
+    {
+        if (!$this->coroutine) {
+            $this->trace = $trace;
+            return;
+        }
+        $ctx = \Swoole\Coroutine::getContext();
+        if (is_object($ctx)) {
+            $ctx["sched_trace"] = $trace;
+        }
+        // 同时更新属性：给协程外部读（日志收尾、统计），不会造成错乱
+        $this->trace = $trace;
+    }
 
 
     /**
@@ -206,6 +283,10 @@ final class Scheduler
     {
         if (self::$self === null) {
             self::$self = new Scheduler();
+            // 让日志自动带链路 id。注册一次即可（Logger 是静态全局的）。
+            Logger::setTraceProvider(function (): int {
+                return Scheduler::instance()->currentTrace();
+            });
         }
         return self::$self;
     }
@@ -477,6 +558,9 @@ final class Scheduler
     /** 投递消息。跨节点地址交给 Cluster；无 Cluster 时返回 false */
     public function deliver(int $to, int $msgId, string|array|object $data = "", int $session = 0): bool
     {
+        // 链路 id 在这里统一注入：调用方（业务代码）不需要知道它的存在。
+        // 位置放在最前面是为了让下面所有分支（本地/跨节点）都带同一个值。
+        $trace = $this->currentTrace();
         // 这里刻意内联 Addr::id 的位运算：热路径上每次静态调用约 250 ns。
         //
         // **节点位为 0 一律视为本地**：`Service::bindAddr()` 注入的是裸 id
@@ -507,7 +591,7 @@ final class Scheduler
 
         // 每消息的 sent 计数不进热路径：一次数组自增约 174 ns。
         // 吞吐类指标由压测/监控层按批次统计，框架只记低频事件（spawn/kill/error）。
-        if (!$box->push(new Message($this->currentOf(), $msgId, $data, $session))) {
+        if (!$box->push(new Message($this->currentOf(), $msgId, $data, $session, $trace))) {
             // 信箱满：丢新的，不让积压无限涨（旧消息通常还有意义）
             $this->stat["overflow"]++;
             return false;
@@ -601,6 +685,7 @@ final class Scheduler
             // 每条都存/恢复要两次属性写（约 300 ns），按批做只付一次。
             $prev = $this->currentOf();
             $this->setCurrentOf($id);
+            $prevTrace = $this->currentTrace();
 
             $n = 0;
             // budget 提到局部变量：内层每轮读一次属性约 150 ns，按条累加很可观
@@ -623,6 +708,8 @@ final class Scheduler
                     if ($traceOn) {
                         $svc->traceRecord($m, $traceNow);
                     }
+                    // 继承这条消息的链路：服务里 send 出去的自然带上
+                    $this->setTrace($m->traceId);
                     if ($wdNs === 0) {
                         $svc->onMessage($m);
                     } else {
@@ -666,6 +753,7 @@ final class Scheduler
                 $this->onCrashed($id);
             }
             $this->setCurrentOf($prev);
+            $this->setTrace($prevTrace);
             // 每条都做 $stat["handled"]++ 要 174 ns；按批累加等价，代价可忽略
             $this->stat["handled"] += $n;
 
@@ -719,6 +807,7 @@ final class Scheduler
         \swoole_coroutine_create(function () use ($self, $svc, $box, $id, $budget): void {
             $n = 0;
             $m = null;
+            $prevTrace = $self->currentTrace();
             try {
                 $self->setCurrentOf($id);
                 $wdNs = $self->watchdogNs;
@@ -727,6 +816,7 @@ final class Scheduler
                     if ($m === null) {
                         break;
                     }
+                    $self->setTrace($m->traceId);
                     if ($wdNs === 0) {
                         $svc->onMessage($m);
                     } else {
@@ -754,6 +844,7 @@ final class Scheduler
                 ]);
                 $self->onCrashed($id);
             } finally {
+                $self->setTrace($prevTrace);
                 unset($self->busy[$id]);
                 // **一批处理完必须回队**。原来是漏的：预算用尽但邮箱还有积压时，
                 // 这个服务要等下一条新消息投递才会被再次调度——突发一批（比如上线

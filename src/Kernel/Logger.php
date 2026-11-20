@@ -87,6 +87,19 @@ final class Logger
         self::write(self::ERROR, $msg, $ctx);
     }
 
+    /**
+     * 取"当前链路 id"的回调。由 `Scheduler` 在启动时注册。
+     *
+     * 用回调而不是让 Logger 直接调 `Scheduler::instance()`：Logger 在 Kernel 层，
+     * Scheduler 在 Service 层，直接依赖会把分层方向拧反（§3.3 的硬约束）。
+     */
+    private static ?\Closure $traceProvider = null;
+
+    public static function setTraceProvider(\Closure $fn): void
+    {
+        self::$traceProvider = $fn;
+    }
+
     private static function write(int $lv, string $msg, array $ctx): void
     {
         if ($lv < self::$level) {
@@ -99,6 +112,15 @@ final class Logger
             "pid" => posix_getpid(),
             "msg" => $msg,
         ];
+        // 链路 id 自动进日志：不用业务记得传。没有链路（定时器/心跳）时不加字段，
+        // 免得每条后台日志都挂一个 trace:0 干扰 grep
+        $tp = self::$traceProvider;
+        if ($tp instanceof \Closure) {
+            $t = $tp();
+            if (is_int($t) && $t > 0 && !isset($ctx["trace"])) {
+                $ctx["trace"] = $t;
+            }
+        }
         if ($ctx !== []) {
             $rec["ctx"] = $ctx;
         }

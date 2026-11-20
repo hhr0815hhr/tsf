@@ -25,11 +25,23 @@ final class Message
 
     public string|array|object $data;
 
-    public function __construct(int $from, int $msgId, string|array|object $data, int $session = 0)
+    /**
+     * 链路追踪 id：一次外部请求触发的所有消息共用。
+     *
+     * `0` 表示"不属于任何追踪"（定时器、内部心跳这类没有外部来源的消息）。
+     * 由网络入口生成，之后在服务之间**自动继承**——业务代码不用管它。
+     *
+     * 为什么放在信封上而不是让业务自己传：追踪只有在"不用记得带"的时候才有人用。
+     * 让它跟 `from` 一样是框架字段，业务无感。
+     */
+    public int $traceId;
+
+    public function __construct(int $from, int $msgId, string|array|object $data, int $session = 0, int $traceId = 0)
     {
         $this->from = $from;
         $this->msgId = $msgId;
         $this->data = $data;
         $this->session = $session;
+        $this->traceId = $traceId;
     }
 }
