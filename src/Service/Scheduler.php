@@ -98,6 +98,7 @@ final class Scheduler
     /** 当前正在处理哪个服务（用于给发出的消息填 from） */
     private int $current = 0;
 
+
     /**
      * 协程模式开关（默认关）。
      *
@@ -196,6 +197,9 @@ final class Scheduler
         "timers_cancelled" => 0,
         "slow" => 0,
         "max_msg_us" => 0,
+        /** 两次 tick 之间的最大间隔（µs）。协程模式下这才是"真阻塞"的信号 */
+        "max_tick_gap_us" => 0,
+        "slow_tick" => 0,
     ];
 
     public static function instance(): Scheduler
@@ -717,12 +721,27 @@ final class Scheduler
             $m = null;
             try {
                 $self->setCurrentOf($id);
+                $wdNs = $self->watchdogNs;
                 while ($n < $budget) {
                     $m = $box->pop();
                     if ($m === null) {
                         break;
                     }
-                    $svc->onMessage($m);
+                    if ($wdNs === 0) {
+                        $svc->onMessage($m);
+                    } else {
+                        // 协程路径原来**完全没有看门狗**（同步路径有，照搬时漏了）。
+                        // 补上，但标记 blocking=false：这里的墙钟包含"挂起等 I/O"，
+                        // 真正会卡住别人的是 tick 间隔，见 tick() 开头那段。
+                        $t0 = hrtime(true);
+                        $svc->onMessage($m);
+                        $dur = hrtime(true) - $t0;
+                        if ($dur > $wdNs) {
+                            if ($self->onSlow($id, $m, $dur, false)) {
+                                break;
+                            }
+                        }
+                    }
                     $n++;
                 }
             } catch (\Throwable $e) {
@@ -753,8 +772,31 @@ final class Scheduler
     public function run(): void
     {
         while (true) {
-            // 单轮限量：让循环有机会回到这里（将来接上退出信号/统计刷新）
-            if ($this->tick(2000) === 0) {
+            // 测"一轮调度花了多久"。
+            //
+            // 为什么放在这里而不是 tick() 里：tick() 是被外部随时调用的
+            // （定时器、测试、HTTP 循环），调用频率由别人决定——在 tick 里测间隔，
+            // 量到的是"两次调用的间隔"，而不是"这一轮被谁卡住了"。测试里
+            // `Coroutine::sleep(20ms)` 就被误报成"调度延迟 19.58ms"。
+            //
+            // 放在 run() 自循环里，语义才准确：一轮 = 收消息 + 到期定时器 + 派发，
+            // 它变慢只可能是**有协程占着 CPU 不下来**（真阻塞）。协程模式下
+            // 等 I/O 会让出，不会拖慢这一轮——这正好对上"阻塞"的定义。
+            $t0 = hrtime(true);
+            $worked = $this->tick(2000);
+            $dtUs = intdiv(hrtime(true) - $t0, 1000);
+            if ($dtUs > $this->stat["max_tick_gap_us"]) {
+                $this->stat["max_tick_gap_us"] = $dtUs;
+            }
+            if ($this->watchdogNs > 0 && $dtUs > intdiv($this->watchdogNs, 1000)) {
+                $this->stat["slow_tick"]++;
+                Logger::warn("scheduler round too long", [
+                    "round_us" => $dtUs,
+                    "limit_ms" => intdiv($this->watchdogNs, 1000000),
+                    "mode" => $this->coroutine ? "coroutine" : "sync",
+                ]);
+            }
+            if ($worked === 0) {
                 // 200 µs 的休眠粒度远小于 20 ms 的定时器误差要求；
                 // 再精细只会空转烧 CPU，收益为零。
                 usleep(200);
@@ -817,7 +859,12 @@ final class Scheduler
     }
 
     /** 慢消息处理：记账 + 告警，kill 模式返回 true（调用方应停止处理该服务） */
-    private function onSlow(int $id, Message $m, int $durNs): bool
+    /**
+     * @param bool $blocking 这条消息是否**真的占住了 worker**。
+     *                       同步模式恒为 true；协程模式下墙钟包含"等 I/O 被挂起"，
+     *                       不能和"阻塞别人"混为一谈，所以标 false 并在日志里区分。
+     */
+    private function onSlow(int $id, Message $m, int $durNs, bool $blocking = true): bool
     {
         $this->stat["slow"]++;
         $us = intdiv($durNs, 1000);
@@ -829,6 +876,7 @@ final class Scheduler
             "msgId" => $m->msgId,
             "us" => $us,
             "limit_ms" => intdiv($this->watchdogNs, 1000000),
+            "blocking" => $blocking,
         ]);
         if ($this->watchdogAction === "kill") {
             $this->kill($id);
