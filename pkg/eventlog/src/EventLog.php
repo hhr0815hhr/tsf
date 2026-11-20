@@ -295,29 +295,62 @@ final class EventLog
      */
     public function truncate(int $uptoSeq): int
     {
-        $keep = [];
-        foreach ($this->replay() as $e) {
-            if ($e["s"] > $uptoSeq) {
-                $keep[] = $e;
+        // 快速路径：整段截掉。检查点场景永远走这条（水位=最后一条），
+        // 而原实现会 file_get_contents + 逐行 json_decode 整个文件，只为得出
+        // "一条都不留"的结论——日志上百万条时白读几十 MB。删文件是 O(1)。
+        if ($uptoSeq > 0 && $uptoSeq >= $this->lastGoodSeq) {
+            $this->writeSeqFile($this->hiWater);
+            $this->close();
+            if (is_file($this->path)) {
+                unlink($this->path);
             }
+            $this->lastGoodSeq = 0;
+            $this->nextSeq = $this->hiWater + 1;
+            return 0;
         }
 
-        // 先把高水位钉住，再重写文件：万一重写后文件里没有序号了，
-        // 下次 scan 还能从这里接上，而不是从 1 重来
+        if (!is_file($this->path)) {
+            return 0;
+        }
+        $raw = file_get_contents($this->path);
+        if (!is_string($raw) || $raw === "") {
+            return 0;
+        }
+
+        // 部分截断：**保留原始行**，不要 replay 再 json_encode。
+        // 重新编码会规范化字段（丢未知字段、改转义），而日志是事实记录，
+        // 不该因为一次归档就被改写。
+        $keep = "";
+        $kept = 0;
+        $pos = 0;
+        $total = strlen($raw);
+        while ($pos < $total) {
+            $nl = strpos($raw, "\n", $pos);
+            if ($nl === false) {
+                break;      // 末尾半行：丢弃
+            }
+            $line = substr($raw, $pos, $nl - $pos);
+            $d = json_decode($line, true);
+            if (!is_array($d) || !isset($d["s"]) || !is_int($d["s"])) {
+                break;      // 坏行之后不可信，与 replay 的判定保持一致
+            }
+            if ((int) $d["s"] > $uptoSeq) {
+                $keep .= $line . "\n";
+                $kept++;
+            }
+            $pos = $nl + 1;
+        }
+
         $this->writeSeqFile($this->hiWater);
         $this->close();
         $tmp = $this->path . ".tmp";
-        $buf = "";
-        foreach ($keep as $e) {
-            $line = json_encode($e, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            if (is_string($line)) {
-                $buf .= $line . "\n";
-            }
+        if (file_put_contents($tmp, $keep) === false) {
+            // 写不出来就别动原文件：宁可这次不截，也不能丢历史
+            return 0;
         }
-        file_put_contents($tmp, $buf);
         rename($tmp, $this->path);
         $this->scan();
-        return count($keep);
+        return $kept;
     }
 
     public function lastSeq(): int
