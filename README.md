@@ -403,6 +403,20 @@ $h = new Handoff($nodeId, $entry, new ClusterTransport($cluster), 3000, 8);  // 
 
 ---
 
+### 两个测试入口：`verify` 与 `test`
+
+| 命令 | 跑什么 | 用在哪 |
+|:--|:--|:--|
+| `tsf verify` | **注册过的** 18 个套件（`bin/tsf` 里的清单），带断言计数 | 日常提交前、CI 门禁 |
+| `tsf test` | **发现式**：遍历 `tests/*/main.php`，没有 `run.sh` 就直接 build+run | 查"有多少东西其实没在验证" |
+| `tsf test --unwired` | 只跑没有 `run.sh` 的那批 | 定期体检 |
+
+为什么需要两个：`verify` 的清单是手写的，**只有被登记的才算数**。仓库里长期存在
+另一批测试——有 `main.php`、没有 `run.sh`，于是从没被执行过。它们的断言"一直是绿的"，
+只是没人跑。`tsf test` 不维护清单：目录里有 `main.php` 就算一个用例。
+
+退出码约定与 verify 一致：`0` 通过、`77` 跳过（用例自己声明缺外部依赖）、其它为失败。
+
 ### 事件日志的检查点
 
 `EventLog` 只追加，恢复 = 从头重放。跑三个月的账本可能是几十万条事件，

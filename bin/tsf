@@ -304,16 +304,14 @@ function runCmd(string $cmd, string $cwd): int
  */
 function runCmdCapture(string $cmd, string $cwd): array
 {
-    $old = getcwd();
-    if ($old !== false) {
-        chdir($cwd);
-    }
+    // **不要用 chdir() 传工作目录**：实测（PHP 8.5 ZTS）子进程不会继承父进程
+    // php 运行期 chdir 的结果——`chdir(X); proc_open("pwd")` 输出的仍是**原目录**。
+    // 之前靠 chdir 的写法在"父进程本来就在目标目录"时碰巧成立（run.sh 都是先 cd 再 build），
+    // 一旦从别处调用（比如 `tsf test` 从仓库根遍历）就静默失效：
+    // tpc 拿到的 cwd 是仓库根，报 `path not exists: project.yml`，而文件其实好好躺在目标目录里。
     $desc = [1 => ["pipe", "w"], 2 => ["pipe", "w"]];
-    $p = proc_open($cmd, $desc, $pipes);
+    $p = $cwd !== "" ? proc_open($cmd, $desc, $pipes, $cwd) : proc_open($cmd, $desc, $pipes);
     if (!is_resource($p)) {
-        if ($old !== false) {
-            chdir($old);
-        }
         return ["rc" => 1, "out" => ""];
     }
     // stderr 不读会阻塞子进程，所以先设为非阻塞并在最后一起取
@@ -340,9 +338,6 @@ function runCmdCapture(string $cmd, string $cwd): array
     fclose($pipes[1]);
     fclose($pipes[2]);
     $rc = proc_close($p);
-    if ($old !== false) {
-        chdir($old);
-    }
     return ["rc" => $rc, "out" => $out];
 }
 
@@ -798,6 +793,141 @@ function verifySuites(): array
  * 之前验证散在 9 个目录里，各自的入口、前置条件、判定方式都不一样，
  * 新人接手时最贵的成本是"不知道有这些脚本"。
  */
+/**
+ * 发现式测试：遍历 `tests/` 下所有带 `main.php` 的目录，全部构建并运行。
+ *
+ * ## 为什么需要它
+ *
+ * `verify` 只跑**注册过**的套件。仓库里长期存在另一批测试：有 `main.php`、
+ * 没有 `run.sh`，因此从没被执行过——它们的断言"一直是绿的"，只是没人跑。
+ * 这不是假绿，是**根本没人看**。
+ *
+ * 这个命令不维护清单：目录里有 `main.php` 就算一个用例，有 `run.sh` 就交给脚本
+ * （脚本自己知道要几个进程、几份配置），没有就直接 build + 跑产物。
+ *
+ * ## 判定
+ *
+ * - 退出码 0 → PASS
+ * - 退出码 77 → SKIP（用例自己声明"缺外部依赖"，和 verify 的约定一致）
+ * - 其它 → FAIL，并打印最后几行输出
+ *
+ * 有外部依赖（MySQL/Postgres/Redis）的用例在这台机器上可能就是红的。
+ * **那是信息，不是噪音**：它说明这些东西没有在 CI 里被验证过。
+ */
+function cmdTest(string $root, string $tsfRoot, string $tpc, string $phpBin, array $argv): int
+{
+    $filter = "";
+    $unwiredOnly = false;
+    foreach (array_slice($argv, 2) as $a) {
+        if ($a === "--unwired") {
+            $unwiredOnly = true;
+            continue;
+        }
+        if ($a !== "" && $a[0] !== "-" && $a !== "test") {
+            $filter = $a;
+        }
+    }
+
+    $dirs = glob($root . "/tests/*", GLOB_ONLYDIR);
+    if (!is_array($dirs)) {
+        fail("找不到 tests/ 目录");
+    }
+    sort($dirs);
+
+    $rows = [];
+    $pass = 0;
+    $fail = 0;
+    $skip = 0;
+
+    foreach ($dirs as $dir) {
+        $d = (string) $dir;
+        if (!is_file($d . "/main.php")) {
+            continue;
+        }
+        $id = basename($d);
+        if ($filter !== "" && strpos($id, $filter) === false) {
+            continue;
+        }
+
+        $hasRun = is_file($d . "/run.sh");
+        // --unwired：只看那些没接进 verify 的（没有 run.sh）。CI 里最有价值的一条
+        if ($unwiredOnly && $hasRun) {
+            continue;
+        }
+
+        // `skip-auto` 标记文件：用例声明"我依赖外部服务/是交互式探测，别在自动集合里跑"。
+        // 用文件而不是代码判断，是为了让"为什么跳过"和用例放在一起、一眼能看到。
+        $skipFile = $d . "/skip-auto";
+        if (is_file($skipFile)) {
+            $why = trim((string) file_get_contents($skipFile));
+            if ($why === "") {
+                $why = "声明了 skip-auto";
+            }
+            $rows[] = ["id" => $id, "state" => "SKIP", "ms" => 0, "tail" => $why, "run" => $hasRun];
+            $skip++;
+            fwrite(STDERR, "→ " . $id . " ... SKIP（" . $why . "）" . PHP_EOL);
+            continue;
+        }
+        fwrite(STDERR, "→ " . $id . ($hasRun ? "" : "（无 run.sh，直接 build+run）") . " ... ");
+        $t0 = microtime(true);
+
+        if ($hasRun) {
+            $out = [];
+            $rc = 0;
+            exec("cd " . escapeshellarg($d) . " && timeout 300 bash run.sh 2>&1", $out, $rc);
+        } else {
+            // 没有脚本：先生成 project.yml 并编译，再跑产物
+            $rc = doBuild($d, $tsfRoot, $tpc, $phpBin);
+            if ($rc === 0) {
+                $bin = findBinary($d);
+                if ($bin === "") {
+                    $out = ["编译成功但找不到产物（目录名与二进制名对不上）"];
+                    $rc = 1;
+                } else {
+                    $out = [];
+                    exec("cd " . escapeshellarg($d) . " && timeout 300 " . escapeshellarg($bin) . " 2>&1", $out, $rc);
+                }
+            } else {
+                $out = ["编译失败"];
+            }
+        }
+
+        $ms = (int) ((microtime(true) - $t0) * 1000);
+        if ($rc === 77) {
+            $state = "SKIP";
+            $skip++;
+        } elseif ($rc === 0) {
+            $state = "PASS";
+            $pass++;
+        } else {
+            $state = "FAIL";
+            $fail++;
+        }
+        $tail = "";
+        if ($state === "FAIL") {
+            $tail = implode(" | ", array_slice($out, -3));
+        }
+        fwrite(STDERR, $state . PHP_EOL);
+        $rows[] = ["id" => $id, "state" => $state, "ms" => $ms, "tail" => $tail, "run" => $hasRun];
+    }
+
+    echo PHP_EOL;
+    echo padWidth("结果", 6) . padWidth("用例", 20) . padWidth("入口", 10) . "耗时" . PHP_EOL;
+    echo str_repeat("-", 64) . PHP_EOL;
+    foreach ($rows as $r) {
+        $sec = number_format($r["ms"] / 1000, 1) . "s";
+        echo padWidth($r["state"], 6) . padWidth($r["id"], 20)
+            . padWidth($r["run"] ? "run.sh" : "main.php", 10) . $sec . PHP_EOL;
+        if ($r["tail"] !== "") {
+            echo "      ↳ " . $r["tail"] . PHP_EOL;
+        }
+    }
+    echo str_repeat("-", 64) . PHP_EOL;
+    echo "通过 " . $pass . " / 失败 " . $fail . " / 跳过 " . $skip . PHP_EOL;
+
+    return $fail === 0 ? 0 : 1;
+}
+
 function verifyRun(string $root, array $argv): int
 {
     $suites = verifySuites();
@@ -1860,6 +1990,10 @@ switch ($cmd) {
         $rc = runCmd(escapeshellarg($binPath) . " migrate-status", $projDir);
         exit($rc);
         break;
+
+    case "test":
+        $root = dirname(__DIR__, 2);
+        exit(cmdTest($root, $tsfRoot, $tpc, $phpBin, $argv));
 
     case "verify":
         $root = dirname(__DIR__, 2);
