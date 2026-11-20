@@ -864,6 +864,20 @@ function verifyRun(string $root, array $argv): int
         $out = [];
         $rc = 0;
         exec("bash " . escapeshellarg($path) . " 2>&1", $out, $rc);
+        $retried = false;
+
+        // 编译/链接偶发失败：ld 只回 "collect2: error: ld returned 1" 而没有细节，
+        // 上一次红的套件每次都不同，单独重跑必过。这种红是噪音——但也不能假装没发生，
+        // 所以重试一次并在结果里标出来：真坏了会连续两次失败。
+        if ($rc !== 0) {
+            $probe = implode(" | ", array_slice($out, -4));
+            if (strpos($probe, "编译失败") !== false || strpos($probe, "ld returned") !== false) {
+                $out = [];
+                $rc = 0;
+                exec("bash " . escapeshellarg($path) . " 2>&1", $out, $rc);
+                $retried = true;
+            }
+        }
         $ms = (int) ((microtime(true) - $t0) * 1000);
 
         // 77 = 脚本主动跳过（端口被占、本机有冲突服务……）。
@@ -893,7 +907,12 @@ function verifyRun(string $root, array $argv): int
         } else {
             $fail++;
         }
-        fwrite(STDERR, $state . PHP_EOL);
+        if ($retried && $state === "PASS") {
+            $tail = "首次编译失败，重试通过（疑似 ld 偶发）";
+            fwrite(STDERR, "PASS*" . PHP_EOL);
+        } else {
+            fwrite(STDERR, $state . PHP_EOL);
+        }
         $rows[] = ["id" => $s["id"], "desc" => $s["desc"], "state" => $state, "ms" => $ms, "tail" => $tail];
     }
 
