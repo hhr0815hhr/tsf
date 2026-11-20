@@ -100,6 +100,23 @@ final class Logger
         self::$traceProvider = $fn;
     }
 
+    /**
+     * 取当前链路 id；没有链路时返回 0。
+     *
+     * 给"需要把 trace 落到别处"的组件用（比如 `pkg/eventlog` 记账）。
+     * 它们不该各自去调 `Scheduler::instance()`——可选包依赖核心是允许的，
+     * 但让每个包都认识调度器，等于把它们绑死在一种运行方式上。
+     */
+    public static function trace(): int
+    {
+        $tp = self::$traceProvider;
+        if (!($tp instanceof \Closure)) {
+            return 0;
+        }
+        $t = $tp();
+        return is_int($t) ? $t : 0;
+    }
+
     private static function write(int $lv, string $msg, array $ctx): void
     {
         if ($lv < self::$level) {

@@ -3,6 +3,7 @@
 namespace TSF\Transport;
 
 use TSF\Kernel\Logger;
+use TSF\Service\Scheduler;
 use TSF\Protocol\Contract\FrameCodec;
 
 /**
@@ -39,6 +40,18 @@ abstract class Server
     /** @var callable|null */
     protected $onFrame = null;
 
+    /**
+     * 是否为每个客户端帧建立一条链路（默认关）。
+     *
+     * 默认关的理由：这是**开销换可观测**的开关，不该替使用者决定。
+     * 心跳 10Hz × 数千连接时，每帧建一个 id 是纯浪费；而"一次点击换一局结算"
+     * 这种包才是链路追踪真正要覆盖的。
+     *
+     * 打开后：`feed()` 每切出一帧就 `beginTrace()`，之后业务 deliver 出去的消息
+     * 都自然带上这条链路，一路到 eventlog 记账——不需要改任何业务代码。
+     */
+    protected bool $traceFrames = false;
+
     /** @var callable|null */
     protected $onClose = null;
 
@@ -68,6 +81,12 @@ abstract class Server
     public function onConnect(callable $cb): void
     {
         $this->onConnect = $cb;
+    }
+
+    /** 打开"每帧一条链路"。见 $traceFrames 注释里的成本说明 */
+    public function traceFrames(bool $on = true): void
+    {
+        $this->traceFrames = $on;
     }
 
     public function onFrame(callable $cb): void
@@ -359,6 +378,11 @@ abstract class Server
             $buf = substr($buf, $frame->consumed);
 
             if ($this->onFrame !== null) {
+                if ($this->traceFrames) {
+                    // 帧边界 = 一次客户端操作的边界。在这里建链路，
+                    // 后面从业务处理到 eventlog 记账都自动继承
+                    Scheduler::instance()->beginTrace();
+                }
                 $cb = $this->onFrame;
                 $cb($fd, $frame->msgId, $frame->body, $frame->flags);
             }

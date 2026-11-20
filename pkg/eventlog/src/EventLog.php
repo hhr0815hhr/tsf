@@ -2,6 +2,8 @@
 
 namespace TSF\EventLog;
 
+use TSF\Kernel\Logger;
+
 /**
  * 追加写的事件日志。一行一条，JSON Lines。
  *
@@ -128,13 +130,21 @@ final class EventLog
         $this->nextSeq++;
         $this->hiWater = $seq;
 
-        $line = json_encode([
+        $rec = [
             "s" => $seq,
             "id" => $id,
             "k" => $kind,
             "t" => (int) (microtime(true) * 1000),
             "d" => $data,
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        ];
+        // 链路 id：把"这笔钱是哪次操作产生的"钉在账上。
+        // 只在有链路时写，避免每条后台/定时事件都挂一个 tr:0 撑大日志。
+        // 老文件没有这个字段，读取侧默认 0，不影响重放与对账。
+        $tr = Logger::trace();
+        if ($tr > 0) {
+            $rec["tr"] = $tr;
+        }
+        $line = json_encode($rec, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         if (!is_string($line)) {
             throw new \RuntimeException("eventlog: 编码失败（" . json_last_error_msg() . "）");
@@ -231,6 +241,7 @@ final class EventLog
                 "k" => isset($d["k"]) ? (string) $d["k"] : "",
                 "t" => isset($d["t"]) ? (int) $d["t"] : 0,
                 "d" => isset($d["d"]) && is_array($d["d"]) ? $d["d"] : [],
+                "tr" => isset($d["tr"]) ? (int) $d["tr"] : 0,
             ];
             if ($limit > 0 && count($out) >= $limit) {
                 break;
