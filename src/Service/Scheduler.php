@@ -736,6 +736,16 @@ final class Scheduler
                 $self->onCrashed($id);
             } finally {
                 unset($self->busy[$id]);
+                // **一批处理完必须回队**。原来是漏的：预算用尽但邮箱还有积压时，
+                // 这个服务要等下一条新消息投递才会被再次调度——突发一批（比如上线
+                // 结算、批量发奖）之后，剩下的消息会永远卡在信箱里，现象是"没反应
+                // 但日志干净"。同步路径一直有这段回队逻辑，协程路径照搬时漏了。
+                if (isset($self->boxes[$id]) && !$self->boxes[$id]->isEmpty()) {
+                    if (!$self->boxes[$id]->queued) {
+                        $self->boxes[$id]->queued = true;
+                        $self->ready[] = $id;
+                    }
+                }
             }
         });
     }
