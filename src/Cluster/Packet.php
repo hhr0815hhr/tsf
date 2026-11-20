@@ -42,6 +42,12 @@ final class Packet
 
     public static function encode(int $dst, int $src, int $session, int $msgId, string $payload): string
     {
+        // msgId 在头上只有 2 字节。**必须在这里拦**：越界时下面两个 chr() 会
+        // 静默截断（69001 → 3465），发送端一切正常、接收端"没收到"，
+        // 两端日志都是干净的——这是最难查的一类问题。
+        if ($msgId < 0 || $msgId > 0xFFFF) {
+            throw new \RuntimeException("cluster: msgId 超出 16 位 [" . $msgId . "]，协议号必须在 0..65535");
+        }
         $len = self::HEADER_SIZE + strlen($payload);
         return chr(($len >> 24) & 0xFF) . chr(($len >> 16) & 0xFF) . chr(($len >> 8) & 0xFF) . chr($len & 0xFF)
             . chr(($dst >> 24) & 0xFF) . chr(($dst >> 16) & 0xFF) . chr(($dst >> 8) & 0xFF) . chr($dst & 0xFF)
