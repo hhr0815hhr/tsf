@@ -798,6 +798,11 @@ function verifySuites(): array
         // 需要 Redis；没有的话脚本自己打 SKIP 并返回 0（环境没装不该判红）
         ["id" => "registry", "desc" => "Redis 注册表+租约（38 项，无 Redis 则 SKIP）", "sh" => "tests/registry-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（120 项：含版本落后调度）", "sh" => "tests/handoff-test/run.sh"],
+        ["id" => "entity", "desc" => "实体属性/脏标记/持久化字段", "sh" => "tests/entity-test/run.sh"],
+        ["id" => "fsm", "desc" => "状态机转移/守卫/非法转移", "sh" => "tests/fsm-test/run.sh"],
+        ["id" => "match", "desc" => "匹配规则/评分/候选筛选", "sh" => "tests/match-test/run.sh"],
+        ["id" => "shard", "desc" => "分片路由：环/虚拟节点/再平衡", "sh" => "tests/shard-test/run.sh"],
+        ["id" => "eventlog", "desc" => "追加/重放/坏行修复/截断/多节点归并", "sh" => "tests/eventlog-test/run.sh"],
         ["id" => "checkpoint", "desc" => "事件日志检查点（45 项：截断/等价/水位/增量/坏点被拒）", "sh" => "tests/checkpoint-test/run.sh"],
         ["id" => "schema", "desc" => "状态版本迁移链（19 项：缺 _v/拒绝降级/恢复集成）", "sh" => "tests/snapshot-migrate-test/run.sh"],
         ["id" => "prom", "desc" => "Prometheus 导出（34 项：格式/名字/TYPE/来源限制）", "sh" => "tests/prom-test/run.sh"],
