@@ -206,6 +206,23 @@ final class Handoff
      *
      * 用返回值而不是异常：拒绝是**正常路径**（对方版本更新、我这正忙），
      * 用异常会让正常的拒绝走进错误日志，把真正的故障淹掉。
+     *
+     * ## 装载 ≠ 可以对外服务（重要）
+     *
+     * 这里被调用只说明"状态字节到了、校验过了"，**不说明这次迁移会成功**：
+     *
+     *   1. 目标回 ACCEPT，但 ACK 可能在网络上丢了
+     *   2. 源侧 `expire()` 超时 → 回滚 → **源继续托管这个 key**
+     *   3. 此时目标手里也有一份（已 install）
+     *
+     * 协议里**没有"最终确认"消息**（只有 MIGRATE/ACCEPT/REJECT/ABORT/ABORTED），
+     * 所以目标侧收不到"源已经 commit 了"的通知。源的超时回滚也不会主动发 ABORT
+     * （见 `expire()`：只 fire `onRollback`，靠 Rebalancer 重试收敛）。
+     *
+     * 结论：**`onInstall` 里只做"暂存"**——存进内存/文件，但不要注册路由、
+     * 不要让消息路由到这个 key、不要宣称归属。对外的时机由 OwnerShip 决定
+     * （环指向本节点 + 状态已装入）。在 `onInstall` 里抢归属，
+     * 一旦源侧回滚，就是两个节点同时服务同一个 key——金币复制这类事故的源头。
      */
     public function onInstall(\Closure $cb): void
     {

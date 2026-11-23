@@ -1085,8 +1085,17 @@ function runOneTest(string $dir, string $tsfRoot, string $tpc, string $phpBin): 
      * 所以再解析一遍输出：出现 `FAIL` 行或 `failed=N`（N>0）也判失败。
      */
     $outText = implode("\n", $out);
+    /*
+     * 只认两种"真失败"的写法，宁可漏也不能误报：
+     *   1. 行首的 `FAIL`（各套件的断言行）
+     *   2. 行首的 `passed=N failed=M` 汇总行里 M>0
+     *
+     * 不能直接搜 "failed=[1-9]" —— handoff-test 有个用例把 `failed=1`
+     * 当作**数据**打在输出里（验证计数器），那样会把全绿的套件判成失败。
+     * 误报的代价是让人开始无视红色，比漏报更糟。
+     */
     $outBad = preg_match('/^\s*FAIL\s/m', $outText) === 1
-        || preg_match('/failed=[1-9][0-9]*/', $outText) === 1;
+        || preg_match('/^passed=\d+ failed=[1-9][0-9]*$/m', $outText) === 1;
     if ($rc === 0 && $outBad) {
         $rc = 1;
     }
