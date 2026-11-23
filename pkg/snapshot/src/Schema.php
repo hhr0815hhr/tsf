@@ -136,15 +136,36 @@ final class Schema
         return $out;
     }
 
-    /** 一份快照的所有块都过一遍迁移 */
+    /**
+     * 一份快照的所有块都过一遍迁移。
+     *
+     * ## 为什么先全部算完再写回
+     *
+     * 一份快照通常有好几块（房间/成员/牌堆…）。逐块 `migrate` 后立刻 `put`，
+     * 遇到"第二块拒绝、第一块已升"的情况，快照就停在**半迁移**状态：
+     * 部分是当前结构、部分是旧结构，而它看起来还是一份"合法"的快照。
+     *
+     * 这种状态最坏的地方是它能被存回去——业务如果在 `catch` 里做了"尽力恢复"
+     * 或者定时保存，脏结构就落到磁盘了，下次启动再也分不清哪些块升级过。
+     *
+     * 所以先算到临时数组，全部成功才写回。失败时快照**一个字节都不变**，
+     * 调用方可以放心地把整条快照当坏数据丢掉（Restorer 就是这么做的）。
+     */
     public function migrateSnapshot(Snapshot $snap): void
     {
+        $done = [];
         foreach ($snap->blocks() as $name) {
             $block = $snap->get($name);
             if ($block === []) {
                 continue;   // 空块没什么可升的
             }
-            $snap->put($name, $this->migrate($snap->kind . "." . $name, $block));
+            // 这里抛异常时 $done 里的结果还没写回，snap 保持原样
+            $done[$name] = $this->migrate($snap->kind . "." . $name, $block);
+        }
+        // 变量名不能复用上面的 $name：AOT 里 foreach 的 key 推成 Var，
+        // 和上一轮 value 推成的 string 冲突，编译期直接报错
+        foreach ($done as $blockName => $blockData) {
+            $snap->put((string) $blockName, $blockData);
         }
     }
 
