@@ -112,6 +112,31 @@ final class Scheduler
      */
     private int $trace = 0;
 
+    /**
+     * 一轮调度结束时的回调。
+     *
+     * 用来做"批尾"动作，典型是**批量发送**：服务在 `onMessage` 里发出的回包
+     * 如果都单独 `send`，一次 tick 处理 500 条消息就是 500 次 syscall。
+     * 注册一个 flush 回调，让传输层在 tick 结束时按连接合并写出。
+     *
+     * 用闭包注入而不是让 Scheduler 认识 Transport：分层方向不能反
+     * （Service 不依赖 Transport）。
+     */
+    private ?\Closure $onBatchEnd = null;
+
+    /** 对应 `onBatchEnd` 的开启钩子（批窗口开/关必须成对） */
+    private ?\Closure $onBatchBegin = null;
+
+    public function onBatchBegin(\Closure $fn): void
+    {
+        $this->onBatchBegin = $fn;
+    }
+
+    public function onBatchEnd(\Closure $fn): void
+    {
+        $this->onBatchEnd = $fn;
+    }
+
     /** 生成一个新的追踪 id：42 位毫秒时间 + 20 位进程内序号 */
     public function newTrace(): int
     {
@@ -626,6 +651,10 @@ final class Scheduler
      */
     public function tick(int $maxMsgs = 0): int
     {
+        if ($this->onBatchBegin !== null) {
+            $bb = $this->onBatchBegin;
+            $bb();
+        }
         // 1) 先收跨节点来的消息
         if ($this->cluster !== null) {
             $packets = $this->cluster->poll();
@@ -774,6 +803,10 @@ final class Scheduler
             $this->cluster->flush();
         }
 
+        if ($this->onBatchEnd !== null) {
+            $cb = $this->onBatchEnd;
+            $cb();
+        }
         return $handled;
     }
 

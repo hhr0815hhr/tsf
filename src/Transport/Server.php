@@ -448,6 +448,39 @@ abstract class Server
         return $this->sendRaw($fd, $frame);
     }
 
+    /**
+     * 打开批量窗口，供"一轮调度"使用。
+     *
+     * `feed()` 自己会开/关；这里给 `tick()` 用：服务在 `onMessage` 里发出的回包
+     * 发生在 feed 之外，如果 `inFeed` 只覆盖 feed，**真实业务路径完全享受不到合并**。
+     *
+     * 用法（由应用在启动时注册）：
+     * ```php
+     * Scheduler::instance()->onBatchEnd(function () use ($server): void {
+     *     $server->flushPending();
+     * });
+     * ```
+     */
+    public function beginBatch(): void
+    {
+        $this->inFeed = true;
+    }
+
+    public function endBatch(): void
+    {
+        $this->inFeed = false;
+        if ($this->batchSend) {
+            $this->flushBatch();
+        }
+    }
+
+    public function flushPending(): void
+    {
+        if ($this->batchSend && !$this->inFeed) {
+            $this->flushBatch();
+        }
+    }
+
     /** 把累积的回包按连接一次写出 */
     protected function flushBatch(): void
     {
