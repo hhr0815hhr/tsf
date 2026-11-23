@@ -798,10 +798,22 @@ function verifySuites(): array
         // 需要 Redis；没有的话脚本自己打 SKIP 并返回 0（环境没装不该判红）
         ["id" => "registry", "desc" => "Redis 注册表+租约（38 项，无 Redis 则 SKIP）", "sh" => "tests/registry-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（120 项：含版本落后调度）", "sh" => "tests/handoff-test/run.sh"],
+        ["id" => "config", "desc" => "配置加载/热更/校验", "sh" => "tests/config-test/run.sh"],
+        ["id" => "gm", "desc" => "GM 命令/权限/审计", "sh" => "tests/gm-test/run.sh"],
+        ["id" => "proto", "desc" => "协议编解码/版本协商", "sh" => "tests/proto-test/run.sh"],
+        ["id" => "watch", "desc" => "watch 增量重编与失败处理", "sh" => "tests/watch-test/run.sh"],
+        ["id" => "breaker", "desc" => "熔断降级：打开/半开/关闭", "sh" => "tests/breaker-test/run.sh"],
+        ["id" => "coroutine", "desc" => "协程化 Scheduler：让出与恢复", "sh" => "tests/coroutine-test/run.sh"],
+        ["id" => "guard", "desc" => "服务守卫：预算/超时/卡死检测", "sh" => "tests/guard-test/run.sh"],
+        ["id" => "metrics", "desc" => "埋点/聚合/慢调用打点", "sh" => "tests/metrics-test/run.sh"],
+        ["id" => "service", "desc" => "服务生命周期/停机/crash dump", "sh" => "tests/service-test/run.sh"],
+        ["id" => "discovery", "desc" => "服务发现：注册/失效/收敛", "sh" => "tests/discovery-test/run.sh"],
+        ["id" => "mail", "desc" => "邮件（需 MySQL，默认 SKIP）", "sh" => "tests/mail-test/run.sh"],
         ["id" => "entity", "desc" => "实体属性/脏标记/持久化字段", "sh" => "tests/entity-test/run.sh"],
         ["id" => "fsm", "desc" => "状态机转移/守卫/非法转移", "sh" => "tests/fsm-test/run.sh"],
         ["id" => "match", "desc" => "匹配规则/评分/候选筛选", "sh" => "tests/match-test/run.sh"],
         ["id" => "shard", "desc" => "分片路由：环/虚拟节点/再平衡", "sh" => "tests/shard-test/run.sh"],
+        ["id" => "shard-router", "desc" => "跨服路由语义：本地/远端/失败", "sh" => "tests/shard-router-test/run.sh"],
         ["id" => "eventlog", "desc" => "追加/重放/坏行修复/截断/多节点归并", "sh" => "tests/eventlog-test/run.sh"],
         ["id" => "checkpoint", "desc" => "事件日志检查点（45 项：截断/等价/水位/增量/坏点被拒）", "sh" => "tests/checkpoint-test/run.sh"],
         ["id" => "schema", "desc" => "状态版本迁移链（19 项：缺 _v/拒绝降级/恢复集成）", "sh" => "tests/snapshot-migrate-test/run.sh"],
@@ -1752,6 +1764,54 @@ function cmdLint(string $root): int
                 $shown++;
             }
         }
+
+        /*
+         * 测试归位：每个有 main.php 的目录，必须有 run.sh（进了 verify）
+         * 或者 skip-auto（写明为什么不该进自动集合）。
+         *
+         * 为什么这条要**阻塞**：§46/§49/§52 三次都是同一个问题——
+         * 测试文件好好躺在那里、`tsf verify` 里却没有它，于是从不执行。
+         * 「有测试」和「测试在跑」是两件事，而这个差别在踩到之前完全看不出来。
+         * 修复成本很低（补个 run.sh 或写一句原因），所以按错误处理。
+         */
+        $ugated = [];
+        // 判据是"在 verifySuites 里"，不是"有 run.sh"——
+        // 实测有 4 个目录写着 run.sh 却从没注册（config/gm/proto/watch），
+        // 它们和"没 run.sh"一样从不执行，但看起来更完整、更不容易被发现。
+        $registered = [];
+        foreach (verifySuites() as $vs) {
+            $registered[(string) $vs["sh"]] = true;
+        }
+        // **注意 $root 是 tsf/ 子目录**（cmdLint 的入参），tests 在它的上一级。
+        // 第一版这里直接用了 $root，glob 扫的是 tsf/tests/（不存在），
+        // 于是这个检查永远通过——又一个"看起来在工作"的空检查。
+        $tdirs = glob(dirname($root) . "/tests/*", GLOB_ONLYDIR);
+        if (is_array($tdirs)) {
+            foreach ($tdirs as $td) {
+                $td = (string) $td;
+                $name = basename($td);
+                if (!is_file($td . "/main.php")) {
+                    continue;
+                }
+                if (is_file($td . "/skip-auto")) {
+                    continue;       // 明确声明了为什么不进自动集合
+                }
+                if (!isset($registered["tests/" . $name . "/run.sh"])) {
+                    $ugated[] = $name;
+                }
+            }
+        }
+        if ($ugated !== []) {
+            say("");
+            say(c("  测试没入口：", "r")
+                . "以下目录有 main.php，但既没有 run.sh（进 verify）也没有 skip-auto（说明原因）");
+            foreach ($ugated as $u) {
+                say("    " . $u);
+            }
+            say(c("  这会变成「测试写了但永远不跑」——补 run.sh 或写 skip-auto", "d"));
+            return 1;
+        }
+
         return 0;
     }
 
