@@ -777,6 +777,9 @@ function verifySuites(): array
     return [
         // 对比脚本是 python3 写的：缺它时 run.sh 会判 FAIL 而不是 SKIP，
         // 于是"环境没装"被当成"代码有问题"——正是 needs 要拦掉的那种假红
+        // 文档链接检查放第一个：它最快（<1 秒），而且坏了意味着"新人照着走会 404"，
+        // 属于最该在回归里拦住的一类问题
+        ["id" => "docs", "desc" => "文档链接有效性（36 条）", "sh" => "scripts/check-doc-links.sh"],
         ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh", "needs" => ["python3"]],
         ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "tests/swoole-contract/run.sh"],
         ["id" => "settle", "desc" => "金币账本（115 项）", "sh" => "tests/settle-test/run.sh"],

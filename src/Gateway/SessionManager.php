@@ -97,19 +97,9 @@ final class SessionManager
         }
     }
 
-    public function touch(int $fd, int $now): void
-    {
-        if (isset($this->byFd[$fd])) {
-            $this->byFd[$fd]->lastActive = $now;
-        }
-    }
-
-    public function countFrame(int $fd): void
-    {
-        if (isset($this->byFd[$fd])) {
-            $this->byFd[$fd]->frames++;
-        }
-    }
+    // 曾经有一个分开的 touch() 和 countFrame()，合并进 touchFrame 后**必须删掉**：
+    // 留着它们，下一个人很可能只调 touch()（以为"续期就够了"），
+    // 结果 frames 不计数——丢帧统计从此永远是 0，而且没有任何报错。
 
     public function countDrop(int $fd): void
     {
