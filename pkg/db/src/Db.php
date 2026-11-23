@@ -295,6 +295,11 @@ final class Db extends Source
     }
 
     /**
+     * "事务已注定失败"的标记。见 transaction() 里的说明。
+     */
+    private bool $txRollbackOnly = false;
+
+    /**
      * 事务。可重入：嵌套调用只在外层真正 BEGIN/COMMIT。
      *
      * 用「深度」而不是 SAVEPOINT，是因为业务里的嵌套几乎都是
@@ -304,34 +309,72 @@ final class Db extends Source
     public function transaction(\Closure $fn): void
     {
         $pdo = $this->conn();
+        $isOuter = $this->txDepth === 0;
 
-        if ($this->txDepth === 0) {
+        if ($isOuter) {
             $pdo->beginTransaction();
+            $this->txRollbackOnly = false;
         }
         $this->txDepth++;
 
+        /*
+         * 失败先记下来，不在 catch 里直接处理。
+         *
+         * 原因：如果在外层"检测到 rollbackOnly"那里 `throw`，它会被自己的
+         * catch 接住，txDepth 被减两次——事务深度变负之后**所有事务都静默失效**。
+         * 这类改动必须在同一个出口统一收尾。
+         */
+        $failed = false;
+        $err = null;
         try {
             $fn($this);
-            if ($this->txDepth === 1) {
-                $pdo->commit();
-            }
         } catch (\Throwable $e) {
-            if ($this->txDepth === 1) {
+            $failed = true;
+            $err = $e;          // 留着原异常：排障要看真实堆栈，不能换成通用提示
+            // 任何一层失败都打标记：外层即使把异常吞掉，commit 也会降级为 rollback
+            $this->txRollbackOnly = true;
+        }
+
+        if ($isOuter) {
+            if ($this->txRollbackOnly) {
+                /*
+                 * 走到这里有两种可能：
+                 *   a) 外层自己失败（$failed = true）
+                 *   b) **内层失败但异常被业务吞掉了**
+                 *
+                 * b 是真正的坑：嵌套用"深度"而不是 SAVEPOINT，内层失败时整个事务
+                 * 已经没有正确的恢复路径。若照常 commit，内层之前成功的那半截
+                 * 会被一起提交——库脏了，而且不报错。
+                 *
+                 * 所以：内层失败即整个事务失败，commit 降级为 rollback 并抛出来。
+                 */
+                $this->txRollbackOnly = false;
                 try {
                     $pdo->rollBack();
                 } catch (\Throwable $ignored) {
                     // MySQL 里 DDL 会隐式提交事务，此时 rollBack 会报
-                    // 「There is no active transaction」。这不是本函数该关心的事，
-                    // 吞掉即可，但**不能让它跳过后面的 txDepth--**。
+                    // 「There is no active transaction」。吞掉即可，
+                    // 但**不能让它跳过后面的 txDepth--**。
                 }
+                if (!$failed) {
+                    $failed = true;     // 内层失败但异常被吞：没有原异常可抛
+                }
+            } else {
+                $pdo->commit();
             }
-            $this->txDepth--;
-            throw $e;
         }
-        // 必须放在 try 外：原来写在 try 里，commit() 一抛异常就跳过了这一句，
-        // txDepth 永久 +1，之后所有 transaction() 都不再 begin/commit ——
-        // 表现是「事务静默失效」，很难查。
+
         $this->txDepth--;
+
+        if ($failed) {
+            if ($err !== null) {
+                throw $err;     // 自己失败：原样抛，堆栈和原因都保留
+            }
+            // 内层失败且异常被吞：只能给一条补偿提示，说明"你以为提交了但没提交"
+            throw new \RuntimeException(
+                "db: 事务未提交——内层失败（异常已被吞掉），本次事务整体回滚"
+            );
+        }
     }
 
     public function inTransaction(): bool
