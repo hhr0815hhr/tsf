@@ -48,6 +48,64 @@ final class Context
     private object $target;
 
     /**
+     * 副作用能力：由宿主**显式**绑定，脚本只能通过这里"做事"。
+     *
+     * ## 为什么必须有这一层
+     *
+     * 原来的 Context 只能读写白名单字段——也就是脚本能改数字，但**发不了奖**。
+     * 而活动玩法要的正是"发奖"，于是热更只能停留在"调数值"，一到"做活动"就得重启。
+     * 这是热更能力上不去的真实原因，不是"没有脚本引擎"。
+     *
+     * ## 为什么未绑定就拒绝
+     *
+     * `reward(350, "daily")` 是脚本在**要求发钱**。如果宿主没明确授予这个能力，
+     * 静默成功等于"脚本能给自己发钱"，静默失败等于"活动悄悄不生效"——
+     * 两种都比抛异常糟。所以未绑定时抛错，让越权当场暴露。
+     *
+     * （`log` 是唯一例外：日志失败不该把活动逻辑打挂，见 log()）
+     */
+    private ?\Closure $onReward = null;
+
+    private ?\Closure $onLog = null;
+
+    /** 宿主授予"发奖"能力。`$fn(int $amount, string $reason): bool` */
+    public function bindReward(\Closure $fn): void
+    {
+        $this->onReward = $fn;
+    }
+
+    /** 宿主授予"记日志"能力。`$fn(string $msg): void` */
+    public function bindLog(\Closure $fn): void
+    {
+        $this->onLog = $fn;
+    }
+
+    /** 脚本申请发奖。返回 false 表示宿主拒绝（比如额度超限） */
+    public function reward(int $amount, string $reason): bool
+    {
+        $fn = $this->onReward;
+        if (!($fn instanceof \Closure)) {
+            throw new \RuntimeException("script: 没有发奖能力（宿主未 bindReward）");
+        }
+        $r = $fn($amount, $reason);
+        return $r === true;
+    }
+
+    public function canReward(): bool
+    {
+        return $this->onReward instanceof \Closure;
+    }
+
+    /** 脚本写日志。未绑定时静默丢弃——日志失败不该让玩法逻辑崩 */
+    public function log(string $msg): void
+    {
+        $fn = $this->onLog;
+        if ($fn instanceof \Closure) {
+            $fn($msg);
+        }
+    }
+
+    /**
      * @param object $target   业务对象（Player / Room 等）
      * @param list<string> $readable 允许读的字段
      * @param list<string> $writable 允许写的字段（必须是 readable 的子集）
