@@ -67,6 +67,9 @@ final class Context
     /** @var array<string, \Closure> 能力名 => 实现 */
     private array $caps = [];
 
+    /** 脚本私有状态（由 Script 在调用前挂上），见 State 的注释 */
+    private ?State $state = null;
+
     /**
      * 授予一项能力。
      *
@@ -86,6 +89,63 @@ final class Context
     public function bind(string $cap, \Closure $fn): void
     {
         $this->caps[$cap] = $fn;
+    }
+
+    /** 由 Script 注入；业务不用调 */
+    public function attachState(State $state): void
+    {
+        $this->state = $state;
+    }
+
+    public function stateInt(string $key, int $default = 0): int
+    {
+        $st = $this->state;
+        return $st === null ? $default : $st->getInt($key, $default);
+    }
+
+    public function setStateInt(string $key, int $value): void
+    {
+        $st = $this->state;
+        if ($st !== null) {
+            $st->setInt($key, $value);
+        }
+    }
+
+    public function addStateInt(string $key, int $delta): int
+    {
+        $st = $this->state;
+        if ($st === null) {
+            return $delta;
+        }
+        return $st->addInt($key, $delta);
+    }
+
+    public function stateString(string $key, string $default = ""): string
+    {
+        $st = $this->state;
+        return $st === null ? $default : $st->getString($key, $default);
+    }
+
+    public function setStateString(string $key, string $value): void
+    {
+        $st = $this->state;
+        if ($st !== null) {
+            $st->setString($key, $value);
+        }
+    }
+
+    public function stateBool(string $key, bool $default = false): bool
+    {
+        $st = $this->state;
+        return $st === null ? $default : $st->getBool($key, $default);
+    }
+
+    public function setStateBool(string $key, bool $value): void
+    {
+        $st = $this->state;
+        if ($st !== null) {
+            $st->setBool($key, $value);
+        }
     }
 
     public function can(string $cap): bool

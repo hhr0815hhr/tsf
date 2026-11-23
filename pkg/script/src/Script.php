@@ -46,9 +46,24 @@ final class Script
 
     private int $versions = 0;
 
+    /**
+     * 脚本私有状态。**reload 不会碰它**——这正是它存在的意义。
+     *
+     * 脚本里的 `static` 每次 require 都重置（换的是代码），而活动名单、累计计数
+     * 这些东西必须跨热更存活。所以状态放在这里，脚本通过 Context 读写。
+     */
+    private State $state;
+
     public function __construct(string $path)
     {
         $this->path = $path;
+        $this->state = new State();
+    }
+
+    /** 直接拿状态（宿主做落盘/落库时用） */
+    public function state(): State
+    {
+        return $this->state;
     }
 
     /** 首次加载。返回 false 表示文件不存在或加载失败。 */
@@ -117,6 +132,8 @@ final class Script
         //
         // zend_set_timeout 只支持秒级，所以这是"防永久卡死"的兜底而不是
         // "保证不卡顿"。传 0 表示不限制（只建议在信任源码时用）。
+        // 把脚本私有状态挂进去：业务侧不用管，脚本里 $ctx->stateInt(...) 就能用
+        $ctx->attachState($this->state);
         return \interp_invoke($target, $ctx, $timeoutMs);
     }
 
