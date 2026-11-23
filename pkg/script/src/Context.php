@@ -71,6 +71,26 @@ final class Context
     private ?State $state = null;
 
     /**
+     * 调用入参（脚本间调用时由宿主塞进来）。
+     *
+     * 为什么单独一个字段而不是复用 target 的字段：target 是"业务对象视图"
+     * （玩家/房间），入参是"这次调用传了什么"。混在一起会让脚本分不清
+     * "我读的是玩家金币，还是调用方传进来的数字"。
+     */
+    private string $arg = "";
+
+    /** 读调用入参 */
+    public function arg(): string
+    {
+        return $this->arg;
+    }
+
+    public function setArg(string $arg): void
+    {
+        $this->arg = $arg;
+    }
+
+    /**
      * 授予一项能力。
      *
      * 统一成"注册表"而不是一个个成员字段：脚本层的能力面是要持续长的
@@ -146,6 +166,27 @@ final class Context
         if ($st !== null) {
             $st->setBool($key, $value);
         }
+    }
+
+    /**
+     * 调用另一个脚本的入口。
+     *
+     * `$target` 是一个**逻辑名**（比如 "activity"、"mail"），解析成哪个脚本由宿主决定——
+     * 脚本不该知道文件路径，也不该能调用任意脚本（那样沙箱就形同虚设）。
+     *
+     * 递归由宿主兜底（层级上限 + 超时预算），这里不做判断。
+     */
+    public function callScript(string $target, string $entry, string $arg = ""): string|int|float|bool|null
+    {
+        if (!isset($this->caps["callScript"])) {
+            throw new \RuntimeException("script: 没有脚本间调用能力（宿主未 bind(\"callScript\")）");
+        }
+        $fn = $this->caps["callScript"];
+        $r = $fn($target, $entry, $arg);
+        if (is_bool($r) || is_int($r) || is_float($r) || is_string($r)) {
+            return $r;
+        }
+        return null;
     }
 
     public function can(string $cap): bool
@@ -261,9 +302,10 @@ final class Context
      * @param list<string> $readable 允许读的字段
      * @param list<string> $writable 允许写的字段（必须是 readable 的子集）
      */
-    public function __construct(object $target, array $readable, array $writable)
+    public function __construct(object $target, array $readable, array $writable, string $arg = "")
     {
         $this->target = $target;
+        $this->arg = $arg;
 
         foreach ($readable as $f) {
             $this->readable[(string) $f] = true;
