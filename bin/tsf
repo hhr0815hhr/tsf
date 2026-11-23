@@ -782,6 +782,8 @@ function verifySuites(): array
         ["id" => "docs", "desc" => "文档链接有效性（36 条）", "sh" => "scripts/check-doc-links.sh"],
         ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh", "needs" => ["python3"]],
         ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "tests/swoole-contract/run.sh"],
+        ["id" => "aoi", "desc" => "AOI 网格（36 项：边界/邻域对拍/规模）", "sh" => "tests/aoi-test/run.sh"],
+        ["id" => "frameloop", "desc" => "帧循环 delta（12 项：首帧/倒退/封顶）", "sh" => "tests/frameloop-test/run.sh"],
         ["id" => "settle", "desc" => "金币账本（115 项）", "sh" => "tests/settle-test/run.sh"],
         ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "tests/settle-crash/run.sh"],
         ["id" => "fd", "desc" => "fd/内存守卫（10 项）", "sh" => "tests/fd-test/run.sh"],

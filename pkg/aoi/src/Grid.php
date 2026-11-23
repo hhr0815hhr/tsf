@@ -273,6 +273,19 @@ final class Grid
      *
      * @return array<int, int> uid => uid（含自己，调用方自行排除）
      */
+    /**
+     * 取半径内的实体。
+     *
+     * **`$radius` 的单位是世界坐标，不是格数。** 内部按
+     * `intdiv(radius, cellSize) + 1` 换算成要扫的圈数。
+     *
+     * 这是个容易传错的参数：radius=1 时"坐标"和"格数"两种解释恰好都得到 k=1，
+     * 于是错误被掩盖；等 radius 变大（比如想做 5 格视野却传了 5）才暴露成
+     * "范围明显不对"。要按格数取，请用 `aroundOfKey($key, $k * $cellSize)`。
+     *
+     * 返回的是**超集**：格子是粗粒度的，半径内的实体保证都在，但可能多给几个。
+     * 精确距离判定由调用方做——这样 AOI 只负责筛除率，不负责最终裁决。
+     */
     public function around(int $uid, int $radius): array
     {
         if (!isset($this->cellOf[$uid])) {
@@ -287,7 +300,14 @@ final class Grid
         return $this->ringOfKey($key, $this->ringsFor($radius));
     }
 
-    /** 半径换算成要扫的圈数；独立成方法是为了让 around 与 aroundOfKey 口径一致 */
+    /**
+     * 半径（**世界坐标**）换算成要扫的圈数。
+     *
+     * 结果偏保守：radius 正好是 cellSize 整数倍时会多扫一圈
+     * （radius=100/cell=100 → k=2，实际 3 格就够）。这是刻意的——
+     * 宁可多扫几个格子，也不要因为少扫一个而漏判；一圈的代价是多遍历
+     * (2k+1)² 里的一层，而漏判的代价是"技能打不中明明在旁边的目标"。
+     */
     public function ringsFor(int $radius): int
     {
         if ($radius <= 0 || $this->cellSize <= 0) {
