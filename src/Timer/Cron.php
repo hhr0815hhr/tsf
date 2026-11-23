@@ -3,7 +3,10 @@
 namespace TSF\Timer;
 
 /**
- * 标准 5 字段 cron 解析：`分 时 日 月 周`。
+ * cron 解析：5 字段 `分 时 日 月 周`，或 6 字段 `秒 分 时 日 月 周`。
+ *
+ * 6 字段是给"每秒级"的调度用的（pkg/schedule 需要）。**5 字段走的是快路径**：
+ * `nextRun` 里秒层直接跳过（详见那里的注释），不会因为支持秒而变慢。
  *
  * 支持：`*`、`n`、`a-b`、`a-b/s`、`* /s`、逗号列表。
  * 不支持秒级、不支持 L/W/# 这类扩展——游戏服里 99% 的需求是"每天 5:00 重置"
@@ -18,6 +21,14 @@ final class Cron
 {
     /** 最多向后找 4 年（覆盖闰年 2 月 29 日这类表达式） */
     private const MAX_DAYS = 1461;
+
+    /**
+     * 秒掩码。默认只有第 0 秒——也就是"5 字段表达式"的语义。
+     *
+     * 单独存出来是为了让 `nextRun` 能判断"要不要进秒循环"：
+     * 值是 1 时整层循环都可以跳过，5 字段的性能因此和以前完全一致。
+     */
+    private int $secMask = 1;
 
     /** @var array<string, int> 分钟掩码（bit n = 第 n 分钟） */
     private int $minuteMask = 0;
@@ -58,24 +69,34 @@ final class Cron
     private function build(string $expr): void
     {
         $fields = preg_split('/\s+/', trim($expr));
-        if ($fields === false || count($fields) !== 5) {
-            throw new \RuntimeException("cron: 需要 5 个字段（分 时 日 月 周），收到 [" . $expr . "]");
+        if ($fields === false) {
+            throw new \RuntimeException("cron: 表达式为空 [" . $expr . "]");
+        }
+        $n = count($fields);
+        if ($n === 5) {
+            // 5 字段时补一个"秒=0"，后面按 6 字段统一处理
+            array_unshift($fields, "0");
+        } elseif ($n !== 6) {
+            throw new \RuntimeException(
+                "cron: 需要 5 或 6 个字段（分 时 日 月 周 / 秒 分 时 日 月 周），收到 [" . $expr . "]"
+            );
         }
 
-        $this->minuteMask = self::fieldMask($fields[0], 0, 59, "分", $expr);
-        $this->hourMask = self::fieldMask($fields[1], 0, 23, "时", $expr);
-        $this->domMask = self::fieldMask($fields[2], 1, 31, "日", $expr);
-        $this->monthMask = self::fieldMask($fields[3], 1, 12, "月", $expr);
+        $this->secMask = self::fieldMask($fields[0], 0, 59, "秒", $expr);
+        $this->minuteMask = self::fieldMask($fields[1], 0, 59, "分", $expr);
+        $this->hourMask = self::fieldMask($fields[2], 0, 23, "时", $expr);
+        $this->domMask = self::fieldMask($fields[3], 1, 31, "日", $expr);
+        $this->monthMask = self::fieldMask($fields[4], 1, 12, "月", $expr);
 
         // 星期允许 7 表示周日
-        $dowMask = self::fieldMask($fields[4], 0, 7, "周", $expr);
+        $dowMask = self::fieldMask($fields[5], 0, 7, "周", $expr);
         if (($dowMask & (1 << 7)) !== 0) {
             $dowMask = ($dowMask | 1) & ~(1 << 7);
         }
         $this->dowMask = $dowMask;
 
-        $this->domRestricted = $fields[2] !== "*";
-        $this->dowRestricted = $fields[4] !== "*";
+        $this->domRestricted = $fields[3] !== "*";
+        $this->dowRestricted = $fields[5] !== "*";
     }
 
     private static function fieldMask(string $field, int $min, int $max, string $label, string $expr): int
@@ -131,8 +152,15 @@ final class Cron
 
     private function nextRun(int $fromTs): int
     {
-        // 从"下一分钟边界"开始找：同一分钟内重复触发会死循环
-        $start = $fromTs - ($fromTs % 60) + 60;
+        // 起点：5 字段从"下一分钟边界"（同一分钟内重复触发会死循环）；
+        // 6 字段从"下一秒"，因为它本来就能秒级触发
+        if ($this->secMask === 1) {
+            $start = $fromTs - ($fromTs % 60) + 60;
+        } else {
+            $start = $fromTs + 1;
+        }
+        // 6 字段的起点可能不在整分钟上，日/时/分三层仍按整点推进，
+        // 靠最后的 `$ts >= $start` 把早于起点的候选跳过
         $bm = (int) date("n", $start);
         $bd = (int) date("j", $start);
         $by = (int) date("Y", $start);
@@ -162,14 +190,59 @@ final class Cron
                     if (($this->minuteMask & (1 << $m)) === 0) {
                         continue;
                     }
-                    $ts = $dayStart + $h * 3600 + $m * 60;
-                    if ($ts >= $start) {
-                        return $ts;
+                    $base = $dayStart + $h * 3600 + $m * 60;
+                    // 5 字段（secMask==1）：直接返回，不进秒循环。
+                    // 这一行是"支持秒但不让 5 字段变慢"的关键——nextRun 最坏要遍历
+                    // 1461 天 × 24 × 60，若在每格再加 60 次位运算就是 60 倍开销。
+                    if ($this->secMask === 1) {
+                        if ($base >= $start) {
+                            return $base;
+                        }
+                        continue;
+                    }
+                    for ($sec = 0; $sec < 60; $sec++) {
+                        if (($this->secMask & (1 << $sec)) === 0) {
+                            continue;
+                        }
+                        $ts = $base + $sec;
+                        if ($ts >= $start) {
+                            return $ts;
+                        }
                     }
                 }
             }
         }
         return 0;
+    }
+
+    /**
+     * 某个时刻是否匹配（精确到秒）。
+     *
+     * 与 `next()` 的关系：`matches(next(t))` 必为 true，且两者用的是同一套掩码
+     * 与同一套"日/周取或"规则——**不能各写一份**，否则会出现
+     * "算出来的时刻自己判定为不匹配"这种自相矛盾。
+     */
+    public function matches(int $ts): bool
+    {
+        if (($this->secMask & (1 << ((int) date("s", $ts)))) === 0) {
+            return false;
+        }
+        if (($this->minuteMask & (1 << ((int) date("i", $ts)))) === 0) {
+            return false;
+        }
+        if (($this->hourMask & (1 << ((int) date("G", $ts)))) === 0) {
+            return false;
+        }
+        if (($this->monthMask & (1 << ((int) date("n", $ts)))) === 0) {
+            return false;
+        }
+        return $this->dayMatches((int) date("j", $ts), (int) date("w", $ts));
+    }
+
+    /** 静态便捷：`Cron::match($expr, $ts)`，等价于 parse 后调 matches() */
+    public static function match(string $expr, int $ts): bool
+    {
+        return self::parse($expr)->matches($ts);
     }
 
     private function dayMatches(int $mday, int $dow): bool
@@ -193,7 +266,8 @@ final class Cron
     /** 便于日志/调试 */
     public function describe(): string
     {
-        return "min=0x" . dechex($this->minuteMask)
+        return "sec=0x" . dechex($this->secMask)
+            . " min=0x" . dechex($this->minuteMask)
             . " hour=0x" . dechex($this->hourMask)
             . " dom=0x" . dechex($this->domMask)
             . " mon=0x" . dechex($this->monthMask)

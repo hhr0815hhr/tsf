@@ -2,6 +2,8 @@
 
 namespace TSF\Schedule;
 
+use TSF\Timer\Cron;
+
 use TSF\Service\Message;
 use TSF\Service\Scheduler;
 use TSF\Service\Service;
@@ -80,7 +82,7 @@ final class Schedule extends Service
             if ($kind === self::KIND_CRON) {
                 $expr = (string) ($t["expr"] ?? "");
                 $last = (int) ($t["a"] ?? 0);
-                if ($last !== $now && Cron::matches($expr, $now)) {
+                if ($last !== $now && Cron::match($expr, $now)) {
                     $fire[] = $name;
                 }
                 continue;
@@ -179,9 +181,13 @@ final class Schedule extends Service
      */
     public function cron(string $name, string $expr, int $target, int $msgId, string|array|object $data = ""): void
     {
-        $f = Cron::parse($expr);
-        if ($f === []) {
-            throw new \RuntimeException("schedule: 非法 cron 表达式 [" . $expr . "]");
+        // 核心的 parse() 对非法表达式**抛异常**（包内旧版是返回空数组）。
+        // 这里统一成"注册时立刻报错"的语义——注册成功但永不触发，
+        // 在运营场景里是灾难（活动该开没开，且没有任何报错）。
+        try {
+            Cron::parse($expr);
+        } catch (\RuntimeException $e) {
+            throw new \RuntimeException("schedule: 非法 cron 表达式 [" . $expr . "]：" . $e->getMessage());
         }
         $this->tasks[$name] = [
             "kind" => self::KIND_CRON,
