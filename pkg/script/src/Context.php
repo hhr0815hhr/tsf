@@ -64,45 +64,136 @@ final class Context
      *
      * （`log` 是唯一例外：日志失败不该把活动逻辑打挂，见 log()）
      */
-    private ?\Closure $onReward = null;
+    /** @var array<string, \Closure> 能力名 => 实现 */
+    private array $caps = [];
 
-    private ?\Closure $onLog = null;
-
-    /** 宿主授予"发奖"能力。`$fn(int $amount, string $reason): bool` */
-    public function bindReward(\Closure $fn): void
+    /**
+     * 授予一项能力。
+     *
+     * 统一成"注册表"而不是一个个成员字段：脚本层的能力面是要持续长的
+     * （Lua 宿主会注册几十个 C 函数），每加一个就加一个属性会让这个类失控。
+     *
+     * 内置约定的名字：
+     *   reward : fn(int $amount, string $reason): bool
+     *   log    : fn(string $msg): void
+     *   timer  : fn(int $ms, string $entry): void
+     *   send   : fn(string $target, int $msgId, string $data): bool
+     *   config : fn(string $key): string
+     *
+     * 未授予的能力**调用即抛错**（log 例外）——静默成功等于脚本能越过宿主做决策，
+     * 静默失败等于活动悄悄不生效，两者都比报错难查。
+     */
+    public function bind(string $cap, \Closure $fn): void
     {
-        $this->onReward = $fn;
+        $this->caps[$cap] = $fn;
     }
 
-    /** 宿主授予"记日志"能力。`$fn(string $msg): void` */
+    public function can(string $cap): bool
+    {
+        return isset($this->caps[$cap]);
+    }
+
+    public function bindReward(\Closure $fn): void
+    {
+        $this->bind("reward", $fn);
+    }
+
     public function bindLog(\Closure $fn): void
     {
-        $this->onLog = $fn;
+        $this->bind("log", $fn);
     }
 
     /** 脚本申请发奖。返回 false 表示宿主拒绝（比如额度超限） */
     public function reward(int $amount, string $reason): bool
     {
-        $fn = $this->onReward;
-        if (!($fn instanceof \Closure)) {
+        if (!isset($this->caps["reward"])) {
             throw new \RuntimeException("script: 没有发奖能力（宿主未 bindReward）");
         }
+        $fn = $this->caps["reward"];
         $r = $fn($amount, $reason);
         return $r === true;
     }
 
     public function canReward(): bool
     {
-        return $this->onReward instanceof \Closure;
+        return isset($this->caps["reward"]);
     }
 
     /** 脚本写日志。未绑定时静默丢弃——日志失败不该让玩法逻辑崩 */
     public function log(string $msg): void
     {
-        $fn = $this->onLog;
-        if ($fn instanceof \Closure) {
+        if (isset($this->caps["log"])) {
+            $fn = $this->caps["log"];
             $fn($msg);
         }
+    }
+
+    /**
+     * 挂号一个后续回调：`$ms` 之后调用脚本里的 `$entry`。
+     *
+     * 这是"脚本能写玩法"的门槛之一。没有它，脚本只能处理"这一瞬间"的事，
+     * 任何"30 秒后结算""活动到点结束"都得改 AOT 代码——那就不是热更了。
+     *
+     * 宿主实现里通常是把 `(ms, entry)` 存起来，到点后回调用
+     * `$script->callWithContext($entry, $ctx)`。
+     */
+    public function timer(int $ms, string $entry): void
+    {
+        if (!isset($this->caps["timer"])) {
+            throw new \RuntimeException("script: 没有定时器能力（宿主未 bind(\"timer\")）");
+        }
+        $fn = $this->caps["timer"];
+        $fn($ms, $entry);
+    }
+
+    public function canTimer(): bool
+    {
+        return isset($this->caps["timer"]);
+    }
+
+    /**
+     * 给别处发一条消息（玩家、房间、或另一个服务）。
+     *
+     * `$target` 的解析由宿主决定（可以是 uid、"room:123"、服务名）。
+     * 框架不在这里做路由——脚本不该知道地址空间的细节。
+     */
+    public function send(string $target, int $msgId, string $data): bool
+    {
+        if (!isset($this->caps["send"])) {
+            throw new \RuntimeException("script: 没有发消息能力（宿主未 bind(\"send\")）");
+        }
+        $fn = $this->caps["send"];
+        $r = $fn($target, $msgId, $data);
+        return $r === true;
+    }
+
+    public function canSend(): bool
+    {
+        return isset($this->caps["send"]);
+    }
+
+    /**
+     * 读一项配置（活动参数、开关、价格表）。
+     *
+     * 为什么让脚本读配置而不是让宿主算好传进来：脚本要"改活动规则"时，
+     * 最常改的就是数值，而这些数值本来就在配置里。少一层搬运，少一处不一致。
+     */
+    public function config(string $key, string $default = ""): string
+    {
+        if (!isset($this->caps["config"])) {
+            return $default;
+        }
+        $fn = $this->caps["config"];
+        $v = $fn($key);
+        return is_string($v) ? $v : $default;
+    }
+
+    public function configInt(string $key, int $default = 0): int
+    {
+        // 复用 config()：闭包返回值类型不确定，先归成 string 再判数字，
+        // 避免 AOT 在"可能是 string 也可能是 int"上推断失败
+        $v = $this->config($key, "");
+        return is_numeric($v) ? (int) $v : $default;
     }
 
     /**
