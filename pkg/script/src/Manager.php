@@ -59,15 +59,64 @@ final class Manager
     }
 
     /** @return list<string> 本次重载的脚本名 */
+    /**
+     * 扫一遍所有脚本，有变更的重载。返回被重载的名字。
+     *
+     * ## 不建议放在帧循环/每秒定时器里
+     *
+     * 这是"检查有没有变"，每次都要对每个脚本做一次 `stat`。更重要的是**语义**：
+     * 自动重载意味着**改文件即刻生效**——生产环境上，任何人（或任何同步工具）
+     * 动一下脚本目录，线上逻辑就换了，没有确认、没有审计、出事也查不到是谁改的。
+     *
+     * 热更是个**受控动作**，推荐由 GM 命令触发（见 `demo/duel` 的
+     * `script.reload` 实现）：
+     *
+     *     $mgr->reload("quest");      // 指定一个，强制重载
+     *     $mgr->reloadAll();          // 全部强制重载
+     *
+     * 调试期确实想"改完就生效"，可以自己挂个低频定时器（比如 5s）并且
+     * **只在开发环境配置里开**——但别把它写成默认行为。
+     */
     public function watchAll(): array
     {
         $reloaded = [];
         foreach ($this->scripts as $name => $s) {
             if ($s->reloadIfChanged()) {
-                $reloaded[] = $name;
+                $reloaded[] = (string) $name;
             }
         }
         return $reloaded;
+    }
+
+    /**
+     * 按名强制重载（不看文件有没有变）。GM 命令走这里。
+     *
+     * 强制而不是 `reloadIfChanged`：运维点了"重载"就是要它重新读一遍，
+     * 哪怕 mtime 没变（比如从别的机器同步过来、或者 mtime 精度只到秒）。
+     */
+    public function reload(string $name): bool
+    {
+        $s = $this->scripts[$name] ?? null;
+        if (!$s instanceof Script) {
+            return false;
+        }
+        return $s->reload();
+    }
+
+    /**
+     * 全部强制重载。返回重载成功的名字（失败的会被跳过，不影响其它脚本）。
+     *
+     * @return array<int, string>
+     */
+    public function reloadAll(): array
+    {
+        $done = [];
+        foreach ($this->scripts as $name => $s) {
+            if ($s->reload()) {
+                $done[] = (string) $name;
+            }
+        }
+        return $done;
     }
 
     /** @return list<string> */

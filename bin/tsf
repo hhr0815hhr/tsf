@@ -162,6 +162,88 @@ function listPackages(string $tsfRoot): array
 }
 
 /**
+ * 交互式选包。**只在真终端里问**；CI / 管道 / nohup 直接返回空数组。
+ *
+ * 为什么要有交互：`tsf new` 出来的工程默认一个可选包都不开，而"要开哪些"
+ * 恰恰是建工程时最清楚、最该一次说清的事。等写到一半发现要 db，再去翻
+ * project.json 加一行、还要记得依赖（mail 要 db、registry 要 handoff、
+ * room 要 fsm+frameloop）——这些都是可以避免的来回。
+ *
+ * 依赖不用用户操心：project.json 只记"显式启用的"，构建时由 resolvePackages()
+ * 补全 requires。所以这里选 room 就只写 room。
+ *
+ * @return array<int, string>
+ */
+function promptPackages(string $tsfRoot): array
+{
+    $all = listPackages($tsfRoot);
+    if ($all === []) {
+        return [];
+    }
+
+    // 非终端不问：`tsf new x < /dev/null`、CI、`| tee` 都会让 fgets 立刻返回 false，
+    // 与其读到一个空行"静默不选"，不如明确按"非交互 = 不启用"处理
+    $tty = false;
+    if (function_exists("stream_isatty")) {
+        $tty = stream_isatty(STDIN);
+    } elseif (function_exists("posix_isatty")) {
+        $tty = posix_isatty(STDIN);
+    }
+    if (!$tty) {
+        return [];
+    }
+
+    $names = array_values(array_keys($all));
+    $n = count($names);
+
+    say("");
+    say("要启用哪些可选功能？（直接回车 = 都不用；以后改 project.json 也能加）");
+    say("");
+    for ($i = 0; $i < $n; $i++) {
+        $name = (string) $names[$i];
+        $desc = isset($all[$name]["desc"]) ? (string) $all[$name]["desc"] : "";
+        $req = "";
+        if (isset($all[$name]["requires"]) && is_array($all[$name]["requires"]) && $all[$name]["requires"] !== []) {
+            $req = "  [自动带上 " . implode(",", $all[$name]["requires"]) . "]";
+        }
+        say("  " . str_pad((string) ($i + 1), 2, " ", STR_PAD_LEFT) . ") "
+            . str_pad($name, 11) . $desc . $req);
+    }
+    say("");
+    say("  输入编号（逗号或空格分隔，如 1,5,9），回车跳过 > ");
+
+    $line = fgets(STDIN);
+    if (!is_string($line)) {
+        return [];
+    }
+    $line = trim($line);
+    if ($line === "") {
+        return [];
+    }
+
+    $picked = [];
+    $tokens = preg_split('/[\s,]+/', $line);
+    if (!is_array($tokens)) {
+        return [];
+    }
+    foreach ($tokens as $t) {
+        if (!is_string($t) || $t === "" || !ctype_digit($t)) {
+            continue;
+        }
+        $idx = (int) $t - 1;
+        if ($idx < 0 || $idx >= $n) {
+            continue;   // 越界就忽略，不打断整个流程
+        }
+        $picked[] = (string) $names[$idx];
+    }
+    $picked = array_values(array_unique($picked));
+    if ($picked !== []) {
+        say("  已选: " . implode(", ", $picked));
+    }
+    return $picked;
+}
+
+/**
  * 展开包的依赖闭包，返回按发现顺序排好的包名列表。
  *
  * project.json 只记"用户显式启用的包"，构建时在这里补齐 requires——
@@ -1992,7 +2074,9 @@ switch ($cmd) {
             }
         }
         if ($name === "") {
-            fail("用法: tsf new <name> [--login]    （名字写 . 表示在当前目录生成）");
+            fail("用法: tsf new <name> [--login] [--packages=db,room | --no-packages]\n"
+                . "        （名字写 . 表示在当前目录生成）\n"
+                . "        不带 --packages/--no-packages 且在终端里运行时，会交互让你选可选功能");
         }
         $isLogin = in_array("--login", $argvv, true);
 
@@ -2023,8 +2107,37 @@ switch ($cmd) {
         ensureDir($projDir . "/var/log");
 
 
-        // 构建清单：声明这个工程要用哪些可选功能包（默认一个都不用）
-        writeProjectJson($projDir, ["name" => $arg, "packages" => []]);
+        // 构建清单：声明这个工程要用哪些可选功能包。
+        //
+        // 三种给法，按优先级：--packages=a,b > --no-packages > 终端交互。
+        // 交互只在真终端发生，CI 里不加参数就是"一个都不用"，不会卡住。
+        $pickedPackages = [];
+        $pkgArg = "";
+        $noPkg = false;
+        foreach ($argvv as $a) {
+            if (strpos($a, "--packages=") === 0) {
+                $pkgArg = substr($a, strlen("--packages="));
+            } elseif ($a === "--no-packages") {
+                $noPkg = true;
+            }
+        }
+        if ($pkgArg !== "") {
+            $known = listPackages($tsfRoot);
+            foreach (explode(",", $pkgArg) as $one) {
+                $one = trim($one);
+                if ($one === "") {
+                    continue;
+                }
+                if (!isset($known[$one])) {
+                    fail("未知的包 [" . $one . "]，可用包见 `tsf list`");
+                }
+                $pickedPackages[] = $one;
+            }
+            $pickedPackages = array_values(array_unique($pickedPackages));
+        } elseif (!$noPkg) {
+            $pickedPackages = promptPackages($tsfRoot);
+        }
+        writeProjectJson($projDir, ["name" => $arg, "packages" => $pickedPackages]);
 
         $cfg = [
             "app" => ["name" => $arg],
@@ -2473,7 +2586,8 @@ switch ($cmd) {
         say("TSF " . TSF_VERSION);
         say("");
         say("用法:");
-        say("  tsf new <name>      新建工程");
+        say("  tsf new <name>      新建工程（终端里会交互选可选功能包）");
+        say("                      --packages=db,room 指定包 / --no-packages 全不启用");
         say("  tsf build [dir]     编译");
         say("  tsf migrate [dir]   跑数据库迁移（部署时执行一次，跑完退出）");
         say("  tsf migrate-status  只看迁移状态，不写库");
