@@ -38,7 +38,41 @@ abstract class Server
     protected $onConnect = null;
 
     /** @var callable|null */
-    protected $onFrame = null;
+    /**
+     * 帧回调。**类型必须是 `\Closure` 而不是无类型/callable**。
+     *
+     * AOT 下无类型属性是"任意值"，每次调用都要走通用 callable 解析（装箱参数、
+     * 查可调用性）；声明成 Closure 后编译器能直接调 `__invoke`。
+     * 这是每帧都要跑一次的路径，差别在微秒级。
+     */
+    protected ?\Closure $onFrame = null;
+
+    /**
+     * 批量发送：把一次 `feed()` 内产生的回包按连接合并，最后一次性写出。
+     *
+     * 为什么需要：pipeline 下客户端一次灌 64 帧，服务端逐帧回调、逐帧 `send`，
+     * 就是 64 次 syscall + 64 次内核缓冲进出。而 Swoole 原生 echo 能跑到 196 万/s、
+     * TSF 只有 15 万/s，差距不在计算，在"每帧一次写"这个模型上。
+     *
+     * 合并之后：一次 feed 内同一个 fd 的所有回包拼成一个 buffer，一次 `send` 写出。
+     * 批内延迟最多多等"这一批处理完"（微秒级），换来 syscall 数量按批摊薄。
+     *
+     * 默认关：closed-loop 场景（一问一答）本来就只有一帧，开了没有收益，
+     * 反而多一次数组拼接。
+     */
+    protected bool $batchSend = false;
+
+    /** @var array<int, string> fd => 本批待发字节 */
+    protected array $pending = [];
+
+    /**
+     * 是否正在 `feed()` 内。
+     *
+     * 批量模式**只在 feed 内生效**：feed 之外（定时器广播、onConnect 回包、
+     * 跨服务转发）没有"批"的概念，如果也进 pending 就永远等不到 flush，
+     * 消息会**静默不发**——这是比慢更严重的问题，所以必须显式区分。
+     */
+    protected bool $inFeed = false;
 
     /**
      * 是否为每个客户端帧建立一条链路（默认关）。
@@ -51,6 +85,61 @@ abstract class Server
      * 都自然带上这条链路，一路到 eventlog 记账——不需要改任何业务代码。
      */
     protected bool $traceFrames = false;
+
+    /**
+     * 分帧采样计时（默认关）。
+     *
+     * 为什么要这个：pipeline 下 TSF 每帧 6.5 µs，Swoole 原生 echo 0.51 µs。
+     * 差值里能算出来的只有 decode + encode 约 0.8 µs，剩下 ~4 µs 不知道在哪。
+     * **在不知道分布之前选优化方案就是赌**，所以先把每段的真实占比测出来。
+     *
+     * 关闭时只有一次静态布尔判断（约 1 ns），不影响生产。
+     * 开启时每帧多两次 `hrtime`（约 100 ns），只用于定位，不用于发布。
+     */
+    protected static bool $prof = false;
+
+    protected static float $profDecodeNs = 0.0;
+
+    protected static float $profCallNs = 0.0;
+
+    protected static float $profSubstrNs = 0.0;
+
+    protected static float $profLoopNs = 0.0;
+
+    protected static int $profFrames = 0;
+
+    public static function setProfile(bool $on): void
+    {
+        self::$prof = $on;
+        self::$profDecodeNs = 0.0;
+        self::$profCallNs = 0.0;
+        self::$profSubstrNs = 0.0;
+        self::$profLoopNs = 0.0;
+        self::$profFrames = 0;
+    }
+
+    /**
+     * 取一份快照并清零（按窗口统计，避免把启动阶段算进去）。
+     *
+     * @return array{n: int, decode_ns: float, call_ns: float, total_ns: float}
+     */
+    public static function profileSnapshot(): array
+    {
+        $n = self::$profFrames;
+        $out = [
+            "n" => $n,
+            "decode_ns" => $n > 0 ? self::$profDecodeNs / $n : 0.0,
+            "substr_ns" => $n > 0 ? self::$profSubstrNs / $n : 0.0,
+            "call_ns" => $n > 0 ? self::$profCallNs / $n : 0.0,
+            "total_ns" => $n > 0 ? self::$profLoopNs / $n : 0.0,
+        ];
+        self::$profDecodeNs = 0.0;
+        self::$profSubstrNs = 0.0;
+        self::$profCallNs = 0.0;
+        self::$profLoopNs = 0.0;
+        self::$profFrames = 0;
+        return $out;
+    }
 
     /** @var callable|null */
     protected $onClose = null;
@@ -89,7 +178,7 @@ abstract class Server
         $this->traceFrames = $on;
     }
 
-    public function onFrame(callable $cb): void
+    public function onFrame(\Closure $cb): void
     {
         $this->onFrame = $cb;
     }
@@ -333,10 +422,45 @@ abstract class Server
 
     abstract protected function closeConn(int $fd): void;
 
-    /** 编码并发送一帧 */
+    /** 打开批量发送（见 $batchSend 注释） */
+    public function enableBatchSend(bool $on = true): void
+    {
+        $this->batchSend = $on;
+    }
+
+    /**
+     * 编码并发送一帧。
+     *
+     * 批量模式下只累积不发送，由 `feed()` 结束前的 `flushBatch()` 统一写出。
+     * 调用方语义不变（仍返回 bool），所以业务代码零改动。
+     */
     public function sendFrame(int $fd, int $msgId, string $body, int $flags = 0): bool
     {
-        return $this->sendRaw($fd, $this->frame->encode($msgId, $body, $flags));
+        $frame = $this->frame->encode($msgId, $body, $flags);
+        if ($this->batchSend && $this->inFeed) {
+            if (isset($this->pending[$fd])) {
+                $this->pending[$fd] .= $frame;
+            } else {
+                $this->pending[$fd] = $frame;
+            }
+            return true;
+        }
+        return $this->sendRaw($fd, $frame);
+    }
+
+    /** 把累积的回包按连接一次写出 */
+    protected function flushBatch(): void
+    {
+        if ($this->pending === []) {
+            return;
+        }
+        // 不复制数组再清空：那次复制在大批处理时是实打实的开销
+        foreach ($this->pending as $fd => $buf) {
+            // 写失败不回退：TCP 流已经不可靠，回退会让调用方以为没发过，
+            // 而实际上可能有半帧落地。丢连接由上层 close 处理。
+            $this->sendRaw((int) $fd, $buf);
+        }
+        $this->pending = [];
     }
 
     public function close(int $fd): void
@@ -355,11 +479,30 @@ abstract class Server
      */
     protected function feed(int $fd, string $data): void
     {
+        $prof = self::$prof;
+        $tFeed = $prof ? hrtime(true) : 0;
+
+        // 自愈：上一次 `onFrame` 抛异常会让 inFeed 停在 true。
+        // 如果不管，**之后所有 sendFrame 都进 pending 且永不 flush**——
+        // 现象是"服务还在跑，但再也发不出消息"，比崩溃难查得多。
+        //
+        // 为什么不在热路径包 try/catch：实测每次进 try 装异常上下文约 300ns/帧，
+        // 在这个函数里是 4–5% 的吞吐。改成"下一次进来先收拾上一次"既为零成本，
+        // 窗口也只有一次 tick 那么长。
+        if ($this->inFeed) {
+            $this->inFeed = false;
+            if ($this->batchSend) {
+                $this->flushBatch();
+            }
+        }
+
         $buf = ($this->buffers[$fd] ?? "") . $data;
 
+        $this->inFeed = true;
         $guard = 0;
         while (true) {
             $frame = null;
+            $tDecode = $prof ? hrtime(true) : 0;
             try {
                 // FrameCodec::decode 返回 DecodedFrame，数据不足返回 null。
                 // 消费长度由返回值携带，不用引用参数——AOT 下闭包/动态调用的引用参数
@@ -368,6 +511,10 @@ abstract class Server
             } catch (\RuntimeException $e) {
                 Logger::warn("bad frame, closing conn", ["fd" => $fd, "err" => $e->getMessage()]);
                 $this->buffers[$fd] = "";
+                $this->inFeed = false;
+                if ($this->batchSend) {
+                    $this->flushBatch();   // 已产生的回包别丢
+                }
                 $this->closeConn($fd);
                 return;
             }
@@ -375,7 +522,18 @@ abstract class Server
             if ($frame === null) {
                 break;
             }
+            if ($prof) {
+                $now = hrtime(true);
+                self::$profDecodeNs += $now - $tDecode;
+                $tDecode = $now;
+            }
+            $tSub = $prof ? hrtime(true) : 0;
             $buf = substr($buf, $frame->consumed);
+            if ($prof) {
+                $now = hrtime(true);
+                self::$profSubstrNs += $now - $tSub;
+                $tDecode = $now;      // 后面 call 段从 substr 结束开始算
+            }
 
             if ($this->onFrame !== null) {
                 if ($this->traceFrames) {
@@ -386,6 +544,13 @@ abstract class Server
                 $cb = $this->onFrame;
                 $cb($fd, $frame->msgId, $frame->body, $frame->flags);
             }
+            if ($prof) {
+                $now = hrtime(true);
+                self::$profCallNs += $now - $tDecode;
+                self::$profFrames++;
+                self::$profLoopNs += $now - $tFeed;
+                $tFeed = $now;
+            }
 
             $guard++;
             if ($guard > 1000) {
@@ -394,6 +559,10 @@ abstract class Server
             }
         }
         $this->buffers[$fd] = $buf;
+        $this->inFeed = false;
+        if ($this->batchSend) {
+            $this->flushBatch();
+        }
     }
 
     protected function attached(int $fd): void

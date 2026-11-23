@@ -100,6 +100,14 @@ final class TcpServer extends Server
 
     protected function closeConn(int $fd): void
     {
+        // 关连接前把本批还没写出的回包冲掉：
+        // 业务常见写法是"回一个错误包然后断开"，批量模式下那个包还在 pending 里，
+        // 直接关就等于**最后一条消息永远收不到**。
+        if ($this->batchSend && isset($this->pending[$fd])) {
+            $buf = $this->pending[$fd];
+            unset($this->pending[$fd]);
+            $this->sendRaw($fd, $buf);
+        }
         if ($this->server !== null) {
             $this->server->close($fd);
         }
