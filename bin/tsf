@@ -1206,6 +1206,116 @@ function verifyRun(string $root, array $argv): int
     return $fail === 0 ? 0 : 1;
 }
 
+
+/**
+ * 编译失败时的"怎么改"提示。
+ *
+ * ## 为什么需要这个
+ *
+ * AOT 的报错和普通 PHP 完全不同：一个在 PHP 里完全合法的写法（同一个变量名先后
+ * 装字符串和数组元素），在 AOT 里是编译错误；而错误文本是编译器内部类型名
+ * （`php::Str` / `php::Var`），新人看不懂"这跟我写的代码有什么关系"。
+ *
+ * 实测：我自己一天里被三种错误卡住，每次都要翻附录的 13 条红线才知道怎么改。
+ * 如果每次都要翻文档，那"上手成本高"就是必然的。
+ *
+ * 所以：从输出里**提炼关键错误**（不让人在几十行日志里找），再按已知模式补一条
+ * `hint:`。不试图覆盖所有错误——只覆盖那些"看过一次就懂、但第一次必踩"的。
+ */
+
+/** @return list<array{0: string, 1: string}> 每项：[匹配用的子串, 提示文本] */
+function aotHints(): array
+{
+    return [
+        [
+            "Cannot assign value to variable",
+            "同一个变量先后承担了两种类型。AOT 在编译期就确定变量的类型，不能像 PHP 那样动态变。\n"
+            . "    改法：换个变量名（推荐），或在首次赋值处就保证类型一致。\n"
+            . "    典型来源：循环里先 `\$k = \"prefix\" . \$i;`，后面又 `foreach (\$list as \$k)`。",
+        ],
+        [
+            "is undefined in",
+            "变量在使用前没有被赋值。AOT 不做「可能未定义」的容忍——它要求控制流上确定有值。\n"
+            . "    改法：把赋值提到使用之前；分支里赋值的，给一个初始值。",
+        ],
+        [
+            "is not captured",
+            "闭包用了外部变量但没写进 `use (...)`。AOT 比 PHP 严格：漏了就是编译错误而不是运行时 null。\n"
+            . "    改法：把变量加进 `use (...)`；需要写的加 `&`。",
+        ],
+        [
+            "Cannot re-assign typed object",
+            "同一个变量先后指向了不同类型的对象（比如 if/else 里分别 new A 和 new B）。\n"
+            . "    改法：用工厂函数返回统一类型（`ServerFactory::make()` 就是这个用途）。",
+        ],
+        [
+            "must not contain mixed",
+            "框架禁止 `mixed` 类型声明（见指南 08）。AOT 下 mixed 会让所有下游推断失效。\n"
+            . "    改法：用联合类型（`string|array|object`）或明确的接口类型。",
+        ],
+        [
+            "undefined reference to",
+            "链接阶段找不到符号。常见原因：用到的扩展（如 ext/interp、ext/codec）没有参与编译。\n"
+            . "    改法：检查 project.yml 的 `ext:` 段；必要时删掉 build-dir 重编。",
+        ],
+        [
+            "All execution code must be within a function",
+            "AOT 不允许顶层执行代码（普通 PHP 可以）。\n"
+            . "    改法：把逻辑放进函数/`main()`，由框架的入口约定调用，不要在文件顶层直接写语句。",
+        ],
+        [
+            "project.yml",
+            "找不到 project.yml。通常是工作目录不对（从仓库根调用子工程）。\n"
+            . "    改法：`tsf build <工程目录>`，不要在父目录直接跑。",
+        ],
+    ];
+}
+
+/**
+ * 提炼失败输出里最关键的几行，并附上修法。
+ *
+ * 只挑 `Fatal error` / `error:` 开头的行：tpc 的其余输出是进度和缓存命中信息，
+ * 混在一起会把真正的错误埋掉（实测一次失败能刷 30+ 行）。
+ */
+function explainBuildFailure(string $out): void
+{
+    $key = [];
+    foreach (explode("\n", $out) as $line) {
+        $t = trim($line);
+        if ($t === "") {
+            continue;
+        }
+        if (stripos($t, "Fatal error:") === 0 || stripos($t, "error:") === 0 || strpos($t, "Compilation failed for:") !== false) {
+            $key[] = $t;
+        }
+    }
+    if ($key === []) {
+        return;
+    }
+
+    say("");
+    say(c("  关键错误：", "r"));
+    $shown = 0;
+    $matched = [];
+    foreach ($key as $line) {
+        if ($shown >= 5) {
+            say(c("  …（还有更多，见上方完整输出）", "d"));
+            break;
+        }
+        say("  " . $line);
+        $shown++;
+        foreach (aotHints() as $h) {
+            if (strpos($line, $h[0]) !== false && !isset($matched[$h[0]])) {
+                $matched[$h[0]] = true;
+                say("");
+                say(c("  hint: ", "y") . $h[1]);
+            }
+        }
+    }
+    say("");
+    say(c("  类型相关的完整规则：docs/guide/08-aot-types.md", "d"));
+}
+
 function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin): int
 {
     if (!is_dir($projDir)) {
@@ -1230,6 +1340,7 @@ function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin):
     // 而 PHP→C++ 转换阶段的失败（`Fatal error: The variable $a is undefined ...`）
     // 本来就打得很清楚，重试只会把同样的错误打第二遍，白等一次编译。
     if (strpos($r["out"], "Compilation failed for:") === false) {
+        explainBuildFailure($r["out"]);
         return $r["rc"];
     }
 
@@ -1240,7 +1351,11 @@ function doBuild(string $projDir, string $tsfRoot, string $tpc, string $phpBin):
     say(c("  （已成功的文件走增量缓存，只重编出错的）", "d"));
     say("");
     $cmd2 = $phpBin . " " . escapeshellarg($tpc) . " project.yml -j 1";
-    return runCmd($cmd2, $projDir);
+    $r2 = runCmdCapture($cmd2, $projDir);
+    if ($r2["rc"] !== 0) {
+        explainBuildFailure($r2["out"]);
+    }
+    return $r2["rc"];
 }
 
 function findBinary(string $projDir): string
