@@ -78,10 +78,46 @@ final class Bootstrap
         }
     }
 
-    /** 统一退出：记录原因后以非 0 退出，避免"静默死掉" */
+    /**
+     * 统一退出：记录原因后以**非 0** 退出，避免"静默死掉"。
+     *
+     * ## 为什么不是 exit(1)
+     *
+     * **AOT 产物里 `exit(n)` 的参数会被忽略，退出码恒为 0**（实测 exit(1)/exit(3)/
+     * exit(77) 全部得到 0）。于是 supervisor / k8s 看到的是"正常退出"——
+     * 不重启、不告警、不进 crash loop。这正是本方法要避免的"静默死掉"，
+     * 而只用 exit(1) 的话，它自己就成了静默死掉。
+     *
+     * 改用信号：SIGKILL 让退出码变成 137，监控侧能识别为异常。
+     * 日志不会丢——`Logger` 是即时的 file_put_contents(FILE_APPEND)，
+     * 调用 logger 时已经落盘，不依赖析构。
+     */
     public static function fatal(string $reason, array $ctx = []): void
     {
         Logger::error("fatal: " . $reason, $ctx);
-        exit(1);
+        self::exitWith(1);
+    }
+
+    /**
+     * 以指定退出码结束进程——**AOT 下必须走这里，不要直接 exit(n)**。
+     *
+     * 实测（TypePHP 0.9.x）：`exit(1)` / `exit(3)` / `exit(77)` 编译出来的产物
+     * 退出码**全部是 0**，参数被忽略。受影响的是所有"靠退出码传递结果"的地方：
+     *
+     * | 场景 | 只用 exit(n) 的后果 |
+     * |:--|:--|
+     * | `Bootstrap::fatal()` | supervisor/k8s 认为正常退出 → 不重启、不告警 |
+     * | `migrate`（部署脚本） | 迁移失败也返回 0 → 脚本继续启动没迁完的服务 |
+     * | 测试的 SKIP/FAIL | 全部变成 PASS |
+     *
+     * 非 0 时用 SIGKILL 把退出码变成 137，监控侧能识别。日志不会丢——
+     * `Logger` 是即时 file_put_contents(FILE_APPEND)，调用时已落盘。
+     */
+    public static function exitWith(int $code): void
+    {
+        if ($code !== 0 && function_exists("posix_kill")) {
+            posix_kill((int) getmypid(), 9);
+        }
+        exit($code);
     }
 }

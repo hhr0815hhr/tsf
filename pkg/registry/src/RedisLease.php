@@ -84,10 +84,20 @@ final class RedisLease implements Lease
         return is_int($out) && $out > 0;
     }
 
+    /**
+     * 释放。返回 true 只代表"**我确实释放了**"。
+     *
+     * Lua 脚本已经把"值是我的才删"保证住了，但脚本返回 0 表示**值不是我的**
+     * （租约已过期、或被别人拿走）——这种情况下什么都没删。
+     *
+     * 原来写的是 `return is_int($out)`，于是 0 也返回 true。后果是调用方
+     * 以为"我释放了"，接着去做善后（通知别的节点接管、删本地状态），
+     * 而实际上它早就不是 owner 了。和 `renew()` 的判断口径保持一致。
+     */
     public function release(string $key): bool
     {
         $out = $this->r->cmd("EVAL", self::LUA_RELEASE, "1", $this->key($key), $this->token);
-        return is_int($out);
+        return is_int($out) && $out > 0;
     }
 
     /** 本地视角：直接问 Redis 这个 key 现在是不是我的 */

@@ -2328,8 +2328,15 @@ switch ($cmd) {
             fail("编译成功但找不到可执行文件");
         }
         ok("执行 " . basename($binPath) . " migrate");
-        $rc = runCmd(escapeshellarg($binPath) . " migrate", $projDir);
-        exit($rc);
+        // 双重判定：退出码 + 输出里的失败计数。
+        // 只看退出码不够——AOT 产物的 exit(n) 恒为 0（见 Bootstrap::exitWith），
+        // 项目里若有人直接写了 exit($code)，迁移失败会被这里当成成功。
+        $mr = runCmdCapture(escapeshellarg($binPath) . " migrate", $projDir);
+        $migFail = preg_match('/失败\s*[1-9][0-9]*\s*个/u', $mr["out"]) === 1;
+        if ($mr["rc"] !== 0 || $migFail) {
+            fail("迁移失败（退出码 " . $mr["rc"] . ($migFail ? "，输出里有失败计数" : "") . "）");
+        }
+        exit(0);
         break;
 
     case "migrate-status":
