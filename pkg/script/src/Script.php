@@ -105,13 +105,19 @@ final class Script
      * 和 call() 的区别：call() 直接传业务对象（脚本有全部权限），
      * callWithContext() 传 Context（只能按白名单读写）。
      */
-    public function callWithContext(string $name, Context $ctx): array|object|string|int|float|bool|null
+    public function callWithContext(string $name, Context $ctx, int $timeoutMs = 1000): array|object|string|int|float|bool|null
     {
         $target = $this->resolve($name);
         if ($target === null) {
             return null;
         }
-        return \interp_invoke($target, $ctx);
+        // 默认 1 秒执行预算：脚本是热更进来的，运营也可能改。
+        // 一个写错的 while 就能把整个 worker 卡死（Coroutine::cancel 打不断
+        // 纯 CPU 循环，§29 实测），而且卡住期间所有玩家一起掉。
+        //
+        // zend_set_timeout 只支持秒级，所以这是"防永久卡死"的兜底而不是
+        // "保证不卡顿"。传 0 表示不限制（只建议在信任源码时用）。
+        return \interp_invoke($target, $ctx, $timeoutMs);
     }
 
     /**
