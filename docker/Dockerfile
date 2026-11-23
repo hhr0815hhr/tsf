@@ -3,8 +3,9 @@
 # ## 为什么需要它
 #
 # 跑 tsf 要凑一套并不轻松的环境：PHP 8.5 **ZTS**（还要 `--enable-embed` 出 libphp.so）、
-# swoole 开 `--enable-swoole-thread`、phpredis（ZTS 版 .so）、typephp 编译器（42MB 工具链包）、
-# phpx（要 cmake 现编）、外加 g++ 和 libmpfr。手工装一轮通常 30 分钟起，还容易漏掉某个 `-dev`。
+# swoole 开 `--enable-swoole-thread`、phpredis（ZTS 版 .so）、zip（composer 装包必需）、
+# typephp 编译器（42MB 工具链包）、phpx（要 cmake 现编）、外加 g++ 和 libmpfr。
+# 手工装一轮通常 30 分钟起，还容易漏掉某个 `-dev`。
 #
 # ## 用法
 #
@@ -161,6 +162,26 @@ RUN set -eux; \
     cmake --build build -j"$(nproc)"; \
     test -f lib/libphpx.so
 
+# --- zip 扩展（composer 的 ZipDownloader 必需）---
+# 没有它 `composer require` 直接失败：
+#   The zip extension and unzip/7z commands are both missing
+# 而 composer 是镜像里装依赖的唯一入口，所以这不是"可选扩展"。
+#
+# 为什么是**单独一层**、而不是把 `--with-zip` 加进上面 PHP 的 ./configure：
+# 加进去会作废 PHP 编译层（约 8 分钟），而这里只需要 20 秒。
+# 代价是 PHP 的 configure 选项与最终扩展清单不再一一对应，故留此注释 + 断言。
+# 依赖都已就绪：builder 的 apt 列表里有 libzip-dev，PHP 源码树在 /src/php-8.5.12。
+# ext/zip 不依赖 PHP 内部私有头（不像 pdo_pgsql），在源码树里 phpize 即可。
+RUN set -eux; \
+    cd "/src/php-${PHP_VERSION}/ext/zip"; \
+    "${PHP_PREFIX}/bin/phpize"; \
+    ./configure --with-php-config="${PHP_PREFIX}/bin/php-config" --with-zip; \
+    make -j"$(nproc)"; \
+    make install; \
+    echo "extension=zip.so" >> "${PHP_PREFIX}/lib/php.ini"; \
+    "${PHP_PREFIX}/bin/php" -m | grep -qix zip && echo "zip loaded"; \
+    "${PHP_PREFIX}/bin/php" -r 'exit(class_exists("ZipArchive") ? 0 : 1);' && echo "ZipArchive ok"
+
 # 用字面路径而不是 $HOME：Dockerfile 的 ENV 里 $HOME 不一定有值（取决于基础镜像），
 # 展开成空串的话 TPC 会变成 /typephp/bin/tpc.php，直到 `tsf build` 才报错。
 ENV TPC=/root/.tsf/toolchain/typephp/bin/tpc.php \
@@ -183,9 +204,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TPC=/root/.tsf/toolchain/typephp/bin/tpc.php \
     TSF_PHP=php85
 
-# 运行期依赖：libmpfr / libgmp（phpx 链了）、libssl / libcurl / libxml2 / sqlite
+# 运行期依赖：libmpfr / libgmp（phpx 链了）、libssl / libcurl / libxml2 / sqlite、
+# libzip4（zip.so 链了它 —— 少了它 `php -m` 里 zip 直接不出现）
 # 另外保留 build-essential + cmake —— 这个镜像同时要能 `tsf build`，
 # 见文件顶部「为什么不做多阶段瘦身」。
+# unzip 是 composer 的兜底解压器：zip 扩展在时用不到，但它只要 200KB，
+# 留着可以少一类"扩展又出问题就彻底卡死"的故障模式。
 #
 # 注意：注释不能写在 RUN 的行继续（`\` 换行）里面，shell 会把它当参数传给 apt-get。
 RUN if [ -n "$APT_MIRROR" ]; then \
@@ -196,9 +220,9 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update && \
     apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -y --no-install-recommends \
         libmpfr6 libgmp10 libssl3 libcurl4 libxml2 libsqlite3-0 libonig5 \
-        libstdc++6 ca-certificates \
+        libzip4 libstdc++6 ca-certificates \
         libgmp-dev libmpfr-dev \
-        curl xz-utils \
+        curl xz-utils unzip \
         build-essential cmake \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb /tmp/*
@@ -212,8 +236,9 @@ RUN ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php85 \
  && ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qi swoole \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qix redis \
- && /usr/local/php-8.5-zts/bin/php -r 'exit(class_exists("Redis") ? 0 : 1);' \
- && echo "swoole ok / redis ok"
+ && /usr/local/php-8.5-zts/bin/php -m | grep -qix zip \
+ && /usr/local/php-8.5-zts/bin/php -r 'exit(class_exists("Redis") && class_exists("ZipArchive") ? 0 : 1);' \
+ && echo "swoole ok / redis ok / zip ok"
 
 # 产物运行时要从这两个目录找 .so（rpath 写死的）
 ENV LD_LIBRARY_PATH=/usr/local/php-8.5-zts/lib:/root/.tsf/toolchain/typephp/vendor/swoole/phpx/lib

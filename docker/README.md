@@ -52,7 +52,7 @@ docker run --rm -v /path/to/TypeServer:/work -w /work/demo/battle tsf:latest \
 |:--|:--|
 | 基础 | `debian:bookworm` |
 | PHP | `/usr/local/php-8.5-zts`（ZTS + embed → `libphp.so`；pcntl / posix 已开） |
-| 扩展 | swoole 6.2.5（thread 模式）、phpredis 6.3.0（ZTS 版，`pkg/redis` 依赖） |
+| 扩展 | swoole 6.2.5（thread 模式）、phpredis 6.3.0（ZTS）、zip（composer 依赖它解包） |
 | 工具链 | `~/.tsf/toolchain/typephp`（tpc + src + vendor），**含 tpc-patches 的改动** |
 | phpx | `~/.tsf/toolchain/typephp/vendor/swoole/phpx/lib/libphpx.so` |
 | 其他 | g++ / cmake / libgmp-dev / libmpfr-dev / composer |
