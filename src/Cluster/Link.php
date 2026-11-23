@@ -57,11 +57,6 @@ final class Link
     }
 
     /** @return resource|null */
-    public function socket()
-    {
-        return $this->sock;
-    }
-
     public function pendingBytes(): int
     {
         return strlen($this->out);
