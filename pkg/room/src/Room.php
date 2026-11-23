@@ -143,7 +143,17 @@ class Room
         return $this->members->uids();
     }
 
-    /** 加入（玩家身份）。只有房间已关闭时才拒绝 —— 其余状态由业务判断 */
+    /**
+     * 加入（玩家身份）。返回 false 的四种原因：
+     *
+     *   1. 房间已关闭
+     *   2. `$uid <= 0`
+     *   3. 该 uid 已在房间里（重复加入**不会**刷新成员信息，也不会占第二个座）
+     *   4. 席位已满（`maxPlayers`；观战者不占座，见 `Member::occupiesSeat()`）
+     *
+     * 返回 bool 而不是原因，是因为调用方通常只想"加进去了没有"。要区分，
+     * 用 `has($uid)` / `isClosed()` / `playerCount()` 自己判——别猜 false 的含义。
+     */
     public function add(int $uid, string $name = ""): bool
     {
         if ($this->closed) {
