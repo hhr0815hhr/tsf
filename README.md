@@ -407,7 +407,7 @@ $h = new Handoff($nodeId, $entry, new ClusterTransport($cluster), 3000, 8);  // 
 
 | 命令 | 跑什么 | 用在哪 |
 |:--|:--|:--|
-| `tsf verify` | **注册过的** 61 个套件（`bin/tsf` 里的清单），带断言计数 | 日常提交前、CI 门禁 |
+| `tsf verify` | **注册过的** 62 个套件（`bin/tsf` 里的清单），带断言计数 | 日常提交前、CI 门禁 |
 | `tsf test` | **发现式**：遍历 `tests/*/main.php`，没有 `run.sh` 就直接 build+run | 查"有多少东西其实没在验证" |
 | `tsf test --unwired` | 只跑没有 `run.sh` 的那批 | 定期体检 |
 | `tsf test --shard 1/4` | 只跑第 1 片（共 4 片） | 多机 CI 分片 |

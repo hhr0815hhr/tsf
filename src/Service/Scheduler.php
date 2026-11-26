@@ -143,6 +143,21 @@ final class Scheduler
     /** @var array<int, int> 已经报过"配额超限"的服务，防止逐批刷日志 */
     private array $memWarned = [];
 
+    /** 内存压力告警阈值（占 memory_limit 的百分比）；0 = 关闭。见 `setMemoryPressure()` */
+    private int $memWarnPct = 0;
+
+    /** 内存压力落 dump 的阈值（百分比）；0 = 关闭 */
+    private int $memDumpPct = 0;
+
+    /** 本进程是否已经落过压力 dump（只落一次，OOM 前只来得及一次） */
+    private int $memDumped = 0;
+
+    /** 上次 warn 的单调毫秒，用于限流（60 秒最多一次） */
+    private int $memWarnedAt = 0;
+
+    /** tick 计数，用于"每 N 轮做一次内存检查" */
+    private int $tickSeq = 0;
+
     /** 当前正在处理哪个服务（用于给发出的消息填 from） */
     private int $current = 0;
 
@@ -556,6 +571,120 @@ final class Scheduler
     public function setTickBudget(int $ms): void
     {
         $this->tickBudgetNs = $ms > 0 ? $ms * 1000000 : 0;
+    }
+
+    /**
+     * 内存压力：在**撞到 memory_limit 之前**告警 / 落 dump。0 表示关闭对应阈值。
+     *
+     * ## 为什么需要它
+     *
+     * OOM 是 fatal error，不是 `Throwable`——`catch` 接不住，
+     * `register_shutdown_function` 也不会执行（实测 AOT 产物 OOM 时
+     * 进程直接以 137 = SIGKILL 退出，只在 stderr 留一行文件名和行号）。
+     * 也就是说：**吃满内存的那一刻，什么现场都来不及记**。
+     *
+     * 唯一的办法是提前动手。这里每 64 轮 tick 检查一次占用率：
+     *
+     * @param int $warnPct 达到这个百分比记一次 warn（60 秒最多一条）
+     * @param int $dumpPct 达到这个百分比落一份 crash dump（每个进程只落一次）
+     *
+     * 典型配置 `setMemoryPressure(80, 92)`：80% 让人知道，92% 留出余量把现场写下。
+     * 不要设到 98% 以上——dump 本身也要内存。
+     */
+    public function setMemoryPressure(int $warnPct, int $dumpPct): void
+    {
+        $this->memWarnPct = $warnPct;
+        $this->memDumpPct = $dumpPct;
+        $this->memDumped = 0;
+    }
+
+    /** @return array<string, int> 当前内存压力状态（排障用） */
+    public function memoryPressure(): array
+    {
+        $limit = $this->memLimitBytes();
+        $used = memory_get_usage(true);
+        $pct = $limit > 0 ? intdiv($used * 100, $limit) : 0;
+        return [
+            "used" => $used,
+            "limit" => $limit,
+            "pct" => $pct,
+            "warn_pct" => $this->memWarnPct,
+            "dump_pct" => $this->memDumpPct,
+            "dumped" => $this->memDumped,
+        ];
+    }
+
+    /** 解析 memory_limit（"512M" / "-1" / 字节数）；返回 0 表示无限制 */
+    private function memLimitBytes(): int
+    {
+        $v = (string) ini_get("memory_limit");
+        if ($v === "" || $v === "-1") {
+            return 0;
+        }
+        $n = (int) $v;
+        $last = strtolower(substr($v, -1));
+        if ($last === "g") {
+            $n = $n * 1073741824;
+        } elseif ($last === "m") {
+            $n = $n * 1048576;
+        } elseif ($last === "k") {
+            $n = $n * 1024;
+        }
+        return $n;
+    }
+
+    private function checkMemoryPressure(): void
+    {
+        $limit = $this->memLimitBytes();
+        if ($limit <= 0) {
+            return;
+        }
+        $used = memory_get_usage(true);
+        $pct = intdiv($used * 100, $limit);
+
+        if ($this->memDumpPct > 0 && $pct >= $this->memDumpPct && $this->memDumped === 0) {
+            $this->memDumped = 1;
+            $dumpPath = "";
+            if ($this->crashDir !== "") {
+                // 此时进程还活着，能拿到真实状态；OOM 之后就没机会了
+                $dumpPath = CrashDump::save(
+                    $this->crashDir,
+                    "memory-pressure",
+                    0,
+                    new \RuntimeException("memory pressure " . $pct . "%"),
+                    [],
+                    "",
+                    [
+                        "pct" => $pct,
+                        "used" => $used,
+                        "limit" => $limit,
+                        "services" => count($this->services),
+                        "timers" => $this->timers->size(),
+                    ]
+                );
+            }
+            Logger::error("memory pressure: dumped before OOM", [
+                "pct" => $pct,
+                "used_mb" => intdiv($used, 1048576),
+                "limit_mb" => intdiv($limit, 1048576),
+                "services" => count($this->services),
+                "dump" => $dumpPath,
+            ]);
+            return;
+        }
+
+        if ($this->memWarnPct > 0 && $pct >= $this->memWarnPct) {
+            $now = self::nowMs();
+            if ($now - $this->memWarnedAt > 60000) {
+                $this->memWarnedAt = $now;
+                Logger::warn("memory pressure high", [
+                    "pct" => $pct,
+                    "used_mb" => intdiv($used, 1048576),
+                    "limit_mb" => intdiv($limit, 1048576),
+                    "services" => count($this->services),
+                ]);
+            }
+        }
     }
 
     public function tickBudgetMs(): int
@@ -977,6 +1106,12 @@ final class Scheduler
      */
     public function tick(int $maxMsgs = 0): int
     {
+        // 内存压力检查：每 64 轮一次。不能每轮做——一次 memory_get_usage + 解析
+        // ini 约 200 ns，逐轮会挤占单消息预算；而 64 轮摊薄后可以忽略
+        $this->tickSeq++;
+        if (($this->tickSeq & 63) === 0 && ($this->memWarnPct > 0 || $this->memDumpPct > 0)) {
+            $this->checkMemoryPressure();
+        }
         if ($this->onBatchBegin !== null) {
             $bb = $this->onBatchBegin;
             $bb();
