@@ -887,6 +887,9 @@ function verifySuites(): array
         ["id" => "db", "desc" => "事务/嵌套/批量/Repo（sqlite 内存库）", "sh" => "tests/db-test/run.sh"],
         ["id" => "migrate", "desc" => "迁移链（版本解析/顺序/幂等）", "sh" => "tests/migrate-test/run.sh"],
         ["id" => "timer", "desc" => "定时器 / cron 下次触发", "sh" => "tests/timer-test/run.sh"],
+        // 批量销毁带定时器的服务后，时间轮里的死对象必须被清掉。
+        // 这个 bug 对外全无症状：不报错、timers 显示 0、只有内存单调涨
+        ["id" => "lifecycle", "desc" => "生命周期：时间轮死对象清理 + 内存收敛（9 项）", "sh" => "tests/lifecycle-test/run.sh"],
         ["id" => "schedule", "desc" => "cron 判定 + 注册表 + 与核心对拍（16 项）", "sh" => "tests/schedule-test/run.sh"],
         ["id" => "settle", "desc" => "金币账本（115 项）", "sh" => "tests/settle-test/run.sh"],
         ["id" => "settle-crash", "desc" => "账本崩溃重放（14 项）", "sh" => "tests/settle-crash/run.sh"],

@@ -948,7 +948,11 @@ final class Scheduler
 
         // 2) 把到期的定时器变成消息投进信箱——它们和普通消息排同一个队，
         // 服务的执行路径仍然只有一条（不在这里直接调回调）。
-        if ($this->timers->size() > 0) {
+        // 判据必须是 hasPending() 而不是 size() > 0：size() 只数有效定时器，
+        // 服务批量销毁后 live 归零、但已取消的对象还压在时间轮里等翻到。
+        // 只看 size() 会让 due() 停摆，游标不再前进，那些死对象永远留着
+        // （内存单调增长而 stats()["timers"] 一直是 0，见 bench/lifecycle）。
+        if ($this->timers->hasPending()) {
             $due = $this->timers->due(self::nowMs());
             foreach ($due as $t) {
                 // 定时器消息的 from 应该是"自己"（自定闹钟），不是 0（系统）
@@ -1507,6 +1511,10 @@ final class Scheduler
         $out["id_wraps"] = $this->ids->wraps();
         // 还没用过的服务 id。接近 0 就快回绕了——回绕不是错误，但这是观察它的唯一窗口
         $out["ids_left"] = $this->ids->left();
+        // 定时器内部结构规模。排障用：服务都销毁了内存不降时，看这两项——
+        // timers 为 0 而 timer_wheel_items 不为 0，就是"死对象还在轮里等游标"
+        $out["timer_detail"] = $this->timers->debugSizes();
+        $out["timer_wheel_items"] = $this->timers->wheelItems();
         return $out;
     }
 }

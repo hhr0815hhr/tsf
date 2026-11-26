@@ -57,6 +57,19 @@ final class TimerHeap
         unset($this->items[$n - 1]);
         $this->items[0] = $last;
         $this->down(0);
+        // 堆很小时整体重排 key。
+        //
+        // 为什么必须做：unset 不会复位 PHP 数组的"下一个可用下标"，下次 push
+        // 会落到比 count 更大的 key 上。反复 push/pop 于是让 key 空间只增不减，
+        // 哈希表的桶跟着涨（每个槽约 36 B），元素数却一直是 0~n。
+        // 实测 10 轮 × 2000 个定时器涨到 6 MB 就是这个原因（见 bench/lifecycle）。
+        //
+        // 只在 n 很小时做：array_values 是 O(n)，堆大时每次都做会把 pop 从
+        // O(log n) 退化成 O(n)。小堆重建的累计成本可以忽略，而 key 空间
+        // 被限制在"历史最大堆大小"，不会随累计 push 次数增长。
+        if ($n <= 32) {
+            $this->items = array_values($this->items);
+        }
         return $top;
     }
 

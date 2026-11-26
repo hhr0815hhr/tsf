@@ -179,6 +179,62 @@ final class Timers
         return count($this->live);
     }
 
+    /**
+     * 是否还有**任何**待处理的东西——包括已取消但还压在轮里的。
+     *
+     * 为什么不能只判 `size() > 0`：`size()` 数的是有效定时器。服务批量销毁后
+     * （一房一 Service 的常态），`cancelAllOf` 把 live 清空但把对象留在时间轮槽里
+     * 等翻到才丢。这时 `size()` 为 0，如果调度器据此跳过 `due()`，游标就永远不前进，
+     * 那些死对象永远留在槽里——内存单调增长，而 `stats()["timers"]` 一直显示 0。
+     *
+     * 实测（bench/lifecycle）：每轮 2000 个定时器，wheelItems 每轮 +2000、
+     * 内存每轮 +47 万 B，十轮 6 MB，没有收敛迹象。
+     */
+    public function hasPending(): bool
+    {
+        return $this->live !== []
+            || $this->wheel !== []
+            || $this->immediate !== []
+            || !$this->far->isEmpty();
+    }
+
+    /**
+     * 时间轮槽里还压着多少 Timer 对象（含已取消、等翻到才丢的）。
+     *
+     * 这是"内存不降"的关键观测点：`size()` 为 0 而这里不为 0，说明死对象
+     * 还在等游标推进。回归见 `tests/lifecycle-test`。
+     */
+    public function wheelItems(): int
+    {
+        $n = 0;
+        foreach ($this->wheel as $bucket) {
+            $n += count($bucket);
+        }
+        return $n;
+    }
+
+    /**
+     * 自省：各内部结构当前有多少条目。排障用，热路径别调。
+     *
+     * 存在的理由：`size()` 只反映 live，看不到 wheel 槽里被标 cancelled
+     * 但还没翻到的对象——那些对象仍然占内存，而 size() 显示 0。
+     * 排查"服务都销毁了内存却不降"时，这一行能一眼看出是哪个结构在留。
+     */
+    public function debugSizes(): string
+    {
+        $slots = 0;
+        foreach ($this->wheel as $bucket) {
+            $slots += count($bucket);
+        }
+        return "live=" . count($this->live)
+            . " byService=" . count($this->byService)
+            . " wheelSlots=" . count($this->wheel)
+            . " wheelItems=" . $slots
+            . " far=" . $this->far->size()
+            . " imm=" . count($this->immediate)
+            . " tomb=" . $this->tombstones;
+    }
+
     public function tombstones(): int
     {
         return $this->tombstones;
