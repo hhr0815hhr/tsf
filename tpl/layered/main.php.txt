@@ -1,0 +1,150 @@
+<?php
+
+use Game\App\EchoService;
+use Game\Protocol\Cmd;
+use Game\Protocol\EchoTask;
+use TSF\Gateway\Gateway;
+use TSF\Gateway\RateLimiter;
+use TSF\Gateway\SessionManager;
+use TSF\Gateway\TokenAuth;
+use TSF\Kernel\AppConfig;
+use TSF\Kernel\Bootstrap;
+use TSF\Kernel\Logger;
+use TSF\Protocol\ProtocolStack;
+use TSF\Service\Scheduler;
+use TSF\Service\Service;
+use TSF\Transport\Server;
+use TSF\Transport\ServerFactory;
+
+/**
+ * 入口只做装配，不写业务。
+ *
+ *   main()               串联
+ *   AppConfig::load()    读 config/tsf.json
+ *   buildProtocol()      协议栈（分帧 + 消息体）
+ *   buildServer()        传输层（tcp / ws）
+ *   buildGateway()       会话 / 鉴权 / 限流
+ *   spawnEchoService()   起一个业务 Service
+ *   registerHandlers()   网络消息 → 内部消息
+ *
+ * 业务写在 src/App/（用例）、src/Domain/（规则），IO 在 src/Infra/。
+ * 为什么这么分、哪一层能依赖哪一层，见工程根目录 README.md
+ * 和框架 docs/guide/14-architecture.md。
+ */
+function main(): void
+{
+    $base = __DIR__;
+    Bootstrap::boot($base, "app");
+    Bootstrap::ensureDirs([$base . "/var/log"]);
+
+    $cfg = AppConfig::load();
+    $proto = buildProtocol($cfg);
+    $server = buildServer($cfg, $proto);
+
+    $gw = buildGateway($cfg, $server, $proto);
+    $echo = spawnEchoService($gw);
+    registerHandlers($gw, $echo);
+
+    $gw->boot();
+    logReady($cfg, $proto);
+    $server->start();
+}
+
+/** 分帧 + 消息体，两层都可换（配置即可，不改代码） */
+function buildProtocol(AppConfig $cfg): ProtocolStack
+{
+    return ProtocolStack::fromConfig($cfg->frameName, $cfg->payloadName);
+}
+
+/**
+ * 传输层：tcp 或 ws。
+ *
+ * 走工厂而不是在 if/else 里分别 new：AOT 下局部变量类型由首次赋值推断，
+ * 分支里分别赋 TcpServer / WsServer 会报类型错误。工厂的返回类型统一，能声明。
+ */
+function buildServer(AppConfig $cfg, ProtocolStack $proto): Server
+{
+    return ServerFactory::make(
+        $cfg->transport,
+        $cfg->host,
+        $cfg->port,
+        $proto->frame(),
+        $cfg->serverOpts()
+    );
+}
+
+function buildGateway(AppConfig $cfg, Server $server, ProtocolStack $proto): Gateway
+{
+    $sessions = new SessionManager($cfg->heartbeatSec);
+    $auth = new TokenAuth($cfg->authTokens, $cfg->authSecret);
+    $limiter = new RateLimiter($cfg->ratePerSec, $cfg->rateBurst);
+
+    // payload 为 raw 时不往 Gateway 传编解码器：省掉每帧一次空转
+    $codec = null;
+    if ($proto->payloadName() !== "raw") {
+        $codec = $proto->payload();
+    }
+
+    $gw = new Gateway(
+        $server,
+        $sessions,
+        $auth,
+        $limiter,
+        $cfg->heartbeatSec,
+        1000,
+        $cfg->requireAuth,
+        $codec
+    );
+    $gw->setSendFailLimit($cfg->sendFailLimit);
+    return $gw;
+}
+
+/**
+ * 起业务 Service，返回它的地址。
+ *
+ * Service 持有 Gateway，是为了能自己回包——业务逻辑不该写进 handler 闭包，
+ * 否则会话状态、计时器这些东西没地方放（闭包没有成员变量）。
+ */
+function spawnEchoService(Gateway $gw): int
+{
+    return Scheduler::instance()->spawnOf(function () use ($gw): Service {
+        return new EchoService($gw);
+    });
+}
+
+/**
+ * 网络消息 → 内部消息。
+ *
+ * handler 只做"拆参数 + 转发"，不写规则。这样同一个 Service 既能被网络调用，
+ * 也能被 GM 命令、定时器调用（发的都是同一条内部消息）。
+ *
+ * 用 $gw->send 而不是 $server->sendFrame：只有经过 Gateway 才能统计发送失败、
+ * 触发背压；这里的回包在 Service 里做，handler 只负责投递。
+ */
+function registerHandlers(Gateway $gw, int $echo): void
+{
+    $gw->on(Cmd::ECHO_REQ, function (int $fd, int $uid, string|array|object $data) use ($echo): void {
+        $task = new EchoTask();
+        $task->fd = $fd;
+        $task->text = is_string($data) ? $data : "";
+        Scheduler::instance()->deliverAs(0, $echo, Cmd::SVC_ECHO, $task);
+    });
+
+    // whoami：验证登录后 uid 已绑定。
+    // 同样受"raw 下必须是 string"约束，所以拼成字符串而不是传数组
+    $gw->on(Cmd::WHOAMI_REQ, function (int $fd, int $uid, string|array|object $data) use ($gw): void {
+        $gw->send($fd, Cmd::WHOAMI_RESP, "uid=" . $uid);
+    });
+}
+
+function logReady(AppConfig $cfg, ProtocolStack $proto): void
+{
+    Logger::info("app ready", [
+        "host" => $cfg->host,
+        "port" => $cfg->port,
+        "transport" => $cfg->transport,
+        "frame" => $proto->frameName(),
+        "payload" => $proto->payloadName(),
+        "require_auth" => $cfg->requireAuth,
+    ]);
+}

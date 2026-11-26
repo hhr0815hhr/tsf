@@ -1,0 +1,57 @@
+<?php
+
+namespace Game\App;
+
+use Game\Domain\Counter;
+use Game\Protocol\Cmd;
+use Game\Protocol\EchoTask;
+use TSF\Gateway\Gateway;
+use TSF\Service\Message;
+use TSF\Service\Service;
+
+/**
+ * 一个业务 Service：用例编排层。
+ *
+ * 它的职责是"按顺序调用 Domain 和 Infra"——不自己算规则（那是 Domain），
+ * 不自己开连接（那是 Infra）。
+ *
+ * 两条容易踩的规矩：
+ *
+ * 1. **状态放成员变量，不要放静态属性**。静态属性在进程里是全局的，
+ *    多个同类 Service 会互相踩；而且它不会随 Service 销毁而清空。
+ *
+ * 2. **不要把逻辑写回 handler 闭包**。闭包没有成员变量，会话状态、计时器
+ *    没地方放，最后只能堆全局变量。handler 只做"拆参数 + 投递"。
+ */
+final class EchoService extends Service
+{
+    private Gateway $gw;
+
+    /** 这个 Service 处理过多少条：演示"状态在成员变量里" */
+    private int $handled = 0;
+
+    public function __construct(Gateway $gw)
+    {
+        $this->gw = $gw;
+    }
+
+    public function onMessage(Message $m): void
+    {
+        if ($m->msgId !== Cmd::SVC_ECHO) {
+            return;
+        }
+        // 内部消息的载荷是对象，先确认类型再取字段
+        if (!($m->data instanceof EchoTask)) {
+            return;
+        }
+        $task = $m->data;
+
+        $this->handled = Counter::bump($this->handled);
+        $reply = Counter::normalize($task->text, 120);
+
+        // config/tsf.json 里 payload 是 raw，所以业务消息必须回 string。
+        // 要传结构化数据有两条路：自己 json_encode 一次（客户端也当字符串收），
+        // 或者把配置改成 payload=json 后直接传数组（客户端要跟着换解析）。
+        $this->gw->send($task->fd, Cmd::ECHO_RESP, $reply);
+    }
+}

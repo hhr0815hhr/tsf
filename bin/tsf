@@ -1662,6 +1662,64 @@ function tplMain(): string
     return $s;
 }
 
+/**
+ * 把 tpl/layered/ 整个目录铺到工程里。
+ *
+ * 两条替换规则：
+ *   - 文件名去掉 `.txt` 后缀（模板不能以 .php 结尾，否则会被当源码扫到）
+ *   - `gitignore.txt` → `.gitignore`（点开头在 Windows 上写起来麻烦，单独一条规则）
+ *
+ * `__PROJECT_NAME__` 会被替换成工程目录名。
+ */
+function genLayered(string $projDir, string $projectName): void
+{
+    $srcRoot = __DIR__ . "/../tpl/layered";
+    if (!is_dir($srcRoot)) {
+        fail("找不到分层模板目录: " . $srcRoot);
+    }
+
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($srcRoot, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    $copied = 0;
+    foreach ($it as $item) {
+        $path = $item->getPathname();
+        $rel = substr($path, strlen($srcRoot) + 1);
+
+        // gitignore 单独处理：模板里叫 gitignore.txt，生成后要叫 .gitignore
+        if ($rel === "gitignore.txt") {
+            $rel = ".gitignore.txt";
+        }
+        if (substr($rel, -4) === ".txt") {
+            $rel = substr($rel, 0, -4);
+        }
+
+        $dst = $projDir . "/" . $rel;
+        if ($item->isDir()) {
+            if (!is_dir($dst) && !mkdir($dst, 0777, true) && !is_dir($dst)) {
+                fail("建目录失败: " . $dst);
+            }
+            continue;
+        }
+
+        $body = (string) file_get_contents($path);
+        $body = str_replace("__PROJECT_NAME__", $projectName, $body);
+
+        $parent = dirname($dst);
+        if (!is_dir($parent) && !mkdir($parent, 0777, true) && !is_dir($parent)) {
+            fail("建目录失败: " . $parent);
+        }
+        if (file_put_contents($dst, $body) === false) {
+            fail("写文件失败: " . $dst);
+        }
+        $copied++;
+    }
+
+    ok("分层骨架：" . $copied . " 个文件（src/Protocol|Domain|App + tests/unit）");
+}
+
 /** 生成的客户端模板；__TSF_ROOT__ 会被替换成框架根目录的绝对路径 */
 function tplClient(): string
 {
@@ -2256,11 +2314,29 @@ switch ($cmd) {
             }
         }
         if ($name === "") {
-            fail("用法: tsf new <name> [--login] [--packages=db,room | --no-packages]\n"
+            fail("用法: tsf new <name> [--layout=flat|layered] [--login] [--packages=db,room | --no-packages]\n"
                 . "        （名字写 . 表示在当前目录生成）\n"
+                . "        --layout=layered 生成分层骨架（src/Protocol|Domain|App + tests/），默认 flat\n"
                 . "        不带 --packages/--no-packages 且在终端里运行时，会交互让你选可选功能");
         }
         $isLogin = in_array("--login", $argvv, true);
+
+        // --layout=layered：生成分层骨架（src/Protocol|Domain|App|Infra + tests/），
+        // 而不是一个 main.php。默认 flat，老行为一字不变。
+        //
+        // 为什么要这个选项：flat 模板适合验证工具链和写 500 行以内的小服务，
+        // 但它不回答"2000 行之后往哪放"。layered 把四层和一条 Domain 测试一起生成出来，
+        // 让工程从第一天就有形状（规范见 docs/guide/14-architecture.md）。
+        $layout = "flat";
+        $layoutCnt = count($argvv);
+        for ($layoutI = 2; $layoutI < $layoutCnt; $layoutI++) {
+            if (strncmp($argvv[$layoutI], "--layout=", 9) === 0) {
+                $layout = substr($argvv[$layoutI], 9);
+            }
+        }
+        if ($layout !== "flat" && $layout !== "layered") {
+            fail("--layout 只支持 flat（默认）或 layered，收到: " . $layout);
+        }
 
         // "." / "./"：在当前目录生成。
         //
@@ -2376,7 +2452,12 @@ switch ($cmd) {
             json_encode($cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n"
         );
 
-        file_put_contents($projDir . "/main.php", tplMain());
+        if ($layout === "layered") {
+            // 骨架自带 main.php，这里不再写平铺版
+            genLayered($projDir, basename($projDir));
+        } else {
+            file_put_contents($projDir . "/main.php", tplMain());
+        }
 
         $client = str_replace("__TSF_ROOT__", $tsfRoot, tplClient());
         file_put_contents($projDir . "/client.php", $client);

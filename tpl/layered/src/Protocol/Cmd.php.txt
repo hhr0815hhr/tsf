@@ -1,0 +1,24 @@
+<?php
+
+namespace Game\Protocol;
+
+/**
+ * 消息 ID。
+ *
+ * 网络 ID 和内部 ID **分开编号**：内部消息永远不出进程，改它们不影响客户端。
+ * 混在一起的话，某天想让两个 Service 私下传个东西，就得占用一个客户端可见的号段。
+ */
+final class Cmd
+{
+    // ---- 网络协议（客户端可见，改了要跟客户端一起发版）----
+    public const ECHO_REQ = 1001;
+
+    public const ECHO_RESP = 1002;
+
+    public const WHOAMI_REQ = 1003;
+
+    public const WHOAMI_RESP = 1004;
+
+    // ---- 内部消息（只在本进程内流转）----
+    public const SVC_ECHO = 2001;
+}

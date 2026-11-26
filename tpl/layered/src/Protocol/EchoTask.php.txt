@@ -1,0 +1,19 @@
+<?php
+
+namespace Game\Protocol;
+
+/**
+ * 内部消息的载荷。
+ *
+ * 为什么用对象而不是 array：AOT 下数组表达不了"这个键是 int、那个是 string"，
+ * 取出来是混合类型，用之前处处得判断。对象的成员有确定类型，编译期就能查。
+ *
+ * 这个类属于协议层（它描述"消息长什么样"），不属于业务层——
+ * 所以它不带任何行为，只有字段。
+ */
+final class EchoTask
+{
+    public int $fd = 0;
+
+    public string $text = "";
+}

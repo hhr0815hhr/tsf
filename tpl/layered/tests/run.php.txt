@@ -1,0 +1,39 @@
+<?php
+
+/**
+ * 单元测试入口：不编译、不起服务、不需要网络。
+ *
+ *     php85 tests/run.php
+ *
+ * 能这么跑的前提是 src/Domain/ 不依赖 TSF —— 这就是"Domain 什么都不许 import"
+ * 那条规矩换来的东西。一旦 Domain 里出现 `new Redis()`，这里就跑不动了。
+ *
+ * 每个测试文件用 `return true/false` 报告结果，入口只负责汇总。
+ * 要测 Service 调度、协议、网络，用框架的 `tsf verify` 那套（它起真进程）。
+ */
+
+$files = glob(__DIR__ . "/unit/*Test.php");
+if ($files === false) {
+    echo "读不到 tests/unit/\n";
+    exit(1);
+}
+if ($files === []) {
+    echo "tests/unit/ 下没有 *Test.php\n";
+    exit(0);
+}
+
+sort($files);
+$failed = 0;
+$ran = 0;
+
+foreach ($files as $f) {
+    echo "== " . basename($f) . " ==" . PHP_EOL;
+    $ok = require $f;
+    $ran++;
+    if ($ok !== true) {
+        $failed++;
+    }
+}
+
+echo PHP_EOL . "运行 " . $ran . " 个文件，失败 " . $failed . PHP_EOL;
+exit($failed === 0 ? 0 : 1);

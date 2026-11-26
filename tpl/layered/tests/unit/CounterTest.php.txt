@@ -1,0 +1,54 @@
+<?php
+
+/**
+ * Domain 层的规则测试。
+ *
+ * 注意这里**没有** `use TSF\...`：Domain 不依赖框架，测试也就不需要框架。
+ * 这是整个分层规则最直接的收益 —— 改一个数值公式，跑这条命令几百毫秒就知道对不对，
+ * 不用编译、不用起端口、不用造数据。
+ */
+
+use Game\Domain\Counter;
+
+require_once __DIR__ . "/../../src/Domain/Counter.php";
+
+$failed = 0;
+
+// 正常情况
+$got = Counter::normalize("  hello  ", 20);
+if ($got !== "hello") {
+    echo "  FAIL  normalize 去空白：得到 " . var_export($got, true) . PHP_EOL;
+    $failed++;
+}
+
+// 截断
+$got2 = Counter::normalize("abcdefgh", 3);
+if ($got2 !== "abc") {
+    echo "  FAIL  normalize 截断：得到 " . var_export($got2, true) . PHP_EOL;
+    $failed++;
+}
+
+// 上限为 0 表示不截断
+$got3 = Counter::normalize("abcdefgh", 0);
+if ($got3 !== "abcdefgh") {
+    echo "  FAIL  normalize 不截断：得到 " . var_export($got3, true) . PHP_EOL;
+    $failed++;
+}
+
+// 空串
+if (Counter::normalize("", 10) !== "") {
+    echo "  FAIL  normalize 空串" . PHP_EOL;
+    $failed++;
+}
+
+// 纯函数
+if (Counter::bump(41) !== 42) {
+    echo "  FAIL  bump(41) 应为 42" . PHP_EOL;
+    $failed++;
+}
+
+if ($failed === 0) {
+    echo "  PASS  5 项" . PHP_EOL;
+}
+
+return $failed === 0;

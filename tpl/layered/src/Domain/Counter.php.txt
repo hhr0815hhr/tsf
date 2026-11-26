@@ -1,0 +1,35 @@
+<?php
+
+namespace Game\Domain;
+
+/**
+ * 纯逻辑：不依赖 TSF、不碰 IO、不知道网络存在。
+ *
+ * 这一层唯一的硬约束是"能单独跑起来"：
+ *
+ *     php85 tests/run.php        # 不编译、不起服务、不需要 redis
+ *
+ * 一旦这里出现 `new Redis()`、`Scheduler::instance()`、`file_get_contents("http")`，
+ * 规则就再也测不动了——每个用例都要先造环境。这是 Domain 层最容易被破坏的边界。
+ *
+ * 需要配置（数值、概率）时，**从参数传进来**，不要自己读配置：
+ * 读配置就意味着依赖框架，单测又要起框架。
+ */
+final class Counter
+{
+    /** 规范化回显内容：去首尾空白，超长截断 */
+    public static function normalize(string $text, int $maxLen): string
+    {
+        $t = trim($text);
+        if ($maxLen > 0 && strlen($t) > $maxLen) {
+            return substr($t, 0, $maxLen);
+        }
+        return $t;
+    }
+
+    /** 累加一次。状态由调用方持有，这里只做运算——纯函数最好测 */
+    public static function bump(int $current): int
+    {
+        return $current + 1;
+    }
+}
