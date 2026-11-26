@@ -70,6 +70,15 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 # --enable-embed=shared  产出 libphp.so，AOT 产物要链它
 # --enable-pcntl         Swoole 的多进程 Server 依赖 fork/signal
 # --enable-posix         框架里用了 posix_getpid()（日志的 pid 字段）
+# --with-pdo-mysql       pkg/db 的 DSN 就是 `mysql:host=...`，缺它一 connect 就
+#                        "could not find driver"；--with-mysqli 一起带上，
+#                        免得业务用 mysqli 时又要重编
+#
+# 这两项**必须在 configure 里**，不能像 zip 那样事后补 .so：
+#   1. pdo_mysql 要用 ext/pdo 的内部头（pdo_sql_parser.h 之类，不随 make install 导出）
+#   2. mysqlnd 得编进 PHP 核心才生效 —— 拆成 mysqlnd.so + pdo_mysql.so 的
+#      "共享 mysqlnd" 方案能跑，但加载顺序敏感，属于自找麻烦
+# PHP 8 起不再支持 libmysqlclient，所以不需要 mysql 的任何 -dev 包，mysqlnd 是内置协议实现。
 RUN set -eux; \
     curl -fsSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.gz" -o /tmp/php.tar.gz; \
     mkdir -p /src && tar -xzf /tmp/php.tar.gz -C /src; \
@@ -84,13 +93,16 @@ RUN set -eux; \
         --with-openssl --with-zlib --with-curl \
         --enable-sockets --enable-mbstring --enable-fileinfo \
         --with-sqlite3 --with-pdo-sqlite \
+        --with-mysqli --with-pdo-mysql \
     ; \
     make -j"$(nproc)"; \
     make install; \
     ln -sf "${PHP_PREFIX}/bin/php" /usr/local/bin/php85; \
     "${PHP_PREFIX}/bin/php" -v; \
     "${PHP_PREFIX}/bin/php" -m | grep -qix posix && echo "posix ok"; \
-    "${PHP_PREFIX}/bin/php" -m | grep -qix pcntl && echo "pcntl ok"
+    "${PHP_PREFIX}/bin/php" -m | grep -qix pcntl && echo "pcntl ok"; \
+    "${PHP_PREFIX}/bin/php" -m | grep -qix pdo_mysql && echo "pdo_mysql ok"; \
+    "${PHP_PREFIX}/bin/php" -r 'exit(in_array("mysql", PDO::getAvailableDrivers(), true) ? 0 : 1);' && echo "PDO mysql driver ok"
 
 # --- swoole（--enable-swoole-thread 要求 ZTS）---
 RUN set -eux; \
@@ -237,8 +249,9 @@ RUN ln -sf /usr/local/php-8.5-zts/bin/php /usr/local/bin/php85 \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qi swoole \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qix redis \
  && /usr/local/php-8.5-zts/bin/php -m | grep -qix zip \
- && /usr/local/php-8.5-zts/bin/php -r 'exit(class_exists("Redis") && class_exists("ZipArchive") ? 0 : 1);' \
- && echo "swoole ok / redis ok / zip ok"
+ && /usr/local/php-8.5-zts/bin/php -m | grep -qix pdo_mysql \
+ && /usr/local/php-8.5-zts/bin/php -r 'exit(class_exists("Redis") && class_exists("ZipArchive") && in_array("mysql", PDO::getAvailableDrivers(), true) ? 0 : 1);' \
+ && echo "swoole ok / redis ok / zip ok / pdo_mysql ok"
 
 # 产物运行时要从这两个目录找 .so（rpath 写死的）
 ENV LD_LIBRARY_PATH=/usr/local/php-8.5-zts/lib:/root/.tsf/toolchain/typephp/vendor/swoole/phpx/lib
