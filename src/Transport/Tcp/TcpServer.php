@@ -19,8 +19,15 @@ final class TcpServer extends Server
         $this->ensureFdLimit($maxConn);
         $this->ensureMemoryLimit($maxConn);
 
-        $server = new \Swoole\Server($this->host, $this->port);
-        $server->set([
+        // TLS：两个 ssl 选项都给了就在这个端口上直接做 TLS（见 Server::sslEnabled）
+        $ssl = $this->sslEnabled();
+        $server = new \Swoole\Server(
+            $this->host,
+            $this->port,
+            SWOOLE_PROCESS,
+            $ssl ? (SWOOLE_SOCK_TCP | SWOOLE_SSL) : SWOOLE_SOCK_TCP
+        );
+        $server->set($this->sslOptions() + [
             "worker_num" => isset($this->options["worker_num"]) ? (int) $this->options["worker_num"] : 1,
             "reactor_num" => isset($this->options["reactor_num"]) ? (int) $this->options["reactor_num"] : 1,
             "max_conn" => $maxConn,
@@ -44,8 +51,13 @@ final class TcpServer extends Server
             // 实测：请求-响应（闭路）场景下开关无差异（p50 均 0.23ms），
             // 推送/广播场景才会显现，故作为默认值保留但允许覆盖。
             "open_tcp_nodelay" => !isset($this->options["nodelay"]) || (bool) $this->options["nodelay"],
+            // 停机排空窗口（秒）。语义和取舍见 Server::maxWaitTime()
+            "max_wait_time" => $this->maxWaitTime(),
             "log_level" => 4,
         ]);
+        if ($ssl) {
+            Logger::info("tls enabled", ["proto" => "tcp", "cert" => $this->options["ssl_cert_file"]]);
+        }
         $this->server = $server;
 
         $server->on("connect", function ($serv, int $fd, int $reactorId) {
@@ -86,6 +98,12 @@ final class TcpServer extends Server
             $this->fireWorkerStart($workerId);
         });
 
+        // worker 退出前：停机钩子 → 服务排空 → 逐个 onStop。SIGTERM / shutdown() / reload 都会走到。
+        // 为什么挂这里而不是接管信号：见 Server::fireWorkerStop()
+        $server->on("workerStop", function ($serv, int $workerId) {
+            $this->fireWorkerStop($workerId);
+        });
+
         Logger::info("server listen", ["proto" => "tcp", "host" => $this->host, "port" => $this->port]);
         $server->start();
     }
@@ -111,6 +129,19 @@ final class TcpServer extends Server
         if ($this->server !== null) {
             $this->server->close($fd);
         }
+    }
+
+    public function peerOf(int $fd): string
+    {
+        if ($this->server === null) {
+            return "";
+        }
+        $info = $this->server->getClientInfo($fd);
+        if (!is_array($info)) {
+            return "";
+        }
+        $ip = $info["remote_ip"] ?? "";
+        return is_string($ip) ? $ip : "";
     }
 
     public function server(): ?\Swoole\Server

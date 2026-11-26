@@ -3,6 +3,7 @@
 namespace TSF\Http;
 
 use TSF\Kernel\Logger;
+use TSF\Service\Scheduler;
 
 /**
  * HTTP 应用：把 Router 接到 Swoole 的 HttpServer 上。
@@ -63,6 +64,15 @@ final class App
     public function after(\Closure $fn): self
     {
         $this->afters[] = $fn;
+        return $this;
+    }
+
+    /** 是否记访问日志（每条请求一行 info）。默认开；量大的服务可以关 */
+    private bool $accessLog = true;
+
+    public function accessLog(bool $on): self
+    {
+        $this->accessLog = $on;
         return $this;
     }
 
@@ -140,12 +150,23 @@ final class App
             $res->end($resp->body);
 
             $ms = (microtime(true) - $started) * 1000;
-            Logger::debug("http", [
-                "method" => $method,
-                "path" => $path,
-                "status" => $resp->status,
-                "ms" => round($ms, 2),
-            ]);
+            // info 级：此前是 debug，默认级别下**一条访问日志都没有**——
+            // "接口被人刷了""这个 404 是谁打的"都查不出来。觉得多的应用关掉它
+            if ($this->accessLog) {
+                Logger::info("http", [
+                    "method" => $method,
+                    "path" => $path,
+                    "status" => $resp->status,
+                    "ms" => round($ms, 2),
+                ]);
+            }
+        });
+
+        // worker 退出前把服务停掉（逐个 onStop）。HTTP 服务自己没有定时器，退得快，
+        // 但它上面可能跑着 Gm 这类 Service——不停它们，`onStop` 里注册到注册中心的
+        // 记录要等 TTL 才消失。不排空：HTTP 请求是同步处理完的，没有"收了没处理"的消息。
+        $server->on("workerStop", function ($serv, int $workerId): void {
+            Scheduler::instance()->shutdown(0);
         });
 
         Logger::info("http ready", ["host" => $this->host, "port" => $this->port]);

@@ -41,9 +41,11 @@ final class Prometheus
      * 渲染成 exposition 文本。
      *
      * @param bool   $withProcess 是否附带进程内存指标（和业务指标分开放，便于按前缀过滤）
-     * @param string $prefix      指标名前缀。默认不加：加了会和日志里的名字对不上
+     * @param string $prefix      业务指标名前缀。默认不加：加了会和日志里的名字对不上
+     * @param bool   $withRuntime 是否附带框架运行时指标（`Metrics::provide()` 登记的那些）。
+     *                           名字固定带 `tsf_` 前缀，不受 `$prefix` 影响
      */
-    public static function render(bool $withProcess = true, string $prefix = ""): string
+    public static function render(bool $withProcess = true, string $prefix = "", bool $withRuntime = true): string
     {
         $out = "";
         $declared = [];
@@ -60,6 +62,17 @@ final class Prometheus
                 $declared[$name] = true;
             }
             $out .= self::renderOne($name, $s);
+        }
+
+        if ($withRuntime) {
+            // 变量名不能和上面业务指标的循环重名：AOT 下 $name 已经是 php::Str，
+            // 从另一个数组里取键赋给它会被判成类型冲突
+            $runtime = Metrics::runtimeSnapshot();
+            foreach ($runtime as $rname => $rv) {
+                $out .= "# HELP " . $rname . " tsf runtime " . $rname . "\n";
+                $out .= "# TYPE " . $rname . (Metrics::isRuntimeCounter($rname) ? " counter" : " gauge") . "\n";
+                $out .= $rname . " " . self::num((float) $rv) . "\n";
+            }
         }
 
         if ($withProcess) {

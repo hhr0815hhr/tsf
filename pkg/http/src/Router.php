@@ -59,6 +59,12 @@ final class Router
     {
         $found = $this->match($req->method, $req->path);
         if ($found === null) {
+            // 路径在、方法不对 → 405 + Allow。此前一律 404：
+            // 客户端把"我用错了方法"和"接口不存在"混在一起，排查时得多猜一轮
+            $allow = $this->methodsFor($req->path);
+            if ($allow !== "") {
+                return Response::fail(405, "method not allowed", 405)->withHeader("Allow", $allow);
+            }
             return Response::fail(404, "not found", 404);
         }
 
@@ -81,6 +87,26 @@ final class Router
     /**
      * @return array{0: array<string, string>, 1: \Closure|string}|null
      */
+    /**
+     * 这个路径上注册过哪些方法（逗号分隔，按注册顺序）。空串 = 路径不存在。
+     *
+     * 给 405 的 `Allow` 头用。只有路由没命中的时候才会走到这里，不是热路径。
+     */
+    private function methodsFor(string $path): string
+    {
+        $out = "";
+        foreach ($this->routes as $method => $list) {
+            if ($this->match((string) $method, $path) === null) {
+                continue;
+            }
+            if ($out !== "") {
+                $out .= ", ";
+            }
+            $out .= $method;
+        }
+        return $out;
+    }
+
     private function match(string $method, string $path): ?array
     {
         $list = $this->routes[$method] ?? [];

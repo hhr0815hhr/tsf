@@ -26,8 +26,15 @@ final class WsServer extends Server
         $this->ensureFdLimit($maxConn);
         $this->ensureMemoryLimit($maxConn);
 
-        $server = new \Swoole\WebSocket\Server($this->host, $this->port);
-        $server->set([
+        // WSS：两个 ssl 选项都给了就是 wss://（见 Server::sslEnabled）
+        $ssl = $this->sslEnabled();
+        $server = new \Swoole\WebSocket\Server(
+            $this->host,
+            $this->port,
+            SWOOLE_PROCESS,
+            $ssl ? (SWOOLE_SOCK_TCP | SWOOLE_SSL) : SWOOLE_SOCK_TCP
+        );
+        $server->set($this->sslOptions() + [
             "worker_num" => isset($this->options["worker_num"]) ? (int) $this->options["worker_num"] : 1,
             "reactor_num" => isset($this->options["reactor_num"]) ? (int) $this->options["reactor_num"] : 1,
             "max_conn" => $maxConn,
@@ -37,8 +44,20 @@ final class WsServer extends Server
             "open_tcp_nodelay" => !isset($this->options["nodelay"]) || (bool) $this->options["nodelay"],
             // 单条消息上限，防止恶意大帧打爆内存
             "package_max_length" => isset($this->options["max_frame"]) ? (int) $this->options["max_frame"] : 1024 * 1024,
+            // 下面两项和 TcpServer 对齐（2026-11-25 补）。之前 WS 这边漏了：
+            // Swoole 默认每连接输出缓冲 2MB、每个回调开一个 2MB 栈的协程，
+            // 连接数上千后内存按连接数膨胀，而 TcpServer 那边早就因为同样的问题 OOM 过。
+            "buffer_output_size" => isset($this->options["buffer_output_size"])
+                ? (int) $this->options["buffer_output_size"] : 65536,
+            "enable_coroutine" => isset($this->options["enable_coroutine"])
+                ? (bool) $this->options["enable_coroutine"] : false,
+            // 停机排空窗口（秒）。语义和取舍见 Server::maxWaitTime()
+            "max_wait_time" => $this->maxWaitTime(),
             "log_level" => 4,
         ]);
+        if ($ssl) {
+            Logger::info("tls enabled", ["proto" => "ws", "cert" => $this->options["ssl_cert_file"]]);
+        }
         $this->server = $server;
 
         $server->on("open", function ($serv, $request) {
@@ -68,6 +87,11 @@ final class WsServer extends Server
             $this->fireWorkerStart($workerId);
         });
 
+        // worker 退出前：停机钩子 → 服务排空 → 逐个 onStop（同 TcpServer）
+        $server->on("workerStop", function ($serv, int $workerId) {
+            $this->fireWorkerStop($workerId);
+        });
+
         Logger::info("server listen", ["proto" => "ws", "host" => $this->host, "port" => $this->port]);
         $server->start();
     }
@@ -93,6 +117,19 @@ final class WsServer extends Server
         if ($this->server !== null) {
             $this->server->close($fd);
         }
+    }
+
+    public function peerOf(int $fd): string
+    {
+        if ($this->server === null) {
+            return "";
+        }
+        $info = $this->server->getClientInfo($fd);
+        if (!is_array($info)) {
+            return "";
+        }
+        $ip = $info["remote_ip"] ?? "";
+        return is_string($ip) ? $ip : "";
     }
 
     public function server(): ?\Swoole\WebSocket\Server

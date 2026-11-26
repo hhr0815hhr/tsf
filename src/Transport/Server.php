@@ -251,6 +251,18 @@ abstract class Server
 
 
 
+    /**
+     * 一条连接的对端 IP；拿不到时返回空串。
+     *
+     * 给网关做"按来源"的准入用（登录失败封禁、未登录流量的限流）。默认实现拿不到——
+     * 子类（TcpServer / WsServer）从 Swoole 的连接信息里取。业务不能假定一定有值：
+     * 测试里的假传输、以及某些代理之后的部署，这里都会是空串，调用方要有退化路径。
+     */
+    public function peerOf(int $fd): string
+    {
+        return "";
+    }
+
     /** 把已注册的 worker 启动钩子依次跑一遍（子类在 Swoole 的 workerStart 里调） */
     protected function fireWorkerStart(int $workerId): void
     {
@@ -259,6 +271,152 @@ abstract class Server
                 $cb($workerId);
             }
         }
+    }
+
+    /**
+     * worker 停止钩子（列表，同 `onWorkerStart`）。在服务停机**之前**执行，收 workerId。
+     *
+     * 给"要在服务还活着的时候做"的收尾用：通知在线玩家"服务器即将重启"、把队列里的
+     * 广播冲出去。属于某个服务的收尾写在它自己的 `onStop()` 里；
+     * 所有服务都停了之后才做的事用 `Scheduler::onShutdown()`。
+     *
+     * @var array<int, callable>
+     */
+    protected array $onShutdown = [];
+
+    /** 排空预算（毫秒）：停机时给"已收到但没处理"的消息的时间上限 */
+    protected int $drainMs = 1000;
+
+    public function onShutdown(callable $cb): void
+    {
+        $this->onShutdown[] = $cb;
+    }
+
+    /** 设置停机排空预算（毫秒）。0 = 不排空，收到信号立刻停服务 */
+    public function setDrainMs(int $ms): void
+    {
+        $this->drainMs = $ms > 0 ? $ms : 0;
+    }
+
+    /**
+     * 停机时的排空窗口（秒），对应 Swoole 的 `max_wait_time`。
+     *
+     * worker 收到 SIGTERM 之后，Swoole 先让 reactor 继续跑这么久（新到的包照常处理），
+     * 然后才触发 `WorkerStop`——框架的停机流程（排空、`onStop`）挂在 `WorkerStop` 上。
+     * 实测（2026-11-25）：只要有持久定时器在（框架的 1ms 调度定时器就是），这个窗口
+     * **一定会等满**，不管当时忙不忙；所以它同时就是"发信号到进程退出"的最短时间。
+     *
+     * - 默认 3（Swoole 的默认值）：滚动重启时让在途请求跑完。
+     * - 想让空闲进程秒退就调小；最小 0，实测退出耗时从约 2.5 秒降到 20 多毫秒，
+     *   停机流程照样完整执行。
+     * - 窗口里 Swoole 一定会打一行 `ERRNO 9101 worker exit timeout, forced termination`。
+     *   它只说明"窗口到期时定时器还在"，不代表有东西没处理完——以紧随其后的
+     *   `scheduler shutdown` 日志为准。
+     */
+    protected function maxWaitTime(): int
+    {
+        if (!isset($this->options["max_wait_time"])) {
+            return 3;
+        }
+        $v = (int) $this->options["max_wait_time"];
+        return $v < 0 ? 0 : $v;
+    }
+
+    /**
+     * worker 停止：依次执行停机钩子 → 调度器停机 → 冲掉还没写出的回包。
+     * 子类在 Swoole 的 workerStop 回调里调。
+     *
+     * 为什么挂在 `WorkerStop`：实测它**在两条退出路径下都会触发**——
+     * 正常退出和窗口到期后的强制退出——而 worker 里接管不了 SIGTERM
+     * （`signal [15] processor has been registered by the system`）。
+     * 所以它是唯一可靠的落点：回调里的清理一定跑完进程才退出。
+     */
+    protected function fireWorkerStop(int $workerId): void
+    {
+        $t0 = hrtime(true);
+        foreach ($this->onShutdown as $cb) {
+            try {
+                if (is_callable($cb)) {
+                    $cb($workerId);
+                }
+            } catch (\Throwable $e) {
+                Logger::error("server shutdown hook threw", [
+                    "worker" => $workerId,
+                    "err" => $e->getMessage(),
+                ]);
+            }
+        }
+        $res = Scheduler::instance()->shutdown($this->drainMs);
+        // 批量模式下还没写出的回包：不冲掉就等于最后一批回复永远发不出去
+        $this->flushPending();
+        $ms = intdiv(hrtime(true) - $t0, 1000000);
+        Logger::info("worker stopped", [
+            "worker" => $workerId,
+            "drained" => $res["drained"],
+            "dropped" => $res["dropped"],
+            "stopped" => $res["stopped"],
+            "ms" => $ms,
+        ]);
+    }
+
+    /**
+     * 是否启用了 TLS。
+     *
+     * 两个选项都给才启用：`ssl_cert_file`（证书链，PEM）和 `ssl_key_file`（私钥，PEM）。
+     * 给了一个、漏了另一个是配置错误，按没启用处理并记一条 error——
+     * 静默降级成明文是最糟的结果：运维以为加密了，实际上端口是裸的。
+     *
+     * ## 它能保证什么
+     *
+     * 传输加密：链路上的窃听者看不到帧内容，中间人无法在不被察觉的情况下篡改。
+     * 明文连接会被握手直接拒掉（`wrong version number`），不存在"协商降级到明文"。
+     *
+     * ## 它不能保证什么
+     *
+     * **证书必须由客户端校验。** 客户端把 `verify_peer` 关掉的话，加密还在，
+     * 但中间人保护没了——游戏客户端至少要做证书固定（证书公钥指纹比对）。
+     * 集群内部（`Cluster`）不走这里，它仍然是明文 + 握手 mac，**不能暴露在不可信网络上**。
+     */
+    protected function sslEnabled(): bool
+    {
+        $cert = isset($this->options["ssl_cert_file"]) ? (string) $this->options["ssl_cert_file"] : "";
+        $key = isset($this->options["ssl_key_file"]) ? (string) $this->options["ssl_key_file"] : "";
+        if ($cert === "" && $key === "") {
+            return false;
+        }
+        if ($cert === "" || $key === "") {
+            Logger::error("ssl: ssl_cert_file 和 ssl_key_file 必须同时配置，当前按明文启动", [
+                "cert" => $cert !== "",
+                "key" => $key !== "",
+            ]);
+            return false;
+        }
+        if (!is_file($cert) || !is_file($key)) {
+            Logger::error("ssl: 证书或私钥文件不存在，当前按明文启动", [
+                "cert" => $cert,
+                "key" => $key,
+            ]);
+            return false;
+        }
+        return true;
+    }
+
+    /** @return array<string, string> 传给 Swoole 的 ssl_* 选项；未启用时为空 */
+    protected function sslOptions(): array
+    {
+        if (!$this->sslEnabled()) {
+            return [];
+        }
+        return [
+            "ssl_cert_file" => (string) $this->options["ssl_cert_file"],
+            "ssl_key_file" => (string) $this->options["ssl_key_file"],
+        ];
+    }
+
+    /** 是否启用了 TLS（给业务和自省用；子类在 start() 之后才有意义） */
+    public function isSecure(): bool
+    {
+        return $this->sslEnabled();
     }
 
     abstract public function start(): void;
@@ -533,6 +691,8 @@ abstract class Server
 
         $this->inFeed = true;
         $guard = 0;
+        // 是否撞到了单次处理的帧数上限（见循环末尾的 guard 注释）
+        $cut = false;
         while (true) {
             $frame = null;
             $tDecode = $prof ? hrtime(true) : 0;
@@ -587,7 +747,10 @@ abstract class Server
 
             $guard++;
             if ($guard > 1000) {
-                // 防止单个连接一次塞几千帧把其他连接饿死
+                // 防止单个连接一次塞几千帧把其他连接饿死。
+                // 剩余字节留在缓冲里，由循环之后的 resumeLater() 接着消化
+                // ——不能就这么等着它下次再发数据，见那里的注释。
+                $cut = true;
                 break;
             }
         }
@@ -596,6 +759,68 @@ abstract class Server
         if ($this->batchSend) {
             $this->flushBatch();
         }
+        if ($cut) {
+            $this->resumeLater($fd);
+        }
+    }
+
+    /**
+     * 一条连接的积压还没消化完：让出一次事件循环，然后继续处理它。
+     *
+     * ## 为什么需要
+     *
+     * feed() 每次最多处理 1000 帧就得让位（否则一条连接能饿死其它连接）。
+     * 在那之前，剩下的帧只是留在缓冲里，**要等这条连接下一次发来任何字节才会被处理**。
+     * 客户端"一次发 3000 帧、然后只等回包"时，后面约 1000 帧的回包永远不来，
+     * 直到它超时或者碰巧又发了点别的。实测见 tests/feed-resume。
+     *
+     * 让位的目的是给别人机会，不是"停止服务这条连接"。所以这里安排一个 1ms 后的
+     * 续处理，而不是无限期地等。（1ms 是 Swoole 定时器的最小粒度；写 0 会报
+     * "Timer must be greater than or equal to 1" 且定时器不触发——实测踩过。
+     * 它也顺带是单连接处理速率的上限：1000 帧/ms，远高于任何真实业务。）
+     *
+     * ## 每轮仍然只有 1000 帧
+     *
+     * resume() 调的还是 feed()，所以同样受 1000 帧的限制：积压 1 万帧就是 10 轮，
+     * 每轮之间其它连接的事件都能插进来。公平性不变，只是不再需要客户端"催"。
+     *
+     * ## 没有事件循环时保持原行为
+     *
+     * 纯 PHP 单测直接调 feed()（没有 Swoole 定时器）时无法安排续处理，
+     * 那就和原来一样等下一次收包——不假装安排了。
+     */
+    private function resumeLater(int $fd): void
+    {
+        if ($this->buffers[$fd] === "") {
+            return;
+        }
+        if (!function_exists("swoole_timer_after")) {
+            return;
+        }
+        // 用 $self 捕获而不是直接在闭包里写 $this（同 Scheduler::dispatchAsync）。
+        // 注意参数：`Timer::tick` 的回调会收到定时器 id，`Timer::after` 的回调**没有参数**。
+        // 照搬 tick 写成 `function (int $timerId)` 会抛 ArgumentCountError
+        // （expects exactly 1 argument, 0 given）——实测踩过。
+        $self = $this;
+        \Swoole\Timer::after(1, function () use ($self, $fd): void {
+            $self->resume($fd);
+        });
+    }
+
+    /**
+     * 继续消化某条连接缓冲里的积压。由 resumeLater() 在 1ms 定时器回调里调用。
+     *
+     * public：它从定时器闭包里被调用，而"闭包能否访问同类私有方法"在 AOT 下没验证过。
+     */
+    public function resume(int $fd): void
+    {
+        // 安排续处理之后连接可能已经关了。缓冲条目在 detached() 里被删掉，
+        // 这里必须判空直接返回——否则会给一个已关闭的 fd 重新建一个缓冲条目，
+        // 而且再也没人来删它（每关闭一条连接就漏一条）。
+        if (!isset($this->buffers[$fd])) {
+            return;
+        }
+        $this->feed($fd, "");
     }
 
     protected function attached(int $fd): void

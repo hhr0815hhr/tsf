@@ -66,10 +66,11 @@ final class Request
     }
 
     /**
-     * 从 Authorization 头取 Bearer token。
+     * 从 Authorization 头取 Bearer token。**只看请求头。**
      *
-     * 也接受 `token` 查询参数（浏览器直接打开调试接口时方便），
-     * 但生产环境应该只用 Authorization 头 —— query 里的 token 会进访问日志。
+     * 此前也接受 `?token=` 查询参数（"浏览器调试时方便"）。但 query 会进访问日志、
+     * 代理日志、浏览器历史和 Referer——等于把凭据抄在了好几个地方。方便调试的办法有很多，
+     * 不必挑一个把凭据泄漏出去的。要调试就用请求头（curl 的 `-H`，或浏览器插件）。
      */
     public function bearerToken(): string
     {
@@ -77,6 +78,6 @@ final class Request
         if (strncmp($h, "Bearer ", 7) === 0) {
             return substr($h, 7);
         }
-        return $this->queryOf("token");
+        return "";
     }
 }

@@ -98,6 +98,10 @@ function buildGateway(AppConfig $cfg, Server $server, ProtocolStack $proto): Gat
         $codec
     );
     $gw->setSendFailLimit($cfg->sendFailLimit);
+    // 未登录流量按来源 IP 限流：每连接的限流断开重连就拿到新桶，等于没有。
+    // 登录时限（30 秒）、登录失败处置（单连接 5 次 / 同一来源 60 秒内 10 次封 10 分钟）
+    // 是 Gateway 的默认值；要改用 setLoginTimeout() / setLoginFailLimit()。
+    $gw->setPeerLimiter(new RateLimiter($cfg->ratePerSec, $cfg->rateBurst));
     return $gw;
 }
 

@@ -6,6 +6,7 @@ use TSF\Cluster\Addr;
 use TSF\Cluster\Cluster;
 use TSF\Kernel\CrashDump;
 use TSF\Kernel\Logger;
+use TSF\Metrics\Metrics;
 use TSF\Timer\Cron;
 use TSF\Timer\Timers;
 
@@ -58,7 +59,19 @@ final class Scheduler
 
     private int $readyHead = 0;
 
-    private int $nextId = 1;
+    /**
+     * 本地服务 id 分配器：单调递增、到顶回绕、带最小宽限期。
+     *
+     * 原来是一个只增不收的计数器——16,777,215 次 spawn 之后这个进程永久不能再建服务。
+     * 为什么用回绕而不是空闲表，见 IdAllocator 的类注释。
+     */
+    private IdAllocator $ids;
+
+    /** id 回绕后的最小宽限期（毫秒），见 IdAllocator */
+    private const ID_GRACE_MS = 5000;
+
+    /** 已经打过日志的回绕次数（每回绕一次只记一行） */
+    private int $idWrapsSeen = 0;
 
     /**
      * 单个服务在一轮里最多处理多少条。
@@ -275,6 +288,18 @@ final class Scheduler
     public function __construct()
     {
         $this->timers = new Timers();
+        $this->ids = new IdAllocator(Addr::MAX_ID, self::ID_GRACE_MS);
+    }
+
+    /**
+     * 设置 id 回绕后的最小宽限期（毫秒）。默认 5 秒。
+     *
+     * 只在极端高频的 spawn/kill 下才起作用（回绕间隔本身通常以小时计），
+     * 见 IdAllocator。压测或测试里想让回绕快一点可以调小；设 0 = 不设宽限期。
+     */
+    public function setIdGraceMs(int $ms): void
+    {
+        $this->ids->setGraceMs($ms);
     }
 
     public function setCluster(Cluster $c): void
@@ -302,7 +327,27 @@ final class Scheduler
         /** 两次 tick 之间的最大间隔（µs）。协程模式下这才是"真阻塞"的信号 */
         "max_tick_gap_us" => 0,
         "slow_tick" => 0,
+        /** 停机时因排空预算用尽而丢弃的消息数（见 shutdown） */
+        "shutdown_dropped" => 0,
+        /** 服务 id 回绕次数（> 0 说明这个进程已经用完过一整轮地址空间） */
+        "id_wraps" => 0,
     ];
+
+    /** 已进入停机流程（`shutdown()` 调用之后一直为 true） */
+    private bool $stopping = false;
+
+    /**
+     * 服务已全部停止：此后的投递一律拒绝。
+     *
+     * 和 `$stopping` 分开：排空期间服务之间还要互相发消息，那时不能拒。
+     */
+    private bool $stopped = false;
+
+    /** @var array<int, \Closure> */
+    private array $shutdownHooks = [];
+
+    /** @var array<string, int>|null 停机结果；没停过时为 null */
+    private ?array $shutdownResult = null;
 
     public static function instance(): Scheduler
     {
@@ -312,6 +357,23 @@ final class Scheduler
             Logger::setTraceProvider(function (): int {
                 return Scheduler::instance()->currentTrace();
             });
+            // 运行时指标：导出时现取（见 Metrics::$providers 的注释）。闭包每次都走 instance()，
+            // 所以 `Scheduler::reset()` 之后取到的是新实例，不会把旧实例的数加进来
+            Metrics::provide("tsf_scheduler", function (): array {
+                return Scheduler::instance()->stats();
+            }, [
+                "handled",
+                "spawned",
+                "killed",
+                "undelivered",
+                "overflow",
+                "errors",
+                "timers_cancelled",
+                "slow",
+                "slow_tick",
+                "shutdown_dropped",
+                "id_wraps",
+            ]);
         }
         return self::$self;
     }
@@ -522,12 +584,22 @@ final class Scheduler
 
     private function create(\Closure $factory): int
     {
-        if ($this->nextId > Addr::MAX_ID) {
-            throw new \RuntimeException("service: 本地服务 id 用尽");
+        if ($this->stopping) {
+            throw new \RuntimeException("service: 调度器已停机，不能再创建服务");
         }
-
-        $id = $this->nextId;
-        $this->nextId++;
+        $self = $this;
+        $id = $this->ids->acquire(self::nowMs(), function (int $candidate) use ($self): bool {
+            return isset($self->services[$candidate]);
+        });
+        if ($this->ids->wraps() !== $this->idWrapsSeen) {
+            // 回绕本身不是错误，但值得知道：从这一刻起 id 开始被复用
+            //（每个 id 要隔一整轮地址空间才会轮到第二次）。
+            $this->idWrapsSeen = $this->ids->wraps();
+            Logger::warn("service id space wrapped: ids are being reused", [
+                "wraps" => $this->idWrapsSeen,
+                "services" => count($this->services),
+            ]);
+        }
 
         $svc = $factory();
         if (!($svc instanceof Service)) {
@@ -565,6 +637,7 @@ final class Scheduler
         $svc = $this->services[$id];
         unset($this->services[$id], $this->boxes[$id]);
         $this->stat["killed"]++;
+        $this->ids->release($id, self::nowMs());
         // 必须撤销它名下的定时器：否则到点还会往一个已销毁的服务投消息
         $cancelled = $this->timers->cancelAllOf($id);
         if ($cancelled > 0) {
@@ -596,7 +669,7 @@ final class Scheduler
         $toNode = $to >> Addr::ID_BITS;
         if ($toNode !== 0 && $toNode !== $this->localNode) {
             // 跨节点：交给 Cluster 攒批发出去
-            if ($this->cluster === null) {
+            if ($this->cluster === null || $this->stopped) {
                 $this->stat["undelivered"]++;
                 return false;
             }
@@ -609,7 +682,8 @@ final class Scheduler
 
         $id = $to & Addr::ID_MASK;
         $box = $this->boxes[$id] ?? null;
-        if ($box === null) {
+        if ($box === null || $this->stopped) {
+            // 服务已停机或不存在：计入 undelivered，而不是悄悄建一个没人读的信箱
             $this->stat["undelivered"]++;
             return false;
         }
@@ -939,6 +1013,10 @@ final class Scheduler
     /** 一次性定时：$ms 之后给 $addr 投一条 $msgId 消息，返回定时器 id */
     public function timeout(int $addr, int $ms, int $msgId, string|array|object $data = ""): int
     {
+        if ($this->stopping) {
+            // 已停机：定时器不会再被调度，注册它没有意义（见 shutdown）
+            return 0;
+        }
         if ($ms < 0) {
             $ms = 0;
         }
@@ -949,6 +1027,9 @@ final class Scheduler
     /** 周期定时：每 $ms 投一条，返回定时器 id（cancel 时用同一个 id） */
     public function interval(int $addr, int $ms, int $msgId, string|array|object $data = ""): int
     {
+        if ($this->stopping) {
+            return 0;
+        }
         if ($ms <= 0) {
             throw new \RuntimeException("timer: interval 必须 > 0 毫秒");
         }
@@ -964,6 +1045,9 @@ final class Scheduler
      */
     public function every(string $cron, int $addr, int $msgId, string|array|object $data = ""): int
     {
+        if ($this->stopping) {
+            return 0;
+        }
         $now = self::nowMs();
         $nextTs = Cron::next($cron, intdiv($now, 1000));
         if ($nextTs <= 0) {
@@ -1031,6 +1115,144 @@ final class Scheduler
         return count($this->services);
     }
 
+    /**
+     * 停机：排空就绪消息 → 逐个 `onStop` → 收尾钩子。**幂等**，重复调用直接返回上次的结果。
+     *
+     * ## 为什么必须有这一段
+     *
+     * 进程收到 SIGTERM 时，框架此前什么都没做：`Service::onStop` 只有 `kill()` 会调，
+     * 于是 `Discovery\LocalNode` 指望在 `onStop` 里注销、账本指望在这里落最后一次快照——
+     * 全都不执行。实测（2026-11-25，tests/shutdown-guard）：空闲进程等满 `max_wait_time`
+     * 被强杀（`ERRNO 9101 worker exit timeout, forced termination`），一个 `onStop` 都没跑。
+     *
+     * ## 顺序及理由
+     *
+     * 1. **先停定时器**：停机期间不该再有定时器往信箱里投消息，否则排空永远排不完。
+     * 2. **排空就绪队列**（有预算）：已经收到的请求尽量处理完再走。之后信箱里还剩的
+     *    会被丢弃并计数——这是停机唯一会丢的消息，所以必须可见。
+     * 3. **逆着创建顺序逐个 `onStop`**：后创建的服务更可能依赖先创建的（房间依赖世界、
+     *    战斗依赖房间），反着停才不会出现"被依赖者先没了"。单个 `onStop` 抛异常不影响其它服务。
+     * 4. **收尾钩子**（`onShutdown()`）：所有服务都停了之后做进程级的落盘。
+     * 5. **把跨节点写缓冲冲出去**：让对端最后收到的消息尽量完整。
+     *
+     * ## 能保证什么、不能保证什么
+     *
+     * 能：`onStop` 和收尾钩子一定被**调用**（单个抛异常也会继续），排空有上限不会卡死。
+     * 不能：**打断**一个卡住的 `onStop`——它是同步代码，卡住了整个 worker 就跟着卡住，
+     * 只能靠外部（k8s 的 terminationGracePeriod）兜底。所以每个超过预算的 `onStop` 都记 warn。
+     *
+     * @param int $drainMs 排空预算（毫秒）。0 = 不排空，直接停。
+     * @return array<string, int> drained / dropped / stopped / failed / timers / ms
+     */
+    public function shutdown(int $drainMs = 1000): array
+    {
+        if ($this->shutdownResult !== null) {
+            return $this->shutdownResult;
+        }
+        $t0 = hrtime(true);
+        $this->stopping = true;
+
+        $cancelled = $this->timers->clearAll();
+        if ($cancelled > 0) {
+            $this->stat["timers_cancelled"] += $cancelled;
+        }
+
+        $drained = 0;
+        if ($drainMs > 0) {
+            $deadline = $t0 + $drainMs * 1000000;
+            while ($this->readyHead < count($this->ready) && hrtime(true) < $deadline) {
+                $n = $this->tick(2000);
+                $drained += $n;
+                if ($n === 0) {
+                    break;
+                }
+            }
+        }
+        $this->stopped = true;
+        $dropped = 0;
+        foreach ($this->boxes as $box) {
+            $dropped += $box->clear();
+        }
+
+        // 逆着创建顺序停。先拷一份 id 列表：kill() 会从 services 里删元素
+        $ids = array_keys($this->services);
+        $stopped = 0;
+        $failed = 0;
+        $slow = 0;
+        for ($i = count($ids) - 1; $i >= 0; $i--) {
+            $id = $ids[$i];
+            $t1 = hrtime(true);
+            try {
+                if ($this->kill($id)) {
+                    $stopped++;
+                }
+            } catch (\Throwable $e) {
+                $failed++;
+                Logger::error("service onStop threw during shutdown", [
+                    "svc" => Addr::label($id),
+                    "err" => $e->getMessage(),
+                ]);
+            }
+            $costMs = intdiv(hrtime(true) - $t1, 1000000);
+            if ($costMs >= 1000) {
+                $slow++;
+                Logger::warn("service onStop is slow during shutdown", [
+                    "svc" => Addr::label($id),
+                    "ms" => $costMs,
+                ]);
+            }
+        }
+
+        foreach ($this->shutdownHooks as $hook) {
+            try {
+                $hook();
+            } catch (\Throwable $e) {
+                $failed++;
+                Logger::error("shutdown hook threw", ["err" => $e->getMessage()]);
+            }
+        }
+
+        if ($this->cluster !== null) {
+            $this->cluster->flush();
+        }
+
+        $this->stat["shutdown_dropped"] = $dropped;
+        $this->shutdownResult = [
+            "drained" => $drained,
+            "dropped" => $dropped,
+            "stopped" => $stopped,
+            "failed" => $failed,
+            "slow" => $slow,
+            "timers" => $cancelled,
+            "ms" => intdiv(hrtime(true) - $t0, 1000000),
+        ];
+        Logger::info("scheduler shutdown", $this->shutdownResult);
+        return $this->shutdownResult;
+    }
+
+    /**
+     * 注册停机收尾钩子：所有服务的 `onStop` 都执行完之后按注册顺序调用。
+     *
+     * 给"不属于任何一个服务的东西"用——进程级的落盘、关连接池。
+     * 属于某个服务的收尾写在它自己的 `onStop()` 里。
+     */
+    public function onShutdown(\Closure $fn): void
+    {
+        $this->shutdownHooks[] = $fn;
+    }
+
+    /** 是否已进入停机流程（`shutdown()` 调用之后一直为 true） */
+    public function stopping(): bool
+    {
+        return $this->stopping;
+    }
+
+    /** @return array<string, int>|null 停机结果；没停过时为 null */
+    public function shutdownResult(): ?array
+    {
+        return $this->shutdownResult;
+    }
+
     /** @return array<string, int> */
     public function stats(): array
     {
@@ -1038,6 +1260,9 @@ final class Scheduler
         $out["services"] = count($this->services);
         $out["ready"] = count($this->ready) - $this->readyHead;
         $out["timers"] = $this->timers->size();
+        $out["id_wraps"] = $this->ids->wraps();
+        // 还没用过的服务 id。接近 0 就快回绕了——回绕不是错误，但这是观察它的唯一窗口
+        $out["ids_left"] = $this->ids->left();
         return $out;
     }
 }

@@ -863,10 +863,27 @@ function verifySuites(): array
         // 属于最该在回归里拦住的一类问题
         ["id" => "docs", "desc" => "文档链接有效性（36 条）", "sh" => "scripts/check-doc-links.sh"],
         ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh", "needs" => ["python3"]],
-        ["id" => "swoole", "desc" => "Swoole 契约（6 项）", "sh" => "tests/swoole-contract/run.sh"],
+        ["id" => "swoole", "desc" => "Swoole 契约（10 项）", "sh" => "tests/swoole-contract/run.sh"],
         ["id" => "aoi", "desc" => "AOI 网格（36 项：边界/邻域对拍/规模）", "sh" => "tests/aoi-test/run.sh"],
         ["id" => "frameloop", "desc" => "帧循环 delta（12 项：首帧/倒退/封顶）", "sh" => "tests/frameloop-test/run.sh"],
         ["id" => "frame", "desc" => "拆包/粘包/非法帧（4 项）", "sh" => "tests/frame-test/run.sh"],
+        // 下面三个是 2026-11-25 框架审计实测出来的缺陷钉成的回归（见 ARCHITECTURE-REVIEW §57）。
+        // 共同点：进程不崩、不报错，只是"偶发丢请求"——没有断言盯着就等于没有。
+        ["id" => "gw-guard", "desc" => "网关守卫：handler 抛异常不丢帧、不逃逸（13 项）", "sh" => "tests/gw-guard/run.sh"],
+        ["id" => "cluster-guard", "desc" => "集群守卫：坏包后丢弃链路、节点不停摆（2 种坏包 × 9 项）", "sh" => "tests/cluster-guard/run.sh"],
+        ["id" => "feed-resume", "desc" => "积压续处理：一次灌 3000/12000 帧不催也回齐（10 项）", "sh" => "tests/feed-resume/run.sh"],
+        // SIGTERM 之后停机流程（排空 / 逆序 onStop / 钩子）是否完整。修之前一个 onStop 都不执行
+        ["id" => "shutdown-guard", "desc" => "停机守卫：SIGTERM 后排空与 onStop（3 个场景，16 项）", "sh" => "tests/shutdown-guard/run.sh"],
+        // 配了证书就走 TLS / WSS；明文连接必须被拒；不配证书时行为不变
+        ["id" => "tls-guard", "desc" => "TLS/WSS：加密收发、拒绝明文、不配证书行为不变（16 项）", "sh" => "tests/tls-guard/run.sh"],
+        // 登录时限 / 登录失败处置 / 未登录流量按来源限流 / token 作废；网关走 assemble() 装配
+        ["id" => "admission", "desc" => "连接准入：登录时限/失败封禁/来源限流/token 作废（38 项）", "sh" => "tests/admission/run.sh"],
+        // 注册表里活着的节点 → Cluster::watchPeer；挂在 LocalNode 心跳上
+        ["id" => "membership", "desc" => "成员联动：注册表 → watchPeer（含换地址重启，38 项）", "sh" => "tests/membership/run.sh"],
+        // 24 位服务 id 用完一轮之后还能不能建服务（含真的绕一轮：1600 万次 spawn + kill）
+        ["id" => "id-recycle", "desc" => "服务 id 回收：单调/回绕/宽限期 + 真绕一轮（53 项）", "sh" => "tests/id-recycle/run.sh"],
+        // 日志按大小轮转 + 保留份数；GM 审计独立文件；两进程并发轮转不出空层
+        ["id" => "log-rotate", "desc" => "日志轮转/保留份数/gm 独立通道（含并发写入）", "sh" => "tests/log-rotate/run.sh"],
         ["id" => "db", "desc" => "事务/嵌套/批量/Repo（sqlite 内存库）", "sh" => "tests/db-test/run.sh"],
         ["id" => "migrate", "desc" => "迁移链（版本解析/顺序/幂等）", "sh" => "tests/migrate-test/run.sh"],
         ["id" => "timer", "desc" => "定时器 / cron 下次触发", "sh" => "tests/timer-test/run.sh"],
@@ -877,11 +894,22 @@ function verifySuites(): array
         ["id" => "room", "desc" => "房间/成员/共享宿主（100 项）", "sh" => "tests/room-test/run.sh"],
         ["id" => "cluster", "desc" => "集群/房间归属（11 项）", "sh" => "demo/duel/run-cluster.sh"],
         ["id" => "cluster-chan", "desc" => "集群通道/握手（TCP 11 项 + UDS 2000 往返）", "sh" => "tests/cluster-test/run.sh"],
+        // 断链后自动重连、拨号不阻塞调度、两端同时互拨只留一条
+        ["id" => "cluster-reconnect", "desc" => "集群断线重连：重启/退避/非阻塞拨号/双向互拨（30 项）", "sh" => "tests/cluster-reconnect/run.sh"],
         // 需要 Redis；没有的话脚本自己打 SKIP 并返回 0（环境没装不该判红）
         ["id" => "registry", "desc" => "Redis 注册表+租约（38 项，无 Redis 则 SKIP）", "sh" => "tests/registry-test/run.sh"],
+        // 接真 MySQL 的三个。以前只有 skip-auto（声明"没有数据库实例"），却还把 mail 挂在
+        // 这张表里指向一个不存在的 run.sh —— lint 只查"有没有注册"，不查脚本在不在，
+        // 于是它永远 SKIP、永远是绿的。仓库里本来就有 scripts/dev-mysql.sh，
+        // 起一个容器就能真跑；缺库时 exit 77。
+        ["id" => "mail", "desc" => "邮件（过期/原子领取/未读，无 MySQL 则 SKIP）", "sh" => "tests/mail-test/run.sh"],
+        ["id" => "db-mysql", "desc" => "db 接真 MySQL（严格模式/建表/迁移，无 MySQL 则 SKIP）", "sh" => "tests/db-mysql-test/run.sh"],
+        ["id" => "db-shards", "desc" => "分片库路由与跨库迁移（无 MySQL 则 SKIP）", "sh" => "tests/db-shards-test/run.sh"],
+        ["id" => "db-pg", "desc" => "db 接真 PostgreSQL（方言差异/迁移/事务隔离，无 PG 则 SKIP）", "sh" => "tests/db-pg-test/run.sh"],
+        ["id" => "redis", "desc" => "pkg/redis（基本命令/nil/哈希/有序集合/重连/pipeline，无 Redis 则 SKIP）", "sh" => "tests/redis-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（120 项：含版本落后调度）", "sh" => "tests/handoff-test/run.sh"],
         ["id" => "config", "desc" => "配置加载/热更/校验", "sh" => "tests/config-test/run.sh"],
-        ["id" => "gm", "desc" => "GM 命令/权限/审计", "sh" => "tests/gm-test/run.sh"],
+        ["id" => "gm", "desc" => "GM 命令/权限/审计/一人一个 token（55 项）", "sh" => "tests/gm-test/run.sh"],
         ["id" => "proto", "desc" => "协议编解码/版本协商", "sh" => "tests/proto-test/run.sh"],
         ["id" => "watch", "desc" => "watch 增量重编与失败处理", "sh" => "tests/watch-test/run.sh"],
         ["id" => "breaker", "desc" => "熔断降级：打开/半开/关闭", "sh" => "tests/breaker-test/run.sh"],
@@ -890,7 +918,6 @@ function verifySuites(): array
         ["id" => "metrics", "desc" => "埋点/聚合/慢调用打点", "sh" => "tests/metrics-test/run.sh"],
         ["id" => "service", "desc" => "服务生命周期/停机/crash dump", "sh" => "tests/service-test/run.sh"],
         ["id" => "discovery", "desc" => "服务发现：注册/失效/收敛", "sh" => "tests/discovery-test/run.sh"],
-        ["id" => "mail", "desc" => "邮件（需 MySQL，默认 SKIP）", "sh" => "tests/mail-test/run.sh"],
         ["id" => "entity", "desc" => "实体属性/脏标记/持久化字段", "sh" => "tests/entity-test/run.sh"],
         ["id" => "fsm", "desc" => "状态机转移/守卫/非法转移", "sh" => "tests/fsm-test/run.sh"],
         ["id" => "match", "desc" => "匹配规则/评分/候选筛选", "sh" => "tests/match-test/run.sh"],
@@ -899,7 +926,7 @@ function verifySuites(): array
         ["id" => "eventlog", "desc" => "追加/重放/坏行修复/截断/多节点归并", "sh" => "tests/eventlog-test/run.sh"],
         ["id" => "checkpoint", "desc" => "事件日志检查点（45 项：截断/等价/水位/增量/坏点被拒）", "sh" => "tests/checkpoint-test/run.sh"],
         ["id" => "schema", "desc" => "状态版本迁移链（19 项：缺 _v/拒绝降级/恢复集成）", "sh" => "tests/snapshot-migrate-test/run.sh"],
-        ["id" => "prom", "desc" => "Prometheus 导出（34 项：格式/名字/TYPE/来源限制）", "sh" => "tests/prom-test/run.sh"],
+        ["id" => "prom", "desc" => "Prometheus 导出（51 项：格式/名字/TYPE/来源限制/运行时指标）", "sh" => "tests/prom-test/run.sh"],
         ["id" => "rpc", "desc" => "RPC（56 项：调用/超时/并发/codec/版本协商/自愈）", "sh" => "tests/rpc-test/run.sh"],
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
@@ -1894,6 +1921,77 @@ function cmdLint(string $root): int
             return 1;
         }
 
+        /*
+         * 反过来也查一遍：**注册了、脚本却不存在**。
+         *
+         * 上面那条只查"tests/ 下有 main.php 的目录在不在表里"，不查表里的路径在不在磁盘上。
+         * 实测（2026-11-25）：`mail` 这一条指向 tests/mail-test/run.sh，而那个目录只有
+         * skip-auto、没有 run.sh。verify 里它显示成 SKIP、永远不红，
+         * lint 也永远通过——一张注册表里躺着一个空条目，没人看得出来。
+         */
+        $ghost = [];
+        foreach (verifySuites() as $vs) {
+            $sh = (string) $vs["sh"];
+            if (strncmp($sh, "tests/", 6) === 0 && !is_file(dirname($root) . "/" . $sh)) {
+                $ghost[] = (string) $vs["id"] . " → " . $sh;
+            }
+        }
+        if ($ghost !== []) {
+            say("");
+            say(c("  注册了不存在的脚本：", "r")
+                . "verifySuites() 里这些条目的 run.sh 不在磁盘上，verify 里永远 SKIP、永远不红");
+            foreach ($ghost as $g) {
+                say("    " . $g);
+            }
+            say(c("  补脚本，或把条目删掉（目录有 main.php 的话写 skip-auto 说明原因）", "d"));
+            return 1;
+        }
+
+        /*
+         * 再查一条：**run.sh 自己会不会编译**。
+         *
+         * 实测（2026-11-26）：`gm-test` / `fd-test` / `settle-crash` 三个套件的 run.sh 里没有编译步骤，
+         * 直接跑目录里的旧产物——产物停在 11 月 16 日。之后十天里每一次"全量通过"，
+         * 这三个套件验证的都是十天前的代码，而输出里它们是绿的。
+         * run.sh 的约定是"自己负责 build"（见 README），但没有任何东西检查这一条。
+         *
+         * 认几种写法：显式 build、走共用入口 scripts/run-svc-test.sh（它内部 build）、
+         * `tsf run` / `tsf watch`（它们自己也 build）。
+         */
+        $noBuild = [];
+        foreach (verifySuites() as $vs) {
+            $sh = (string) $vs["sh"];
+            $full = dirname($root) . "/" . $sh;
+            if (!is_file($full)) {
+                continue;   // 上一条已经报过了
+            }
+            $txt = (string) @file_get_contents($full);
+            // 去掉注释行：注释里写了"build"不算数
+            $code = preg_replace('/^\s*#.*/m', '', $txt);
+            if (!is_string($code)) {
+                $code = $txt;
+            }
+            if (strpos($code, "build") === false
+                && strpos($code, "run-svc-test.sh") === false
+                && strpos($code, " watch ") === false
+                && strpos($code, " run ") === false
+                // 解释执行的套件（直接 php85 main.php）没有产物，谈不上旧
+                && strpos($code, "php85 main.php") === false
+            ) {
+                $noBuild[] = (string) $vs["id"] . " → " . $sh;
+            }
+        }
+        if ($noBuild !== []) {
+            say("");
+            say(c("  run.sh 不编译，跑的是目录里的旧产物：", "r")
+                . "verify 里它是绿的，但验证的不是当前代码");
+            foreach ($noBuild as $g) {
+                say("    " . $g);
+            }
+            say(c("  在 run.sh 里加 `php85 \"\$ROOT/tsf/bin/tsf\" build .`，失败即 exit 1", "d"));
+            return 1;
+        }
+
         return 0;
     }
 
@@ -2165,9 +2263,22 @@ switch ($cmd) {
                 // 限流：每秒补充 rate_per_sec 个令牌，桶容量 rate_burst
                 "rate_per_sec" => 50,
                 "rate_burst" => 100,
+                // 未登录流量**按来源 IP** 的限流（同一来源的未登录连接共用一个桶，重连拿不到新桶）。
+                // 不配 = 和上面同档；配 0 关闭
+                // "peer_rate_per_sec": 50,
+                // "peer_rate_burst": 100,
+                // 连上之后这么久还没登录就断开（未登录的连接可以一直发心跳躲开空闲清扫）。0 = 关闭
+                "login_timeout_sec" => 30,
+                // 登录失败处置：同一连接连续 5 次 → 断开；同一来源 60 秒内 10 次 → 封 600 秒
+                "login_fail_per_conn" => 5,
+                "login_fail_per_ip" => 10,
+                "login_fail_window_sec" => 60,
+                "login_ban_sec" => 600,
                 "auth" => [
                     // require=false 仅用于压测/内网；生产必须为 true
                     "require" => true,
+                    // 是否接受永不过期的 2 段旧格式 token。生产环境应当 false
+                    "allow_legacy" => true,
                     "secret" => "dev-secret-change-me",
                     "tokens" => [
                         "tok-1001" => 1001,

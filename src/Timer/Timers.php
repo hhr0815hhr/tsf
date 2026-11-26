@@ -155,6 +155,25 @@ final class Timers
         return $n;
     }
 
+    /**
+     * 撤销全部定时器，返回撤销的个数。停机时用。
+     *
+     * 不逐个 cancel：轮 / 堆 / immediate 里的条目直接丢掉即可——之后不会再有 due() 调用，
+     * 墓碑计数也就没有意义了，一并归零。
+     */
+    public function clearAll(): int
+    {
+        $n = count($this->live);
+        $this->wheel = [];
+        $this->immediate = [];
+        $this->far = new TimerHeap();
+        $this->live = [];
+        $this->byService = [];
+        $this->tombstones = 0;
+        $this->nearMinDue = 0;
+        return $n;
+    }
+
     public function size(): int
     {
         return count($this->live);

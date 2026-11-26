@@ -121,6 +121,7 @@ final class Router
         if (!is_string($raw)) {
             // 跨进程时 RawPayload 只搬 string；收到非 string 说明对端不是本 RPC 实现
             $this->unrouted++;
+            Metrics::inc("rpc.unrouted");
             $this->reply($m, false, "bad-envelope");
             return true;
         }
@@ -132,6 +133,7 @@ final class Router
             $cut = strpos($rest, Rpc::SEP);
             if ($cut === false) {
                 $this->unrouted++;
+                Metrics::inc("rpc.unrouted");
                 $this->reply($m, false, "bad-request");
                 return true;
             }
@@ -155,6 +157,7 @@ final class Router
             // codec 解不出来：说明两端协议不一致，或对端发的东西坏了。
             // 必须回一个错误，让调用方立刻知道，而不是等超时
             $this->unrouted++;
+            Metrics::inc("rpc.unrouted");
             $this->reply($m, false, "bad-request");
             return true;
         }
@@ -165,6 +168,7 @@ final class Router
         $h = $this->handlers[$method] ?? null;
         if (!($h instanceof \Closure)) {
             $this->unrouted++;
+            Metrics::inc("rpc.unrouted");
             $this->reply($m, false, "no-method:" . $method);
             return true;
         }
@@ -172,6 +176,7 @@ final class Router
         try {
             $out = $h($body, $m);
             $this->handled++;
+            Metrics::inc("rpc.handled");
             // 不靠 `is_string()` 判定：AOT 下闭包返回值经过类型擦除后，
             // `is_string` 可能对字符串也返回 false，导致"handler 明明返回了内容、
             // 对端却收到空串"。这里直接取字符串化结果，非字串一律当空。
@@ -185,6 +190,7 @@ final class Router
         } catch (\Throwable $e) {
             // 处理函数崩了也要回包：调用方等到超时才知道失败，是最难排查的情况
             $this->errors++;
+            Metrics::inc("rpc.errors");
             $this->reply($m, false, "handler-error:" . $e->getMessage());
         }
         return true;

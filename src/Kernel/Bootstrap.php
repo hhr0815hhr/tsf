@@ -44,6 +44,29 @@ final class Bootstrap
         $logLevel = Logger::levelFromName($levelName);
         $logStdout = Config::getBool("log.stdout", false);
         Logger::init($channel, $logFile, $logLevel, $logStdout);
+        // 轮转：默认单文件 64 MB、保留 5 份（磁盘上限约 384 MB）。max_bytes 设 0 = 不轮转。
+        // 默认值必须有——没有上限的日志迟早写满磁盘，之后所有日志静默消失。
+        Logger::setRotation(
+            Config::getInt("log.max_bytes", 67108864),
+            Config::getInt("log.max_files", 5)
+        );
+        // 审计通道：GM 指令单独落一个文件，和运行日志分开留存、分开检索。
+        // 不配就放在日志目录下；显式配成空串 = 关闭（审计记录回到主日志）。
+        $gmFile = Config::getString("log.gm_file", "");
+        if ($gmFile === "" && !Config::has("log.gm_file")) {
+            if ($logFile !== "") {
+                $gmFile = dirname($logFile) . "/gm.log";
+            }
+        }
+        if ($gmFile !== "") {
+            Logger::initChannel(
+                "gm",
+                $gmFile,
+                Logger::INFO,
+                Config::getInt("log.gm_max_bytes", 134217728),
+                Config::getInt("log.gm_max_files", 10)
+            );
+        }
 
         // 3) 基础信息不放进任何全局注册表：baseDir/env 由 Bootstrap 自己的访问器提供。
         //    （曾经有个 Container，已删——静态容器是隐式共享，和"只发消息"的模型冲突。）

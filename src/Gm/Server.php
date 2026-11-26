@@ -42,6 +42,11 @@ use TSF\Service\Service;
  * **4. 鉴权失败要限流。** 否则这个端口就是个可以无限猜 token 的口令框。
  * 同一 IP 一分钟失败 10 次就拒绝（429），并记一条 warn。
  *
+ * **5. 一人一个 token（推荐）。** `setOperators(["zhangsan" => "tok-a", "lisi" => "tok-b"])` 之后，
+ * 每个操作人用自己的 token，审计日志里的操作人**来自 token**，不再是请求头自报；
+ * 某个人离职，摘掉他的 token 就行，不用全组换密钥。构造函数里的那个共享 token 仍然可用
+ * （不配它就只认操作人 token）。见 `TSF\Gm\Server::setOperators()` 的注释。
+ *
  * ## 为什么是"迷你 HTTP"而不是完整实现
  *
  * 只支持 POST /gm + GET /health，一律 `Connection: close`，不解析 chunked、
@@ -63,7 +68,19 @@ final class Server extends Service
 
     private string $token;
 
+    /**
+     * 一人一个 token：token => 操作人名。为空 = 只有共享 token。
+     *
+     * 共享 token 的问题是它答不了"这条指令是谁发的"——几个人共用一个 token，
+     * 审计日志里的操作人只能靠请求头自报（`x-gm-operator`），想赖就能赖。
+     * 一人一个之后，操作人就是 token 对应的名字，伪造不了。
+     */
+    private array $operators = [];
+
     private int $pollMs;
+
+    /** 上一次回收异步任务表的时间（单调毫秒） */
+    private int $lastGcMs = 0;
 
     /** @var resource|null */
     private $server = null;
@@ -100,6 +117,72 @@ final class Server extends Service
         $this->pollMs = $pollMs > 0 ? $pollMs : 5;
     }
 
+    /**
+     * 一人一个 token。`$tokens` 是 操作人名 => token。
+     *
+     * ```php
+     * $gm->setOperators(["zhangsan" => $tokA, "lisi" => $tokB]);
+     * ```
+     *
+     * - 配了之后，用这些 token 发来的指令，审计日志里的 `op` 就是**名字**；请求头里的
+     *   `x-gm-operator` 被忽略（自报的身份不许覆盖 token 的身份）。
+     * - 构造函数里的共享 token 仍然有效（如果非空）：用它的指令仍按请求头记操作人。
+     *   想彻底停用共享 token，构造时传空串——只要操作人 token 至少有一个，就允许启动。
+     * - 同一个 token 配给了两个人：后配的生效，并记一条 warn（多半是复制粘贴错了）。
+     * - 某个操作人离职：`removeOperator("name")`，立刻失效。
+     *
+     * token 的生成：用足够长的随机串（`bin2hex(random_bytes(24))`），不要用名字、工号这类能猜的东西。
+     */
+    public function setOperators(array $tokens): void
+    {
+        foreach ($tokens as $name => $tok) {
+            $n = (string) $name;
+            $t = (string) $tok;
+            if ($n === "" || $t === "") {
+                continue;
+            }
+            if (isset($this->operators[$t]) && $this->operators[$t] !== $n) {
+                Logger::warn("gm: same token assigned to two operators, the later one wins", [
+                    "first" => $this->operators[$t],
+                    "later" => $n,
+                ]);
+            }
+            $this->operators[$t] = $n;
+        }
+    }
+
+    /**
+     * 换共享 token。传空串 = 停用共享 token（只要还有操作人 token 就仍然可用）。
+     * 立刻生效：之后带着旧 token 的请求一律 401。
+     */
+    public function setSharedToken(string $token): void
+    {
+        $this->token = $token;
+    }
+
+    /** 停用某个操作人的全部 token */
+    public function removeOperator(string $name): int
+    {
+        $n = 0;
+        foreach ($this->operators as $tok => $who) {
+            if ($who === $name) {
+                unset($this->operators[$tok]);
+                $n++;
+            }
+        }
+        return $n;
+    }
+
+    /** @return array<string, string> 操作人名 => 是否还有有效 token */
+    public function operators(): array
+    {
+        $out = [];
+        foreach ($this->operators as $who) {
+            $out[$who] = true;
+        }
+        return $out;
+    }
+
     /** 调整爆破阈值（测试用；默认 1 分钟 10 次） */
     public function setAuthFailLimit(int $maxPerWindow, int $windowMs): void
     {
@@ -109,10 +192,11 @@ final class Server extends Service
 
     public function onStart(): void
     {
-        if ($this->token === "") {
+        if ($this->token === "" && $this->operators === []) {
             // 宁可起不来，也不要以空口令跑起来
             throw new \RuntimeException(
-                "GM 通道必须配置 token。空口令的调试模式一旦上线，等于把发奖接口挂在公网上"
+                "GM 通道必须配置 token（共享 token 或至少一个操作人 token）。"
+                . "空口令的调试模式一旦上线，等于把发奖接口挂在公网上"
             );
         }
 
@@ -166,6 +250,8 @@ final class Server extends Service
             "short_write" => $this->shortWrite,
             "conns" => count($this->conns),
             "listen_error" => $this->listenError,
+            "operators" => count($this->operators),
+            "shared_token" => $this->token !== "" ? 1 : 0,
         ];
     }
 
@@ -178,6 +264,12 @@ final class Server extends Service
         }
         $now = Scheduler::nowMs();
         $this->acceptNew($now);
+        // 异步任务表每分钟收一次：任务是静态数组，没人清理的话长跑进程里一路涨。
+        // 此前 Task::gc() 写好了但**没有任何调用方**
+        if ($now - $this->lastGcMs >= 60000) {
+            $this->lastGcMs = $now;
+            Task::gc();
+        }
 
         foreach ($this->conns as $id => $c) {
             if ($c->sock === null) {
@@ -323,13 +415,18 @@ final class Server extends Service
                 $given = substr($auth, 7);
             }
         }
-        if (!$this->tokenMatches($given)) {
+        $operator = $this->authenticate($given);
+        if ($operator === null) {
             $this->authFailCount++;
             $this->noteAuthFail($ip, $now);
             // 响应里不区分"没带 token"和"token 不对"：少给爆破者一点信息
             Logger::warn("gm auth failed", ["peer" => $c->peer]);
             $this->respond($c, 401, "{\"ok\":false,\"error\":\"鉴权失败\"}");
             return;
+        }
+        // 操作人 token 认出来的身份优先；共享 token 只能靠请求头自报
+        if ($operator === "") {
+            $operator = self::operatorOf($headers);
         }
 
         $this->requests++;
@@ -351,7 +448,8 @@ final class Server extends Service
         $cmd = isset($req["cmd"]) && is_string($req["cmd"]) ? $req["cmd"] : "";
         $args = isset($req["args"]) && is_array($req["args"]) ? $req["args"] : [];
 
-        $r = Registry::dispatch($cmd, $args, $c->peer);
+        // 操作人的来源见 authenticate()
+        $r = Registry::dispatch($cmd, $args, $c->peer, $operator);
         if ($r->ok) {
             $this->okCount++;
             $this->respond($c, 200, $r->body());
@@ -359,6 +457,36 @@ final class Server extends Service
         }
         $this->failCount++;
         $this->respond($c, 200, $r->body());
+    }
+
+    /** 从请求头取操作人：最多 64 字节，去掉换行、引号这类会破坏 JSON 行的字符 */
+    private static function operatorOf(array $headers): string
+    {
+        if (!isset($headers["x-gm-operator"])) {
+            return "";
+        }
+        $raw = (string) $headers["x-gm-operator"];
+        // 逐字节过滤而不是正则：正则的返回类型在 AOT 下是 string|null 联合，要绕着写。
+        // 丢掉控制字符、引号和反斜杠（它们会破坏 JSON 行）；>= 0x80 的字节保留，
+        // 中文操作人名才写得进去。
+        $op = "";
+        $n = strlen($raw);
+        for ($i = 0; $i < $n; $i++) {
+            $b = ord($raw[$i]);
+            if ($b < 0x20 || $b === 0x7F || $raw[$i] === '"' || $raw[$i] === '\\') {
+                continue;
+            }
+            $op .= $raw[$i];
+        }
+        // 必须是合法 UTF-8：否则 json_encode 整条记录失败，审计就丢了
+        if (preg_match('//u', $op) !== 1) {
+            return "";
+        }
+        if (strlen($op) > 64) {
+            // 按字符截断，不切断多字节字符
+            $op = mb_strcut($op, 0, 64);
+        }
+        return trim($op);
     }
 
     private function respond(Conn $c, int $status, string $body): void
@@ -407,16 +535,51 @@ final class Server extends Service
      * 理论上能被按字节爆破。这里用异或累加消除提前返回。
      * 长度本身会泄漏（不同长度直接返回 false），但那只泄漏"长度"，没有意义。
      */
-    private function tokenMatches(string $given): bool
+    /**
+     * 验 token，并认出操作人。
+     *
+     * 返回 null = 没通过；"" = 通过的是共享 token（没有可信的身份）；
+     * 其它字符串 = 通过的是某个操作人的 token，值就是他的名字。
+     *
+     * 所有 token 都比完才返回，命中了也不提前退出：否则"token 对了"比"token 错了"
+     * 少花的时间，等于告诉爆破者"你猜的前缀是对的"。
+     */
+    private function authenticate(string $given): ?string
     {
-        $want = $this->token;
-        if (strlen($given) !== strlen($want)) {
+        // 两个变量分开而不是"先置 null 再赋字符串"：AOT 不允许一个变量先后是 null 和字符串
+        $found = false;
+        $name = "";
+        if ($this->token !== "" && self::sameString($given, $this->token)) {
+            $found = true;
+        }
+        foreach ($this->operators as $tok => $who) {
+            if (self::sameString($given, $tok)) {
+                $found = true;
+                $name = (string) $who;
+            }
+        }
+        if (!$found) {
+            return null;
+        }
+        return $name;
+    }
+
+    /**
+     * 定长比较，不提前返回。
+     *
+     * `===` 在 PHP 里对字符串是"先比长度、再逐字节"，命中第一个不同字节就返回——
+     * 理论上能被按字节爆破。这里用异或累加消除提前返回。
+     * 长度本身会泄漏（不同长度直接返回 false），但那只泄漏"长度"，没有意义。
+     */
+    private static function sameString(string $a, string $b): bool
+    {
+        if (strlen($a) !== strlen($b)) {
             return false;
         }
         $diff = 0;
-        $n = strlen($want);
+        $n = strlen($b);
         for ($i = 0; $i < $n; $i++) {
-            $diff |= ord($given[$i]) ^ ord($want[$i]);
+            $diff |= ord($a[$i]) ^ ord($b[$i]);
         }
         return $diff === 0;
     }

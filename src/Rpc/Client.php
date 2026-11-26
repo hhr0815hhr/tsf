@@ -2,6 +2,7 @@
 
 namespace TSF\Rpc;
 
+use TSF\Metrics\Metrics;
 use TSF\Rpc\Codec\JsonCodec;
 use TSF\Rpc\Contract\RpcCodec;
 use TSF\Service\Message;
@@ -172,11 +173,13 @@ final class Client extends Service
     {
         if ($addr === 0) {
             $this->failed++;
+            Metrics::inc("rpc.failed");
             $cb(null, "bad-addr");
             return 0;
         }
         if (count($this->pending) >= $this->maxPending) {
             $this->failed++;
+            Metrics::inc("rpc.failed");
             $cb(null, "too-many-pending");
             return 0;
         }
@@ -209,6 +212,7 @@ final class Client extends Service
         if ($payload === "") {
             unset($this->pending[$id]);
             $this->failed++;
+            Metrics::inc("rpc.failed");
             $cb(null, "encode-failed");
             return 0;
         }
@@ -219,6 +223,8 @@ final class Client extends Service
         }
 
         $this->sent++;
+
+        Metrics::inc("rpc.sent");
         $s = Scheduler::instance();
         // deliverAs 而不是 deliver：必须让 from 是**本 RPC 服务的地址**，
         // 否则响应会回到"当前正在处理消息的那个服务"的信箱里去
@@ -297,6 +303,7 @@ final class Client extends Service
         $p["retried"] = true;
         $this->pending[$id] = $p;
         $this->sent++;
+        Metrics::inc("rpc.sent");
         Scheduler::instance()->deliverAs($this->addr(), $p["addr"], Rpc::MSG_REQ, $payload, $id);
     }
 
@@ -324,6 +331,7 @@ final class Client extends Service
             // 超时之后才到的响应。计数而不回调——调用方已经收到过"超时"了，
             // 再回调一次会让它对同一笔请求处理两遍
             $this->late++;
+            Metrics::inc("rpc.late");
             return;
         }
         unset($this->pending[$id]);
@@ -332,8 +340,10 @@ final class Client extends Service
 
         if ($success) {
             $this->ok++;
+            Metrics::inc("rpc.ok");
         } else {
             $this->failed++;
+            Metrics::inc("rpc.failed");
         }
         if ($cb instanceof \Closure) {
             $cb($success ? $body : null, $success ? "" : $body);
@@ -360,6 +370,7 @@ final class Client extends Service
             }
             unset($this->pending[$id]);
             $this->timedOut++;
+            Metrics::inc("rpc.timeout");
             $cb = $p["cb"];
             if ($cb instanceof \Closure) {
                 $cb(null, "timeout");

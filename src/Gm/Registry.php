@@ -84,16 +84,22 @@ final class Registry
      * 派发并记审计日志。**不抛异常**。
      *
      * `$peer` 是调用方 IP（已经过鉴权），写进审计日志用于追责。
+     *
+     * `$operator` 是操作人（调用方自报，取自请求头 `x-gm-operator`）。
+     * **它不是鉴权**——GM 通道只有一个共享 token，谁拿着 token 都可以填任何名字。
+     * 它的用途是让同一个 token 的几个人不至于"查不出是谁发的"：审计日志里
+     * "谁、从哪个 IP、什么时候、执行了什么、结果如何"四样里，此前缺的正好是第一样。
+     * 要真正的操作人身份，得换成一人一个 token（未做）。
      */
-    public static function dispatch(string $cmd, array $args, string $peer = ""): Result
+    public static function dispatch(string $cmd, array $args, string $peer = "", string $operator = ""): Result
     {
         $t0 = hrtime(true);
 
         if ($cmd === "") {
-            return self::audit($cmd, $args, $peer, Result::fail("缺少 cmd"), $t0);
+            return self::audit($cmd, $args, $peer, Result::fail("缺少 cmd"), $t0, $operator);
         }
         if (!isset(self::$handlers[$cmd])) {
-            return self::audit($cmd, $args, $peer, Result::fail("未知指令：" . $cmd), $t0);
+            return self::audit($cmd, $args, $peer, Result::fail("未知指令：" . $cmd), $t0, $operator);
         }
 
         $r = null;
@@ -109,10 +115,17 @@ final class Registry
         if (!($r instanceof Result)) {
             $r = Result::fail("handler 没有返回 Result");
         }
-        return self::audit($cmd, $args, $peer, $r, $t0);
+        return self::audit($cmd, $args, $peer, $r, $t0, $operator);
     }
 
-    private static function audit(string $cmd, array $args, string $peer, Result $r, int $t0): Result
+    private static function audit(
+        string $cmd,
+        array $args,
+        string $peer,
+        Result $r,
+        int $t0,
+        string $operator = ""
+    ): Result
     {
         $us = (int) round((float) (hrtime(true) - $t0) / 1000.0);
         $argStr = "";
@@ -138,12 +151,18 @@ final class Registry
             "ok" => $r->ok,
             "us" => $us,
         ];
+        if ($operator !== "") {
+            $ctx["op"] = $operator;
+        }
         if (!$r->ok) {
             $ctx["err"] = $r->error;
         }
-        // 审计用 info 级别：它必须默认可见（warn 以上会被刷屏淹没，
-        // 而审计的价值恰恰在于"事后按 uid 搜一条操作记录"）
-        Logger::info("gm: " . $cmd, $ctx);
+        // 写 gm 通道（Bootstrap 默认把 `log.gm_file` 建成独立文件）。没建这个通道时
+        // `Logger::to` 落回主日志——审计记录永远有地方可去。
+        //
+        // 成功是 info、失败是 warn：审计的价值恰恰在于"事后按 uid 搜一条操作记录"，
+        // 所以成功的操作必须默认可见；失败的操作本来就该醒目一点。
+        Logger::to("gm", $r->ok ? Logger::INFO : Logger::WARN, "gm: " . $cmd, $ctx);
 
         return $r;
     }

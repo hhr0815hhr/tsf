@@ -3,6 +3,7 @@
 namespace TSF\Discovery;
 
 use TSF\Discovery\Contract\Registry;
+use TSF\Kernel\Logger;
 use TSF\Service\Message;
 use TSF\Service\Service;
 
@@ -45,6 +46,9 @@ final class LocalNode extends Service
 
     private bool $registered = false;
 
+    /** @var array<int, \Closure> 每次心跳之后要做的事：对账、同步成员…… */
+    private array $afterBeat = [];
+
     public function __construct(Registry $registry, NodeInfo $info, int $beatMs = 1000)
     {
         $this->registry = $registry;
@@ -65,6 +69,32 @@ final class LocalNode extends Service
         }
         $this->beats++;
         $this->registry->heartbeat($this->info->nodeId);
+        foreach ($this->afterBeat as $cb) {
+            try {
+                $cb();
+            } catch (\Throwable $e) {
+                // 对账失败不该让心跳服务崩掉：记一行，下个周期再来
+                Logger::error("localnode: after-beat hook failed", ["err" => $e->getMessage()]);
+            }
+        }
+    }
+
+    /**
+     * 注册"每次心跳之后"要做的事。典型用法：跟着心跳对一遍集群成员。
+     *
+     * ```php
+     * $membership = new Membership($registry, $cluster);
+     * $node->afterBeat(function () use ($membership): void {
+     *     $membership->sync();
+     * });
+     * ```
+     *
+     * 为什么挂在这里：心跳的周期本来就是"我发现对端变化的粒度"（TTL 的量级），
+     * 对账跟着它走最自然，不用再起一个定时器。
+     */
+    public function afterBeat(\Closure $cb): void
+    {
+        $this->afterBeat[] = $cb;
     }
 
     public function onStop(): void

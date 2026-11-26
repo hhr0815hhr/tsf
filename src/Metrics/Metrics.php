@@ -54,6 +54,26 @@ final class Metrics
     /** @var array<string, int> 被限流压掉的慢调用数 */
     private static array $suppressed = [];
 
+    /**
+     * 运行时指标的提供者：前缀 => [function (): array<string, int>, ...]。
+     *
+     * ## 为什么和业务埋点分开
+     *
+     * 业务埋点（`inc` / `gauge`）是**推**：代码在事件点上记一笔。
+     * 框架自己的统计（调度器处理了多少消息、网关有多少会话、集群断了多少次链路）
+     * 本来就各自存在 `stats()` 里，再去事件点补一次 `inc` 等于同一件事记两遍，
+     * 还要动热路径。所以这里用**拉**：导出的时候现取。
+     *
+     * 同一个前缀可以有多个提供者（一个进程里两个集群节点、两个网关），取值时相加——
+     * "总处理条数""总会话数"本来就该是求和。
+     *
+     * @var array<string, array<int, \Closure>>
+     */
+    private static array $providers = [];
+
+    /** @var array<string, array<int, string>> 每个前缀里哪些键是单调计数（其余按 gauge） */
+    private static array $providerCounters = [];
+
     /** 同一个指标两条慢日志之间的最小间隔（ms） */
     private static int $slowIntervalMs = 1000;
 
@@ -279,6 +299,73 @@ final class Metrics
     public static function dump(): void
     {
         Logger::info(self::table());
+    }
+
+    /**
+     * 登记一个运行时指标提供者。
+     *
+     * `$fn` 返回 `array<string, int>`（通常就是组件的 `stats()`）。导出时每个键变成
+     * `<前缀>_<键>`；在 `$counters` 里列出的是单调计数（Prometheus 里可以 `rate()`），
+     * 没列出的一律按 gauge。
+     *
+     * @param array<int, string> $counters
+     */
+    public static function provide(string $prefix, \Closure $fn, array $counters = []): void
+    {
+        // rtrim：`sanitize` 会把 "bad prefix!" 末尾的非法字符变成下划线，前缀不该以它结尾
+        $p = rtrim(Prometheus::sanitize($prefix), "_");
+        if ($p === "") {
+            return;
+        }
+        self::$providers[$p][] = $fn;
+        self::$providerCounters[$p] = $counters;
+    }
+
+    /** 清掉所有提供者（测试用；`reset()` 不清这里——提供者是"谁在运行"，不是"记了多少"） */
+    public static function clearProviders(): void
+    {
+        self::$providers = [];
+        self::$providerCounters = [];
+    }
+
+    /**
+     * 当前所有运行时指标，键是 `<前缀>_<键>`，同前缀的多个提供者已相加。
+     *
+     * @return array<string, int>
+     */
+    public static function runtimeSnapshot(): array
+    {
+        $out = [];
+        foreach (self::$providers as $prefix => $fns) {
+            foreach ($fns as $fn) {
+                $stats = $fn();
+                foreach ($stats as $k => $v) {
+                    $name = $prefix . "_" . Prometheus::sanitize((string) $k);
+                    if (isset($out[$name])) {
+                        $out[$name] += $v;
+                    } else {
+                        $out[$name] = $v;
+                    }
+                }
+            }
+        }
+        return $out;
+    }
+
+    /** 运行时指标里哪些是单调计数（给导出器标 TYPE 用） */
+    public static function isRuntimeCounter(string $name): bool
+    {
+        // 逐个前缀试：键名自己也可能带下划线（max_tick_gap_us），所以不能只按最后一个下划线切
+        foreach (self::$providerCounters as $prefix => $keys) {
+            if (strncmp($name, $prefix . "_", strlen($prefix) + 1) !== 0) {
+                continue;
+            }
+            $key = substr($name, strlen($prefix) + 1);
+            if (in_array($key, $keys, true)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static function reset(): void

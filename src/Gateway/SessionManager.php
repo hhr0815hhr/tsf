@@ -136,6 +136,24 @@ final class SessionManager
         return $dead;
     }
 
+    /**
+     * 找出连上了却一直没登录的连接。
+     *
+     * 和 `sweep()` 分开：空闲判定看的是"最近一帧"，而未登录的连接**可以一直发心跳**
+     * ——每秒一个 PING 就永远不空闲，于是一个连接名额被无限期占着，登录却永远不来。
+     * 所以未登录的连接另有一条从 `openAt` 起算的死线。
+     */
+    public function sweepUnauthed(int $now, int $loginTimeoutSec): array
+    {
+        $dead = [];
+        foreach ($this->byFd as $fd => $s) {
+            if (!$s->authed && $now - $s->openAt > $loginTimeoutSec) {
+                $dead[] = (int) $fd;
+            }
+        }
+        return $dead;
+    }
+
     public function total(): int
     {
         return count($this->byFd);
