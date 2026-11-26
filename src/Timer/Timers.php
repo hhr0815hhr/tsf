@@ -52,6 +52,15 @@ final class Timers
     /** 近端最早到期时刻（只是给 run() 休眠用的提示，可能偏小） */
     private int $nearMinDue = 0;
 
+    /**
+     * 墙钟与单调钟的偏移（墙钟毫秒 - 单调毫秒）。由 `due()` 传入，每轮更新。
+     *
+     * 为什么需要它：cron 表达式按墙钟算（"每天 3 点"），而本模块内部一律用
+     * 单调毫秒。两者不能直接混用——把单调秒当 Unix 时间戳喂给 `date()`，
+     * 日期会整体错位。这里只保存差值，仍然不自己取时钟（便于测试）。
+     */
+    private int $wallOffsetMs = 0;
+
     public function __construct()
     {
         $this->far = new TimerHeap();
@@ -261,8 +270,13 @@ final class Timers
      *
      * @return array<int, Timer>
      */
-    public function due(int $nowMs): array
+    public function due(int $nowMs, int $wallOffsetMs = 0): array
     {
+        // 偏移由调用方给（本模块不自己取时钟）。传 0 表示"沿用上次的"，
+        // 所以没墙钟概念的老调用点行为不变；cron 要正确必须由调度器每轮更新
+        if ($wallOffsetMs !== 0) {
+            $this->wallOffsetMs = $wallOffsetMs;
+        }
         if ($this->cursor < 0) {
             $this->cursor = $nowMs - 1;
         }
@@ -378,9 +392,15 @@ final class Timers
             }
             $this->rearm($t, $next);
         } elseif ($t->cron !== "") {
-            $nextTs = Cron::next($t->cron, intdiv($t->dueAt, 1000));
+            // cron 按墙钟算，但本模块内部是单调毫秒，用偏移换算
+            $wallNowMs = $this->cursor + $this->wallOffsetMs;
+            $nextTs = Cron::next($t->cron, intdiv($wallNowMs, 1000));
             if ($nextTs > 0) {
-                $this->rearm($t, $nextTs * 1000);
+                $delay = $nextTs * 1000 - $wallNowMs;
+                if ($delay <= 0) {
+                    $delay = 1;
+                }
+                $this->rearm($t, $this->cursor + $delay);
             }
             // 表达式永不触发时不再重排，静默退化为一次性
         }

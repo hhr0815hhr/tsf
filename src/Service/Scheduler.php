@@ -1005,7 +1005,12 @@ final class Scheduler
         // 只看 size() 会让 due() 停摆，游标不再前进，那些死对象永远留着
         // （内存单调增长而 stats()["timers"] 一直是 0，见 bench/lifecycle）。
         if ($this->timers->hasPending()) {
-            $due = $this->timers->due(self::nowMs());
+            // 每轮把"墙钟 - 单调钟"的偏移递给 Timers：cron 要用它换算日期，
+            // 而 NTP 校时会让这个偏移变化，所以不能只在启动时算一次。
+            // 用毫秒墙钟：秒精度会让 cron 落点提前最多 1 秒
+            $monoNow = self::nowMs();
+            $wallMs = (int) (microtime(true) * 1000.0);
+            $due = $this->timers->due($monoNow, $wallMs - $monoNow);
             foreach ($due as $t) {
                 // 定时器消息的 from 应该是"自己"（自定闹钟），不是 0（系统）
                 $prev = $this->currentOf();
@@ -1349,11 +1354,23 @@ final class Scheduler
             return 0;
         }
         $now = self::nowMs();
-        $nextTs = Cron::next($cron, intdiv($now, 1000));
+        // Cron 必须按**墙钟**算：它内部用 date()/mktime()，吃的是 Unix 时间戳。
+        // 原来传 intdiv(nowMs(), 1000) 是把 hrtime 秒当纪元秒——hrtime 的起点是
+        // 系统启动，跟 1970 无关，于是日期整体错位（实测"每天 3 点"落到 6:44）。
+        //
+        // 用毫秒而不是 time() 的秒：秒精度会把毫秒截掉，落点比整点提前最多 1 秒
+        // （实测"每天 03:00"落在 02:59:59）。
+        $wallNowMs = (int) (microtime(true) * 1000.0);
+        $nextTs = Cron::next($cron, intdiv($wallNowMs, 1000));
         if ($nextTs <= 0) {
             throw new \RuntimeException("timer: cron 表达式永远不会触发 [" . $cron . "]");
         }
-        return $this->timers->add($now, $addr, $nextTs * 1000, $msgId, $data, 0, $cron);
+        // 换回单调基准：只取"还要等多久"，两个时钟的差值才是可以相加的量
+        $delayMs = $nextTs * 1000 - $wallNowMs;
+        if ($delayMs <= 0) {
+            $delayMs = 1;
+        }
+        return $this->timers->add($now, $addr, $now + $delayMs, $msgId, $data, 0, $cron);
     }
 
     public function cancelTimer(int $timerId): bool
@@ -1554,8 +1571,18 @@ final class Scheduler
     }
 
     /** @return array<string, int> */
-    public function stats(): array
+    /**
+     * 最近一个定时器的到期时刻（单调毫秒）；没有定时器时返回 0。
+     *
+     * cron 定时器的落点对不对，只能从这里看——`stats()["timers"]` 只说数量。
+     * 回归见 `tests/clock-test`。
+     */
+    public function nextTimerDueAt(): int
     {
+        return $this->timers->nextDueAt();
+    }
+
+    public function stats(): array    {
         $out = $this->stat;
         $out["services"] = count($this->services);
         $out["ready"] = count($this->ready) - $this->readyHead;
