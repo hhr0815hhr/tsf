@@ -917,6 +917,12 @@ function verifySuites(): array
         ["id" => "guard", "desc" => "服务守卫：预算/超时/卡死检测", "sh" => "tests/guard-test/run.sh"],
         ["id" => "metrics", "desc" => "埋点/聚合/慢调用打点", "sh" => "tests/metrics-test/run.sh"],
         ["id" => "service", "desc" => "服务生命周期/停机/crash dump", "sh" => "tests/service-test/run.sh"],
+        // 时间片与 tick 总预算：出问题时吞吐不变、只在压力下变慢，没有断言盯着等于没有。
+        // 三个关键语义：只在消息边界生效 / 打断后不丢消息 / 关掉后行为可逆
+        ["id" => "slice", "desc" => "调度时间片 + tick 预算（顺序/不丢/可逆，17 项）", "sh" => "tests/slice-test/run.sh"],
+        // 内存归因默认关闭，开着时只写 error 日志——"没报错"和"没生效"在日志里一样，
+        // 没有断言就分不清守卫是在工作还是根本没跑
+        ["id" => "mem-attr", "desc" => "单服务内存归因：尖峰/配额/kill/清理（15 项）", "sh" => "tests/mem-attr-test/run.sh"],
         ["id" => "discovery", "desc" => "服务发现：注册/失效/收敛", "sh" => "tests/discovery-test/run.sh"],
         ["id" => "entity", "desc" => "实体属性/脏标记/持久化字段", "sh" => "tests/entity-test/run.sh"],
         ["id" => "fsm", "desc" => "状态机转移/守卫/非法转移", "sh" => "tests/fsm-test/run.sh"],
@@ -1800,7 +1806,54 @@ function lintTree(string $base, string $nsPrefix, string $root, array &$problems
     return $checked;
 }
 
-function cmdLint(string $root): int
+/**
+ * 业务工程 `scripts/` 的约束（规则 6/7）。
+ *
+ * 这两条是"热更能不能长期用"的前提，不是洁癖：
+ *
+ * - **规则 6**：脚本里不能有 `class` / `function` 定义。PHP 不允许重复定义，
+ *   `reload()` 第二次必然 `Cannot redeclare`。这个错误在开发期不会暴露
+ *   （第一次加载是好的），要等运营点第一次重载才炸。
+ * - **规则 7**：脚本只能 `use TSF\Script\*`，能力一律从 `Context` 取。
+ *   `12-hot-reload.md` §6.5 那条安全边界——"脚本碰不到任意业务对象"——
+ *   只有落成门禁才守得住，否则第一个图省事的人 `use TSF\Room\Room` 就破了。
+ *
+ * @param array<int, string> $problems
+ */
+function lintScripts(string $dir, string $root, array &$problems): int
+{
+    if (!is_dir($dir)) {
+        return 0;
+    }
+    $checked = 0;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    foreach ($it as $f) {
+        if (!$f->isFile() || substr($f->getPathname(), -4) !== ".php") {
+            continue;
+        }
+        $checked++;
+        $rel = str_replace($root . "/", "", $f->getPathname());
+        $code = (string) file_get_contents($f->getPathname());
+
+        if (preg_match('/^\s*(final\s+|abstract\s+)?class\s+[A-Za-z_]/m', $code)) {
+            $problems[] = $rel . "  脚本里不能定义 class（reload 第二次会 Cannot redeclare）";
+        }
+        if (preg_match('/^\s*function\s+[A-Za-z_]/m', $code)) {
+            $problems[] = $rel . "  脚本里不能定义 function（reload 第二次会 Cannot redeclare）";
+        }
+        if (preg_match_all('/^\s*use\s+(?:function\s+|const\s+)?([^;]+);/m', $code, $m) > 0) {
+            foreach ($m[1] as $u) {
+                $name = trim($u);
+                if (strncmp($name, "TSF\\Script\\", 11) !== 0) {
+                    $problems[] = $rel . "  脚本只能 use TSF\\Script\\*，实际 use 了 " . $name;
+                }
+            }
+        }
+    }
+    return $checked;
+}
+
+function cmdLint(string $root, string $project = ""): int
 {
     $problems = [];
     $hints = [];
@@ -1853,6 +1906,12 @@ function cmdLint(string $root): int
                     . "  ext/ 下不允许 TSF 命名空间的类（适配类应放 src/）";
             }
         }
+    }
+
+    // 规则 6/7：业务工程的 scripts/ 约束。只在目标目录有 scripts/ 时生效，
+    // 所以 `tsf lint` 不带参数（只查框架）的行为完全不变。
+    if ($project !== "" && is_dir($project . "/scripts")) {
+        $checked += lintScripts($project . "/scripts", $project, $problems);
     }
 
     if ($problems === []) {
@@ -2155,7 +2214,23 @@ switch ($cmd) {
         break;
 
     case "lint":
-        exit(cmdLint($tsfRoot));
+        // 可选位置参数：业务工程目录。给了就同时检查它的 scripts/（规则 6/7）。
+        // 不带参数时行为与以前完全一致（只查框架）。
+        $lintTarget = "";
+        $lintN = count($argvv);
+        for ($lintI = 2; $lintI < $lintN; $lintI++) {
+            if (strncmp($argvv[$lintI], "--", 2) !== 0) {
+                $lintTarget = $argvv[$lintI];
+                break;
+            }
+        }
+        if ($lintTarget !== "") {
+            $lintTarget = rtrim(str_replace("\\", "/", $lintTarget), "/");
+            if ($lintTarget === "") {
+                $lintTarget = "/";
+            }
+        }
+        exit(cmdLint($tsfRoot, $lintTarget));
         break;
 
     case "new":

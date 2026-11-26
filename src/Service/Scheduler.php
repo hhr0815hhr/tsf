@@ -111,6 +111,38 @@ final class Scheduler
     /** 超时后的动作：log（只告警）/ kill（销毁服务，后续消息不再处理） */
     private string $watchdogAction = "log";
 
+    /**
+     * 单服务单次调度的时间片（纳秒）；0 = 关闭。
+     *
+     * 与 `$watchdogNs` 的区别见 `setSlice()`：这个在消息边界主动让出，
+     * 而 watchdog 是事后记账。两者共用同一对 `hrtime`，同时开不额外付费。
+     */
+    private int $sliceNs = 0;
+
+    /** 单次 `tick()` 的总预算（纳秒）；0 = 关闭。见 `setTickBudget()` */
+    private int $tickBudgetNs = 0;
+
+    /**
+     * 单批消息允许的内存净增长（字节）；0 = 关闭。见 `setMemGuard()`。
+     *
+     * 为什么只做"归因 + 杀"，不做"隔离"：所有 Service 共享 PHP 堆，
+     * 想做到 Erlang 的 per-process heap 得换运行时。能做的只有
+     * "在 tick 边界量出差值，定位到是谁，然后把它干掉"。
+     */
+    private int $memMsgBytes = 0;
+
+    /** 单服务累计净增长的配额（字节）；0 = 不限制 */
+    private int $memServiceBytes = 0;
+
+    /** 超限动作：log / kill */
+    private string $memAction = "log";
+
+    /** @var array<int, int> addr id => 累计净增长（只累加正增长） */
+    private array $memSpent = [];
+
+    /** @var array<int, int> 已经报过"配额超限"的服务，防止逐批刷日志 */
+    private array $memWarned = [];
+
     /** 当前正在处理哪个服务（用于给发出的消息填 from） */
     private int $current = 0;
 
@@ -331,6 +363,16 @@ final class Scheduler
         "shutdown_dropped" => 0,
         /** 服务 id 回绕次数（> 0 说明这个进程已经用完过一整轮地址空间） */
         "id_wraps" => 0,
+        /** 因单服务时间片用尽而被让出的次数（见 setSlice） */
+        "slice_hit" => 0,
+        /** 因单次 tick 总预算用尽而提前返回的次数（见 setTickBudget） */
+        "tick_over" => 0,
+        /** 单批消息内存增长超过 setMemGuard 阈值的次数 */
+        "mem_spike" => 0,
+        /** 因累计内存超配额被销毁的服务数（只有 action=kill 时才增长） */
+        "mem_kill" => 0,
+        /** 配额超限告警次数。**每个服务最多 1 次**，逐批报会把磁盘写满 */
+        "mem_warn" => 0,
     ];
 
     /** 已进入停机流程（`shutdown()` 调用之后一直为 true） */
@@ -373,6 +415,10 @@ final class Scheduler
                 "slow_tick",
                 "shutdown_dropped",
                 "id_wraps",
+                "slice_hit",
+                "tick_over",
+                "mem_spike",
+                "mem_kill",
             ]);
         }
         return self::$self;
@@ -419,6 +465,98 @@ final class Scheduler
     public function watchdogThresholdMs(): int
     {
         return intdiv($this->watchdogNs, 1000000);
+    }
+
+    /**
+     * 单服务单次调度的时间片（毫秒）。0 = 关闭（默认）。
+     *
+     * 与 `setWatchdog()` 的分工：
+     *   - watchdog 是**单条消息事后**记账：已经卡了才记/杀
+     *   - slice 是**本次调度事前**让出：跑到预算就把剩余消息排到队尾，让别人先跑
+     *
+     * **只在消息边界生效**。一条消息自己跑 100 ms，slice 设 2 ms 也拦不住它——
+     * PHP 无法中断正在执行的代码。这条边界必须知道，否则会误以为它能防死循环。
+     *
+     * **只在同步模式下生效**。协程模式里墙钟包含挂起等 I/O 的时间，拿它做 CPU 预算
+     * 会把"等 redis 30 ms 的服务"误判成慢——协程模式该用 `setBudget` 限条数。
+     *
+     * 代价：需要计时，与 watchdog 共用同一对 `hrtime`（约 +259 ns/条，实测见
+     * `bench/guard-test`）。两个都关时只多一次布尔判断。
+     */
+    public function setSlice(int $ms): void
+    {
+        $this->sliceNs = $ms > 0 ? $ms * 1000000 : 0;
+    }
+
+    public function sliceThresholdMs(): int
+    {
+        return intdiv($this->sliceNs, 1000000);
+    }
+
+    /**
+     * 单次 `tick()` 的总预算（毫秒）。0 = 关闭（默认）。
+     *
+     * 解决的不是"某个服务慢"，而是"这一轮 tick 总体太长"：定时器延迟、IO 回调饥饿、
+     * 心跳抖动都来自它。每处理 64 条消息检查一次（逐条检查要 236 ns，占单消息预算的 27%）。
+     *
+     * 跳出后未处理的消息留在信箱里，下一个 tick 继续——不丢消息。
+     */
+    public function setTickBudget(int $ms): void
+    {
+        $this->tickBudgetNs = $ms > 0 ? $ms * 1000000 : 0;
+    }
+
+    public function tickBudgetMs(): int
+    {
+        return intdiv($this->tickBudgetNs, 1000000);
+    }
+
+    /**
+     * 单服务内存守卫。0 表示关闭对应维度。
+     *
+     * 共享堆下没有 per-process heap，所以这里做的是**归因**而不是隔离：
+     * 在 tick 边界量 `memory_get_usage()` 的差值，归到刚处理完的那个服务上。
+     * 抓得到"一条消息吃 20 MB"和"长期只涨不降"，抓不到"每次 1 KB 慢慢涨"
+     * ——后者需要逐分配追踪，PHP 做不到。
+     *
+     * `$perMsgMb`：单批净增长超过它就记 error（通常是"一次查询捞了整张表"）
+     * `$perServiceMb`：单服务累计超过它就按 `$action` 处理（通常是"缓存没上限"）
+     *
+     * 成本：每个服务每批多两次 `memory_get_usage()`（各约 100 ns）。
+     * 默认关闭——只在排障或"怀疑内存涨得不正常"时打开。
+     *
+     * @param string $action log | kill（kill 会走 `onCrashed`，受监督树约束）
+     */
+    public function setMemGuard(int $perMsgMb, int $perServiceMb, string $action = "log"): void
+    {
+        if ($action !== "log" && $action !== "kill") {
+            throw new \RuntimeException("memGuard: action 只能是 log 或 kill");
+        }
+        $this->memMsgBytes = $perMsgMb > 0 ? $perMsgMb * 1048576 : 0;
+        $this->memServiceBytes = $perServiceMb > 0 ? $perServiceMb * 1048576 : 0;
+        $this->memAction = $action;
+    }
+
+    public function memGuardEnabled(): bool
+    {
+        return $this->memMsgBytes > 0 || $this->memServiceBytes > 0;
+    }
+
+    /**
+     * 每个服务当前的累计净增长（字节），key 是地址的可读形式。
+     *
+     * 这是**累计值**，不是当前占用——PHP 释放内存时不会回退这个数。
+     * 用它判断"谁在涨"，不要用它算"谁占了多少"。
+     *
+     * @return array<string, int>
+     */
+    public function memByService(): array
+    {
+        $out = [];
+        foreach ($this->memSpent as $id => $bytes) {
+            $out[Addr::label($id)] = $bytes;
+        }
+        return $out;
     }
 
     public function budget(): int
@@ -531,6 +669,65 @@ final class Scheduler
      * 和 kill() 的区别：kill() 是**主动**销毁（用户调用，不重启）；
      * onCrashed() 是**异常**导致（可能重启）。
      */
+    /**
+     * 把一段内存增长归到某个服务上，并按阈值处置。
+     *
+     * 只在 tick 边界调用。同一 tick 里服务是串行处理的，所以差值不会混进
+     * 别的服务的分配——但会混进"框架自己"的分配（日志缓冲、信箱扩容），
+     * 所以这条只适合发现**数量级异常**，不适合精确记账。
+     */
+    private function attributeMemory(int $id, int $delta): void
+    {
+        if ($delta > 0) {
+            $prev = 0;
+            if (isset($this->memSpent[$id])) {
+                $prev = $this->memSpent[$id];
+            }
+            $this->memSpent[$id] = $prev + $delta;
+        }
+
+        if ($this->memMsgBytes > 0 && $delta > $this->memMsgBytes) {
+            $this->stat["mem_spike"]++;
+            Logger::error("service memory spike", [
+                "svc" => Addr::label($id),
+                "delta_mb" => intdiv($delta, 1048576),
+                "limit_mb" => intdiv($this->memMsgBytes, 1048576),
+            ]);
+            if ($this->memAction === "kill") {
+                $this->killForMemory($id);
+                return;
+            }
+        }
+
+        $spent = 0;
+        if (isset($this->memSpent[$id])) {
+            $spent = $this->memSpent[$id];
+        }
+        if ($this->memServiceBytes > 0 && $spent > $this->memServiceBytes) {
+            // 只报一次：配额超了之后每一批都会超，逐批打日志会把磁盘写满，
+            // 反而看不到"第一次"——那才是要查的时间点
+            if (!isset($this->memWarned[$id])) {
+                $this->memWarned[$id] = 1;
+                $this->stat["mem_warn"]++;
+                Logger::error("service memory quota exceeded", [
+                    "svc" => Addr::label($id),
+                    "spent_mb" => intdiv($spent, 1048576),
+                    "limit_mb" => intdiv($this->memServiceBytes, 1048576),
+                ]);
+            }
+            if ($this->memAction === "kill") {
+                $this->killForMemory($id);
+            }
+        }
+    }
+
+    private function killForMemory(int $id): void
+    {
+        $this->stat["mem_kill"]++;
+        unset($this->memWarned[$id]);
+        $this->onCrashed($id);
+    }
+
     private function onCrashed(int $addr): void
     {
         $this->kill($addr);
@@ -649,6 +846,9 @@ final class Scheduler
         if ($this->currentOf() === $id) {
             $this->setCurrentOf(0);
         }
+        // 归因表跟着服务一起清：id 会被回收（回绕），留着这笔会让新服务
+        // 一出生就顶着前一个的"内存债"，配额直接超限
+        unset($this->memSpent[$id], $this->memWarned[$id]);
         $svc->onStop();
         return true;
     }
@@ -761,8 +961,22 @@ final class Scheduler
 
         $handled = 0;
         $limit = $maxMsgs > 0 ? $maxMsgs : PHP_INT_MAX;
+        // 总预算：只在开启时取一次时钟，关闭时零成本
+        $tickStart = $this->tickBudgetNs > 0 ? hrtime(true) : 0;
+        // 内存守卫：关闭时不取基线，整个归因分支都不进
+        $memOn = $this->memMsgBytes > 0 || $this->memServiceBytes > 0;
+        // 预算用尽后要连外层一起停：只 break 内层的话，下一个服务照样跑满一整批
+        $stop = false;
 
-        while ($handled < $limit && $this->readyHead < count($this->ready)) {
+        while ($handled < $limit && !$stop && $this->readyHead < count($this->ready)) {
+            // 每 64 条检查一次：逐条检查要 236 ns，会吃掉单消息预算的 27%
+            if ($tickStart !== 0 && ($handled & 63) === 0
+                && hrtime(true) - $tickStart > $this->tickBudgetNs) {
+                $this->stat["tick_over"]++;
+                $stop = true;
+                break;
+            }
+
             $id = $this->ready[$this->readyHead];
             $this->readyHead++;
 
@@ -790,11 +1004,18 @@ final class Scheduler
             $this->setCurrentOf($id);
             $prevTrace = $this->currentTrace();
 
+            // 内存归因的基线：只在同步路径取（协程的批次不在这个调用栈里结束）
+            $memBefore = $memOn ? memory_get_usage() : 0;
+
             $n = 0;
             // budget 提到局部变量：内层每轮读一次属性约 150 ns，按条累加很可观
             $budget = $this->budget;
             // 看门狗阈值也提到局部：关闭时只多一次整数比较
             $wdNs = $this->watchdogNs;
+            // 时间片：和 watchdog 共用同一对 hrtime，两者都关时走无计时分支
+            $sliceNs = $this->sliceNs;
+            $needTime = $wdNs > 0 || $sliceNs > 0;
+            $sliced = 0;
             $m = null;
             // 取证缓冲：开关提到局部，关闭时只多一次判断
             $traceOn = $this->traceOn;
@@ -804,6 +1025,14 @@ final class Scheduler
             // 但语义上本来就是"服务出错即销毁"，剩下的积压消息随服务一起丢弃。
             try {
                 while ($n < $budget) {
+                    // tick 总预算：**放在 pop 之前**。取出消息再放弃就是丢消息，
+                    // 而没有断言的丢消息正是这个项目最怕的一类 bug。
+                    if ($tickStart !== 0 && ($handled & 63) === 0
+                        && hrtime(true) - $tickStart > $this->tickBudgetNs) {
+                        $this->stat["tick_over"]++;
+                        $stop = true;
+                        break;
+                    }
                     $m = $box->pop();
                     if ($m === null) {
                         break;
@@ -813,21 +1042,30 @@ final class Scheduler
                     }
                     // 继承这条消息的链路：服务里 send 出去的自然带上
                     $this->setTrace($m->traceId);
-                    if ($wdNs === 0) {
+                    if (!$needTime) {
                         $svc->onMessage($m);
                     } else {
                         $t0 = hrtime(true);
                         $svc->onMessage($m);
                         $dur = hrtime(true) - $t0;
-                        if ($dur > $wdNs) {
+                        if ($wdNs > 0 && $dur > $wdNs) {
                             // 只能事后记账：实测无法打断正在执行的 CPU 循环（见 watchdogNs 注释）
                             if ($this->onSlow($id, $m, $dur)) {
                                 break;
                             }
                         }
+                        if ($sliceNs > 0) {
+                            $sliced += $dur;
+                        }
                     }
                     $handled++;
                     $n++;
+                    // 时间片用尽：**这条已处理完**，剩余消息由外层重新入队，让别人先跑。
+                    // 只能是消息边界——PHP 无法中断正在执行的代码。
+                    if ($sliceNs > 0 && $sliced > $sliceNs) {
+                        $this->stat["slice_hit"]++;
+                        break;
+                    }
                 }
             } catch (\Throwable $e) {
                 // 单个服务出错不该拖垮整个进程：记录后销毁它（状态可能已不一致）
@@ -859,6 +1097,12 @@ final class Scheduler
             $this->setTrace($prevTrace);
             // 每条都做 $stat["handled"]++ 要 174 ns；按批累加等价，代价可忽略
             $this->stat["handled"] += $n;
+
+            // 内存归因。服务在 catch 里已经被销毁的话跳过——它的对象已经释放，
+            // 这时再往 memSpent 里写一笔，会留下一个永远查不到实体的孤儿记录
+            if ($memOn && isset($this->services[$id])) {
+                $this->attributeMemory($id, memory_get_usage() - $memBefore);
+            }
 
             // 没处理完（撞到 budget）：排到队尾，本轮先让别人跑
             if (isset($this->boxes[$id]) && !$this->boxes[$id]->isEmpty() && !$this->boxes[$id]->queued) {

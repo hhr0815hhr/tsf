@@ -43,6 +43,100 @@ final class Manager
         return $this->scripts[$name] ?? null;
     }
 
+    /** @var array<string, array<int, Script>> 灰度版本：name => ver => Script */
+    private array $alt = [];
+
+    /** @var array<string, int> 灰度比例：name => 0..100 */
+    private array $gray = [];
+
+    /**
+     * 注册同名脚本的另一个版本（灰度用）。
+     *
+     * 为什么不用"直接改 register 的路径"做灰度：那样只能全量切换，切错了只能切回来，
+     * 中间那段时间**所有玩家**都在新逻辑上。灰度要的是"先让 10% 的人踩"。
+     *
+     * @param int $ver 版本号，只用于排错与日志；`pick()` 选的是**最后注册**的那个
+     */
+    public function registerAlt(string $name, int $ver, string $path): Script
+    {
+        $s = new Script($path);
+        if (!isset($this->alt[$name])) {
+            $this->alt[$name] = [];
+        }
+        $this->alt[$name][$ver] = $s;
+        return $s;
+    }
+
+    /**
+     * 灰度比例（0–100）。0 = 全走 `register()` 的版本，100 = 全走 alt。
+     *
+     * 默认 0：注册了灰度版本不等于启用它，要显式设比例——与
+     * `script.autoReload` 默认 false 是同一个原则：危险动作不能靠"配了就等于开了"。
+     */
+    public function setGray(string $name, int $percent): void
+    {
+        if ($percent < 0) {
+            $percent = 0;
+        }
+        if ($percent > 100) {
+            $percent = 100;
+        }
+        $this->gray[$name] = $percent;
+    }
+
+    /**
+     * 按灰度给这个 uid 选版本。同一个 uid 多次调用结果恒定（乘法散列是确定的）。
+     *
+     * **不用 `$uid % 100`**：uid 通常是连续的，取模会按注册批次成段划分
+     * （1001–1100 全进新逻辑）。那就不叫灰度，叫"按批次灰度"——出了问题一波全中。
+     * 这里用 Knuth 乘法散列，相邻 uid 会跳到相差 61 的桶。
+     */
+    public function pick(string $name, int $uid): ?Script
+    {
+        $base = $this->scripts[$name] ?? null;
+        if (!$base instanceof Script) {
+            return null;
+        }
+        if (!isset($this->alt[$name])) {
+            return $base;
+        }
+        $pct = $this->gray[$name] ?? 0;
+        if ($pct <= 0) {
+            return $base;
+        }
+        // 取 alt 里最后注册的那个（版本号最大通常也是它）
+        $newest = $base;
+        foreach ($this->alt[$name] as $altScript) {
+            $newest = $altScript;
+        }
+        if ($pct >= 100) {
+            return $newest;
+        }
+        $bucket = ($uid * 2654435761) % 100;
+        if ($bucket < 0) {
+            $bucket = -$bucket;
+        }
+        if ($bucket < $pct) {
+            return $newest;
+        }
+        return $base;
+    }
+
+    /** 带灰度的调用：按 uid 选版本，再走 `callWithContext` */
+    public function callGray(
+        string $name,
+        int $uid,
+        string $entry,
+        Context $ctx,
+        int $timeoutMs = 1000
+    ): array|object|string|int|float|bool|null {
+        $s = $this->pick($name, $uid);
+        if (!$s instanceof Script) {
+            return null;
+        }
+        return $s->callWithContext($entry, $ctx, $timeoutMs);
+    }
+
     /** @return list<string> 加载失败的脚本名 */
     public function loadAll(): array
     {
@@ -50,6 +144,14 @@ final class Manager
         foreach ($this->scripts as $name => $s) {
             if (!$s->load()) {
                 $failed[] = $name;
+            }
+        }
+        // 灰度版本也要加载：只加载 base 的话，把灰度打到 100 的那一刻才发现 alt 有语法错
+        foreach ($this->alt as $name => $vers) {
+            foreach ($vers as $altScript) {
+                if (!$altScript->load()) {
+                    $failed[] = "alt:" . (string) $name;
+                }
             }
         }
         if ($failed !== []) {
@@ -81,7 +183,15 @@ final class Manager
     {
         $reloaded = [];
         foreach ($this->scripts as $name => $s) {
-            if ($s->reloadIfChanged()) {
+            $hit = $s->reloadIfChanged();
+            if (isset($this->alt[$name])) {
+                foreach ($this->alt[$name] as $altScript) {
+                    if ($altScript->reloadIfChanged()) {
+                        $hit = true;
+                    }
+                }
+            }
+            if ($hit) {
                 $reloaded[] = (string) $name;
             }
         }
@@ -100,7 +210,17 @@ final class Manager
         if (!$s instanceof Script) {
             return false;
         }
-        return $s->reload();
+        $ok = $s->reload();
+        // 灰度版本一起重载：只换 base 会让"灰度中的那批人"继续跑旧代码，
+        // 现象是"重载了但一部分人没生效"，而且日志看不出差异
+        if (isset($this->alt[$name])) {
+            foreach ($this->alt[$name] as $altScript) {
+                if (!$altScript->reload()) {
+                    $ok = false;
+                }
+            }
+        }
+        return $ok;
     }
 
     /**
@@ -112,7 +232,15 @@ final class Manager
     {
         $done = [];
         foreach ($this->scripts as $name => $s) {
-            if ($s->reload()) {
+            $ok = $s->reload();
+            if (isset($this->alt[$name])) {
+                foreach ($this->alt[$name] as $altScript) {
+                    if (!$altScript->reload()) {
+                        $ok = false;
+                    }
+                }
+            }
+            if ($ok) {
                 $done[] = (string) $name;
             }
         }
