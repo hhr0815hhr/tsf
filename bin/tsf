@@ -1361,12 +1361,48 @@ function verifyRun(string $root, array $argv): int
             continue;
         }
 
+        // 退出码之外，再看一眼输出里有没有"真失败"的行。2026-11-27 之前 verify 只认退出码：
+        // run.sh 忘了把断言结果传成退出码的套件，红着也是绿的。判据与 tsf test 那边同一套
+        // （行首 FAIL、或 `passed=N failed=M` 且 M>0），宁可漏也不能误报。
+        $outText = implode("\n", $out);
+        $outBad = preg_match('/^\s*FAIL\s/m', $outText) === 1
+            || preg_match('/^passed=\d+ failed=[1-9][0-9]*$/m', $outText) === 1;
+        // 「一项断言都没执行」的通过也是假的。run.sh 靠 grep 数用例的 PASS/FAIL 行，
+        // 两边的格式对不上（空格数不同、"OK" 还是 "PASS"）时汇总行就是 passed=0 failed=0，
+        // 退出码却是 0。2026-11-27 schedule-test 就是这样藏了四天的红：
+        // 用例打 "  OK   "、run.sh 数 "  PASS  "，passed=0 failed=0，每次全量都"通过"。
+        $none = $rc === 0 && preg_match('/^passed=0 failed=0$/m', $outText) === 1;
         $tail = "";
-        if ($rc !== 0) {
-            $tail = implode(" | ", array_slice($out, -4));
+        if ($rc !== 0 || $outBad || $none) {
+            // 失败明细优先给**断言行**。只给最后 3 行时，`passed=4 failed=1` 这种汇总
+            // 看不出是哪条断言——clock 套件在 CI 上红了一次，日志里只有这一句。
+            $asserts = [];
+            foreach ($out as $line) {
+                if (preg_match('/^\s*FAIL\b/', $line) === 1) {
+                    $asserts[] = trim((string) $line);
+                }
+            }
+            if ($asserts !== []) {
+                $tail = implode(" | ", array_slice($asserts, 0, 6));
+                if (count($asserts) > 6) {
+                    $tail .= " | …… 共 " . count($asserts) . " 条";
+                }
+            } else {
+                $tail = implode(" | ", array_slice($out, -4));
+            }
+            if ($rc === 0) {
+                $tail = ($none ? "一项断言都没执行（run.sh 数 PASS/FAIL 的模式与用例输出对不上）" : "run.sh 退出码为 0，但输出里有 FAIL")
+                    . " | " . $tail;
+            }
+            // 全文落盘：汇总行只放得下几条，排障要的是完整输出。CI 会把 /tmp/tsf-verify-fail/ 上传。
+            $failDir = "/tmp/tsf-verify-fail";
+            if (!is_dir($failDir)) {
+                @mkdir($failDir, 0777, true);
+            }
+            @file_put_contents($failDir . "/" . (string) $s["id"] . ".log", $outText . PHP_EOL);
         }
-        $state = $rc === 0 ? "PASS" : "FAIL";
-        if ($rc === 0) {
+        $state = ($rc === 0 && !$outBad && !$none) ? "PASS" : "FAIL";
+        if ($state === "PASS") {
             $pass++;
         } else {
             $fail++;
@@ -2236,6 +2272,65 @@ function cmdLint(string $root, string $project = ""): int
             }
             say(c("  在 run.sh 里加 `php85 \"\$ROOT/tsf/bin/tsf\" build .`，失败即 exit 1", "d"));
             say(c("  （确属解释执行、没有产物的，在 verifySuites() 条目里写 `\"noBuild\" => \"原因\"`）", "d"));
+            return 1;
+        }
+
+        /*
+         * 最后一条：**不能写死某台机器的仓库路径**。
+         *
+         * 2026-11-27 CI 第一次在 GitHub 的 runner 上跑，9 个红的套件里有 4 个直接是
+         * `/data/TypeServer/...: No such file or directory`。本地永远发现不了：
+         * 仓库就摊在 /data/TypeServer。
+         * 更糟的是另外两个：proto-test 和 config-test 的命令全失败了，退出码却是 0
+         * （输出都过了 `| head` / `| tail`），在 CI 里"通过"了——空的通过。
+         * 那两个脚本的判定已经补严；这里挡的是同一类问题的源头。
+         *
+         * 扫的范围：注册的脚本、tests/ 下的 php 与 sh、scripts/ 下的 sh。注释行不算。
+         * bench/ 下的基准脚本里有不少这类路径，它们不在回归里，暂不扫。
+         */
+        $repoDir = dirname($root);
+        $scan = [];
+        foreach (verifySuites() as $vs) {
+            $scan[] = $repoDir . "/" . (string) $vs["sh"];
+        }
+        foreach (["/tests/*/*.php", "/tests/*/*.sh", "/tests/*/tests/*/*.php", "/scripts/*.sh"] as $pat) {
+            foreach ((array) glob($repoDir . $pat) as $g) {
+                $scan[] = (string) $g;
+            }
+        }
+        $baked = [];
+        foreach (array_unique($scan) as $f) {
+            if (!is_file($f)) {
+                continue;
+            }
+            $lines = file($f);
+            if (!is_array($lines)) {
+                continue;
+            }
+            foreach ($lines as $no => $line) {
+                $code = (string) $line;
+                if (str_ends_with($f, ".sh")) {
+                    if (preg_match('/^\s*#/', $code) === 1) {
+                        continue;
+                    }
+                } elseif (preg_match('#^\s*(//|\*|/\*)#', $code) === 1) {
+                    continue;
+                }
+                if (preg_match('#/data/TypeServer|/home/hhr#', $code) === 1) {
+                    $baked[] = substr($f, strlen($repoDir) + 1) . ":" . ($no + 1) . "  " . trim($code);
+                }
+            }
+        }
+        if ($baked !== []) {
+            say("");
+            say(c("  写死了某台机器的仓库路径，换一个检出位置（CI runner、别人的机器）就失败：", "r"));
+            foreach (array_slice($baked, 0, 12) as $b) {
+                say("    " . $b);
+            }
+            if (count($baked) > 12) {
+                say("    …… 共 " . count($baked) . " 处");
+            }
+            say(c("  shell 里用 `ROOT=$(cd ../.. && pwd)`；php 里用 `getenv(\"TSF_ROOT\")`（run-svc-test.sh 会导出）", "d"));
             return 1;
         }
 
