@@ -2109,7 +2109,18 @@ function cmdLint(string $root, string $project = ""): int
          * 测试文件好好躺在那里、`tsf verify` 里却没有它，于是从不执行。
          * 「有测试」和「测试在跑」是两件事，而这个差别在踩到之前完全看不出来。
          * 修复成本很低（补个 run.sh 或写一句原因），所以按错误处理。
+         *
+         * 但这三条只在 TypeServer（套件所在的仓库）里有意义。tsf 包被单独克隆时
+         * （composer 装出来的 vendor/hhr0815hhr/tsf、GitHub 上的 tsf 仓库）上一级没有
+         * tests/，下面会把每个条目都报成"注册了不存在的脚本"——`tsf lint` 不带参数时
+         * 对包的用户必然判红。2026-11-27 tsf 仓库的 CI 第一次在 GitHub 上跑就是这么红的
+         * （本地验证时 tsf 是子模块，上一级有 tests/，暴露不出来）。
          */
+        if (!is_dir(dirname($root) . "/tests")) {
+            say("");
+            say(c("  注册表规则跳过：上一级没有 tests/（这里是单独的 tsf 包，回归套件在 TypeServer 仓库）", "d"));
+            return 0;
+        }
         $ugated = [];
         // 判据是"在 verifySuites 里"，不是"有 run.sh"——
         // 实测有 4 个目录写着 run.sh 却从没注册（config/gm/proto/watch），
