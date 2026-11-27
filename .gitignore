@@ -1,4 +1,4 @@
-# 仓库是白名单（先 `*` 再放行）；这里是子模块自己的忽略规则，只管构建产物。
+# 构建产物不入库。源码（interp.c / php_interp.h / config.m4 / README.md / build.sh）入库。
 
 # ext/interp 的构建产物（phpize 生成 + make 产出）。源码 4 个文件（interp.c / php_interp.h /
 # config.m4 / README.md）和 build.sh 入库；.so 必须在目标机上现编，不进仓库。
