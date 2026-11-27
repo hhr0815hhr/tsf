@@ -946,6 +946,13 @@ function verifySuites(): array
         ["id" => "drain", "desc" => "进程 drain（8 项）", "sh" => "demo/duel/run-drain.sh"],
         ["id" => "rejoin", "desc" => "断线重连（6 项）", "sh" => "demo/duel/run-rejoin.sh"],
         ["id" => "script", "desc" => "脚本热更（加载/对象共享/越权/热更/异常）", "sh" => "tests/script-test/run.sh"],
+        // 端到端：AOT 规则与脚本规则对拍 → 改文件重载 → 回滚 → 灰度分流。
+        // 光有 pkg 的单测证明不了"接线对"，接线错了只会在业务数字上慢慢歪。
+        // 依赖 ext/interp，缺了 run.sh 自己 exit 77（SKIP 而非 FAIL）。
+        ["id" => "rule-hot", "desc" => "脚本规则热更端到端（对拍/重载/回滚/灰度）", "sh" => "demo/rule-hot/run.sh"],
+        // 跨进程：只 reload 本机时另一个节点仍是旧规则，广播后才一致。
+        // 这条断言防的是"以为 reload 一次就全服生效"——多节点部署里最常见的误判
+        ["id" => "rule-hot-cluster", "desc" => "跨节点热更：单机不够 + 广播生效", "sh" => "demo/rule-hot/run-cluster.sh"],
         ["id" => "http", "desc" => "HTTP 接口（路由/中间件/鉴权/限流）", "sh" => "tests/http-test/run.sh"],
     ];
 }
@@ -1671,11 +1678,98 @@ function tplMain(): string
  *
  * `__PROJECT_NAME__` 会被替换成工程目录名。
  */
-function genLayered(string $projDir, string $projectName): void
+function genLayered(string $projDir, string $projectName, bool $withScript): void
 {
-    $srcRoot = __DIR__ . "/../tpl/layered";
+    $copied = copyTplTree(__DIR__ . "/../tpl/layered", $projDir, $projectName);
+    if ($withScript) {
+        // 脚本层是条件生成的：没启用 script 包时铺出去会 use 到不存在的命名空间，
+        // 编译直接失败——比"少一层目录"难查得多
+        $copied += copyTplTree(__DIR__ . "/../tpl/layered-script", $projDir, $projectName);
+    }
+
+    // main.php 里两处占位：use 与启动调用。
+    // 不启用脚本层时整行删掉，而不是留注释——注释里提到不存在的类更误导人
+    $mainPath = $projDir . "/main.php";
+    $body = (string) file_get_contents($mainPath);
+    if ($withScript) {
+        $body = str_replace("__RULES_USE__", "use Game\\App\\RuleService;", $body);
+        $boot = "    // 规则层：加载 scripts/ 并在启动时自检一次（改脚本 + 重载即生效）\n"
+            . '    RuleService::boot($base . "/scripts");';
+        $body = str_replace("__RULES_BOOT__", $boot, $body);
+    } else {
+        $body = str_replace("__RULES_USE__\n", "", $body);
+        $body = str_replace("__RULES_BOOT__\n", "", $body);
+    }
+    file_put_contents($mainPath, $body);
+
+    // README 里的脚本层段落也是条件的：没有 scripts/ 目录却讲它，
+    // 新人会照着找一个不存在的文件
+    $readmePath = $projDir . "/README.md";
+    $rb = (string) file_get_contents($readmePath);
+    if ($withScript) {
+        $rb = str_replace(
+            "__RULES_TREE__",
+            "├── scripts/            (L2) 规则：改了重载即生效，不参与编译",
+            $rb
+        );
+        $rb = str_replace("__RULES_SECTION__", rulesSection(), $rb);
+    } else {
+        $rb = str_replace("__RULES_TREE__\n", "", $rb);
+        $rb = str_replace("__RULES_SECTION__\n", "", $rb);
+    }
+    file_put_contents($readmePath, $rb);
+
+    $tail = $withScript ? " + scripts/" : "";
+    ok("分层骨架：" . $copied . " 个文件（src/Protocol|Domain|App" . $tail . " + tests/unit）");
+}
+
+/** 分层骨架 README 里的"脚本层"章节（只在启用 script 包时插入） */
+function rulesSection(): string
+{
+    return <<<'MD'
+## 脚本层（选了 script 包才有）
+
+`scripts/` 里的 PHP **不参与编译**，改完 + 重载就生效。判断一条逻辑放哪，按顺序问：
+
+| # | 问题 | 是 → |
+|:--:|:--|:--|
+| 1 | 会动钱、动库存、落库、推送吗？ | 执行留 AOT，脚本最多"申请" |
+| 2 | 每帧跑，或每人每秒 ≥10 次吗？ | AOT |
+| 3 | 线上会改吗（活动、掉率、条件、折扣）？ | **脚本** |
+
+三条都"否"的，写 AOT，省一层间接。
+
+`scripts/levelup.php` 是判定示例，`src/App/RuleService.php` 是宿主（加载、调用、重载）。
+改脚本前后都能跑单测——**不编译、不起服务**：
+
+```bash
+php85 tests/script/run.php
+```
+
+启动时宿主还会自检一次，日志里能看到：
+
+```
+rule self-check ok  sample=gold:1000;item:3001:1
+```
+
+脚本怎么写、改完怎么生效、怎么灰度、两种接法（只读视图 / 能力）有什么区别，
+见框架仓库 `demo/rule-hot/`——那里有完整流程和耗时对照。
+
+MD;
+}
+
+/**
+ * 把一个模板目录铺到工程里。
+ *
+ * 两条替换规则：
+ *   - 文件名去掉 `.txt` 后缀（模板不能以 .php 结尾，否则会被当源码扫到）
+ *   - `gitignore.txt` → `.gitignore`
+ *   - `__PROJECT_NAME__` 替换成工程目录名
+ */
+function copyTplTree(string $srcRoot, string $projDir, string $projectName): int
+{
     if (!is_dir($srcRoot)) {
-        fail("找不到分层模板目录: " . $srcRoot);
+        fail("找不到模板目录: " . $srcRoot);
     }
 
     $it = new RecursiveIteratorIterator(
@@ -1688,7 +1782,6 @@ function genLayered(string $projDir, string $projectName): void
         $path = $item->getPathname();
         $rel = substr($path, strlen($srcRoot) + 1);
 
-        // gitignore 单独处理：模板里叫 gitignore.txt，生成后要叫 .gitignore
         if ($rel === "gitignore.txt") {
             $rel = ".gitignore.txt";
         }
@@ -1704,20 +1797,19 @@ function genLayered(string $projDir, string $projectName): void
             continue;
         }
 
-        $body = (string) file_get_contents($path);
-        $body = str_replace("__PROJECT_NAME__", $projectName, $body);
+        $data = (string) file_get_contents($path);
+        $data = str_replace("__PROJECT_NAME__", $projectName, $data);
 
         $parent = dirname($dst);
         if (!is_dir($parent) && !mkdir($parent, 0777, true) && !is_dir($parent)) {
             fail("建目录失败: " . $parent);
         }
-        if (file_put_contents($dst, $body) === false) {
+        if (file_put_contents($dst, $data) === false) {
             fail("写文件失败: " . $dst);
         }
         $copied++;
     }
-
-    ok("分层骨架：" . $copied . " 个文件（src/Protocol|Domain|App + tests/unit）");
+    return $copied;
 }
 
 /** 生成的客户端模板；__TSF_ROOT__ 会被替换成框架根目录的绝对路径 */
@@ -2355,7 +2447,10 @@ switch ($cmd) {
                 fail("当前目录已经是 tsf 工程（已有 main.php 或 project.json）: " . $projDir);
             }
         } else {
-            $projDir = getcwd() . "/" . $name;
+            // 绝对路径直接用：`getcwd() . "/" . "/tmp/x"` 会拼成
+            // `<cwd>//tmp/x`，看着像成功，实际生成到了工程目录里。
+            // CI 里生成到 mktemp 目录时必然踩这个。
+            $projDir = strncmp($name, "/", 1) === 0 ? $name : getcwd() . "/" . $name;
             if (is_dir($projDir)) {
                 fail("目录已存在: " . $projDir);
             }
@@ -2454,7 +2549,9 @@ switch ($cmd) {
 
         if ($layout === "layered") {
             // 骨架自带 main.php，这里不再写平铺版
-            genLayered($projDir, basename($projDir));
+            // 脚本层只在启用 script 包时生成（否则会 use 到不存在的命名空间）
+            $withScript = in_array("script", $pickedPackages, true);
+            genLayered($projDir, basename($projDir), $withScript);
         } else {
             file_put_contents($projDir . "/main.php", tplMain());
         }

@@ -1,0 +1,74 @@
+<?php
+
+/**
+ * 脚本层单测：**不需要 AOT 编译，也不需要起服务**。
+ *
+ *   php85 tests/script/run.php
+ *
+ * 能这么跑的原因：
+ *   1. `src/Domain/` 不依赖 TSF（骨架第一条规矩），原生 PHP 直接 require
+ *      就能当脚本的 stub 视图；
+ *   2. 脚本由 `interp.so` 加载，和线上是同一份运行时，测过的就是线上跑的。
+ *
+ * 这一步解决的痛点是"脚本改完只能上线验"。脚本是运营每周改的东西，
+ * 没有秒级反馈，等于每次改都在赌。
+ *
+ * 缺 interp 扩展时退出码 77（回归里算 SKIP，不算 FAIL）。
+ */
+
+use Game\Domain\PlayerView;
+
+if (!function_exists("interp_require_file")) {
+    fwrite(STDERR, "SKIP 需要 ext/interp（PHP_INI_SCAN_DIR=<confdir> 或 php.ini 里 extension=interp.so）" . PHP_EOL);
+    exit(77);
+}
+
+require __DIR__ . "/../../src/Domain/PlayerView.php";
+
+$pass = 0;
+$fail = 0;
+
+$ok = function (bool $cond, string $name, string $extra = "") use (&$pass, &$fail): void {
+    if ($cond) {
+        $pass++;
+        echo "  PASS  " . $name . ($extra !== "" ? "  (" . $extra . ")" : "") . PHP_EOL;
+    } else {
+        $fail++;
+        echo "  FAIL  " . $name . ($extra !== "" ? "  (" . $extra . ")" : "") . PHP_EOL;
+    }
+};
+
+$e = interp_require_file(__DIR__ . "/../../scripts/levelup.php");
+$ok(is_array($e), "加载 levelup.php");
+if (!is_array($e)) {
+    echo PHP_EOL . "passed=0 failed=1" . PHP_EOL;
+    exit(1);
+}
+$ok(isset($e["onLevelUp"]), "导出表里有 onLevelUp 入口");
+
+$onLevelUp = $e["onLevelUp"];
+
+// 规则契约：<2 级不发；每 5 级给装备；VIP 多给一件
+$ok($onLevelUp(new PlayerView(1001, 1, 0, 0)) === "", "1 级不发奖");
+$ok($onLevelUp(new PlayerView(1001, 5, 0, 0)) === "gold:500;item:3001:1", "5 级：金币 + 装备");
+$ok($onLevelUp(new PlayerView(1001, 10, 0, 0)) === "gold:1000;item:3001:1", "10 级：仍是一件装备");
+$ok(
+    $onLevelUp(new PlayerView(1001, 10, 0, 3)) === "gold:1000;item:3001:1;item:3002:1",
+    "VIP 额外一件"
+);
+
+// 视图只读：属性是 private，写入必须失败（否则脚本能绕开宿主改数据）
+$wrote = "no";
+$v = new PlayerView(1001, 10, 0, 0);
+try {
+    $v->level = 99;
+} catch (\Throwable $x) {
+    $wrote = "blocked";
+}
+$ok($wrote === "blocked", "视图属性写不了（private + 无 setter）");
+
+// 等级边界：2 级是第一条生效的等级
+$ok($onLevelUp(new PlayerView(1001, 2, 0, 0)) === "gold:200", "2 级：只有金币");
+
+echo PHP_EOL . "passed=" . $pass . " failed=" . $fail . PHP_EOL;
+exit($fail === 0 ? 0 : 1);

@@ -1,6 +1,7 @@
 <?php
 
 use Game\App\EchoService;
+__RULES_USE__
 use Game\Protocol\Cmd;
 use Game\Protocol\EchoTask;
 use TSF\Gateway\Gateway;
@@ -44,6 +45,7 @@ function main(): void
     $gw = buildGateway($cfg, $server, $proto);
     $echo = spawnEchoService($gw);
     registerHandlers($gw, $echo);
+__RULES_BOOT__
 
     $gw->boot();
     logReady($cfg, $proto);

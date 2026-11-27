@@ -8,6 +8,7 @@ TSF 分层骨架。`tsf new --layout layered` 生成。
 ├── config/
 │   ├── tsf.json        框架配置：端口、集群、鉴权、日志
 │   └── game/           业务配置（表驱动，改了不用重编译）
+__RULES_TREE__
 ├── src/
 │   ├── Protocol/       协议：消息 ID、内部消息载体
 │   ├── Domain/         纯逻辑：规则、数值。不依赖 TSF，能单独测
@@ -54,6 +55,7 @@ php85 tests/run.php
    实测一段 81 ms 的循环会把整个进程的定时器精度拖到 87 ms
    （所有房间一起卡）。要处理大批数据就拆成多条消息，一条一小批。
 
+__RULES_SECTION__
 ## 加一个新功能
 
 以"加一个领取奖励"为例，顺序是固定的：

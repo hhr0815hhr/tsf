@@ -1,0 +1,127 @@
+<?php
+
+namespace Game\App;
+
+use Game\Domain\PlayerView;
+use TSF\Kernel\Logger;
+use TSF\Script\Manager;
+use TSF\Script\Script;
+use TSF\Service\Message;
+use TSF\Service\Scheduler;
+use TSF\Service\Service;
+
+/**
+ * 规则宿主：加载 scripts/、按名调用、被要求时重载。
+ *
+ * ## 它为什么是一个 Service 而不是一个工具类
+ *
+ * 脚本对象、State、能力闭包都活在这一个实例里。让别的地方 `new Manager()`
+ * 会造出第二份脚本状态——同一个脚本两个版本，线上表现为"重载了但一部分人没生效"，
+ * 而且日志里看不出差异。所以**全进程只有这一个宿主**，别处要重载就发消息过来。
+ *
+ * ## 重载是手动动作
+ *
+ * 不提供自动轮询。改文件即刻生效在生产上是危险默认：任何人 / rsync / 挂载
+ * 动一下这个目录，线上逻辑就换了，没有确认也没有审计。
+ * 接 GM 的完整写法见框架仓库 `demo/rule-hot/`（script.reload / script.gray）。
+ */
+final class RuleService extends Service
+{
+    private string $scriptDir;
+
+    private Manager $mgr;
+
+    public function __construct(string $scriptDir)
+    {
+        $this->scriptDir = $scriptDir;
+        $this->mgr = new Manager();
+    }
+
+    /**
+     * 装配入口：由 main.php 调用一次。
+     *
+     * 放在静态方法里，是为了让 main.php 只多一行；建 Service 必须走 spawnOf
+     * （`new` 出来的对象不会进调度器，它的 onMessage 永远不会被调用）。
+     */
+    public static function boot(string $scriptDir): void
+    {
+        Scheduler::instance()->spawnOf(function () use ($scriptDir): Service {
+            return new RuleService($scriptDir);
+        });
+    }
+
+    public function onStart(): void
+    {
+        // 名字是逻辑名，脚本不该知道自己的文件路径被谁用
+        $this->mgr->register("levelup", $this->scriptDir . "/levelup.php");
+
+        $failed = $this->mgr->loadAll();
+        if ($failed !== []) {
+            // 不崩：脚本坏了服务还得活着，业务走 AOT 兜底路径
+            Logger::error("脚本加载失败", ["names" => $failed, "dir" => $this->scriptDir]);
+            return;
+        }
+        $this->selfCheck();
+    }
+
+    /**
+     * 启动自检：拿一个假玩家跑一次规则，把结果写进日志。
+     *
+     * 为什么值得做：脚本的语法错能在 loadAll 里发现，但"入口名写错""返回类型变了"
+     * 这类问题只有真调一次才暴露。放启动时，比等运营点了领奖才发现便宜得多。
+     */
+    private function selfCheck(): void
+    {
+        $script = $this->mgr->get("levelup");
+        if (!$script instanceof Script) {
+            Logger::warn("没有注册 levelup 脚本", []);
+            return;
+        }
+        $v = new PlayerView(1001, 10, 0, 1);
+        $r = $script->call("onLevelUp", $v);
+        if (is_string($r)) {
+            Logger::info("rule self-check ok", ["sample" => $r]);
+            return;
+        }
+        // 脚本抛异常时 interp 返回结构化错误，带 file/line——直接进日志，
+        // 不用等上线后看"business failed"人肉翻
+        if (is_array($r) && isset($r["ok"]) && $r["ok"] === false) {
+            $at = "";
+            if (isset($r["file"]) && isset($r["line"])) {
+                $at = (string) $r["file"] . ":" . (string) $r["line"];
+            }
+            $why = isset($r["message"]) ? (string) $r["message"] : "script error";
+            Logger::error("rule self-check 失败", ["at" => $at, "why" => $why]);
+            return;
+        }
+        Logger::error("rule self-check 返回了非字符串（契约是 string）", []);
+    }
+
+    /** 这个 Service 不收业务消息；保留钩子是为了以后接 GM 转发 */
+    public function onMessage(Message $m): void
+    {
+    }
+
+    /**
+     * 重载。返回 [ok, names]。
+     *
+     * `$name` 为空表示全部。名字不存在时返回 ok=false——
+     * 不要静默成功，"点了重载但什么都没发生"是最难查的一类运维故障。
+     *
+     * @return array<string, mixed>
+     */
+    public function reload(string $name): array
+    {
+        if ($name === "") {
+            $done = $this->mgr->reloadAll();
+            return ["ok" => true, "names" => $done];
+        }
+        if (!$this->mgr->get($name) instanceof Script) {
+            return ["ok" => false, "msg" => "不存在: " . $name];
+        }
+        if (!$this->mgr->reload($name)) {
+            return ["ok" => false, "msg" => "加载失败（看日志）: " . $name];
+        }
+        return ["ok" => true, "names" => [$name]];
+    }
+}

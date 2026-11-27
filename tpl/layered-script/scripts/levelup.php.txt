@@ -1,0 +1,32 @@
+<?php
+
+// 规则脚本（L2）：升级奖励。
+//
+// 文件约定（lint 会检查，违反会在 `tsf lint` 里报）：
+//   1. 只 return 一个数组（入口名 => 闭包），**不定义 function / class**
+//      —— reload 时重复定义会 Cannot redeclare，而且开发期看不出来
+//   2. 只能 use TSF\Script\*，能力一律从参数取，不直接抓 Service
+//   3. 不要自己取随机数 / 读时间：交给 AOT 的视图方法，才能回放与对账
+//
+// 返回 "itemId:count;itemId:count"，空串 = 无奖励。宿主负责真正发奖。
+return [
+    "onLevelUp" => function ($v) {
+        $level = $v->level();
+        if ($level < 2) {
+            return "";
+        }
+
+        // 基础：每级 100 金币（由宿主换算成金币，脚本只给数量）
+        $gold = $level * 100;
+
+        // 每 5 级给一件装备，VIP 额外给一件
+        $out = "gold:" . $gold;
+        if ($level % 5 === 0) {
+            $out = $out . ";item:3001:1";
+        }
+        if ($v->isVip()) {
+            $out = $out . ";item:3002:1";
+        }
+        return $out;
+    },
+];
