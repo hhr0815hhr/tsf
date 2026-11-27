@@ -276,6 +276,16 @@ final class Server extends Service
                 unset($this->conns[$id]);
                 continue;
             }
+            // 已经回了响应、半关闭，只等对端把没发完的请求体倒完（见 respondAndDrain）。
+            // 这一段不再解析、不进 buf，读到多少丢多少。
+            if ($c->drainUntil > 0) {
+                $left = (string) @fread($c->sock, 65536);
+                $c->drainLeft -= strlen($left);
+                if (($left === "" && feof($c->sock)) || $c->drainLeft <= 0 || $now >= $c->drainUntil) {
+                    $this->drop($id, $c);
+                }
+                continue;
+            }
             $data = @fread($c->sock, 8192);
             if ($data === false || ($data === "" && feof($c->sock))) {
                 $this->drop($id, $c);
@@ -285,12 +295,11 @@ final class Server extends Service
                 continue;
             }
             if (strlen($c->buf) + strlen($data) > self::MAX_BODY * 2) {
-                $this->respond($c, 413, "{\"ok\":false,\"error\":\"请求太大\"}");
-                $this->drop($id, $c);
+                $this->respondAndDrain($c, 413, "{\"ok\":false,\"error\":\"请求太大\"}");
                 continue;
             }
             $c->buf .= $data;
-            if ($this->tryServe($c)) {
+            if ($this->tryServe($c) && $c->drainUntil === 0) {
                 $this->drop($id, $c);
             }
         }
@@ -327,6 +336,37 @@ final class Server extends Service
             $c->sock = null;
         }
         unset($this->conns[$id]);
+    }
+
+    /**
+     * 回一个"请求我没收全就不要了"的响应（目前只有 413），然后**半关闭 + 排空**，
+     * 而不是直接 close。
+     *
+     * 为什么：413 是在只读到请求头的时候回的，对端还在往这边写 body。
+     * 这时 close()，内核发现接收缓冲区里还有没读的数据，发的不是 FIN 而是 RST——
+     * 对端收到 RST 会把自己接收队列里**已经到了的响应**一起丢掉，应用层看到的是
+     * connection reset，而不是 413。时序上谁先到是随机的，所以表现为偶发。
+     * （2026-11-27 gm-test 的「超大 body 413」在全量回归里红过一次：got=0。）
+     *
+     * 做法：写完响应后 shutdown(SHUT_WR)——对端读到 EOF 知道"响应说完了"，但这一侧
+     * 继续把它没发完的字节读出来丢掉：它声明的 Content-Length 那么多字节都到了就 close
+     * （这时接收缓冲区是空的，发的是 FIN）；声明不了的就等它关连接（EOF）或超时（2 秒）。
+     * 对端不关也不怕，有超时兜底。
+     *
+     * @param Conn $c
+     * @param int  $unread 对端还差多少字节发完（-1 = 不知道）
+     */
+    private function respondAndDrain(Conn $c, int $status, string $body, int $unread = -1): void
+    {
+        $this->respond($c, $status, $body);
+        $sock = $c->sock;
+        if ($sock !== null) {
+            @stream_socket_shutdown($sock, STREAM_SHUT_WR);
+        }
+        $c->drainUntil = Scheduler::nowMs() + 2000;
+        $c->drainLeft = $unread;
+        // 已缓冲的请求头和部分 body 不再需要
+        $c->buf = "";
     }
 
     // ───────────────────── HTTP ─────────────────────
@@ -367,12 +407,14 @@ final class Server extends Service
             $raw = $headers["content-length"];
             $len = ctype_digit($raw) ? (int) $raw : -1;
             if ($len < 0) {
-                $this->respond($c, 400, "{\"ok\":false,\"error\":\"Content-Length 不合法\"}");
+                $this->respondAndDrain($c, 400, "{\"ok\":false,\"error\":\"Content-Length 不合法\"}");
                 return true;
             }
         }
         if ($len > self::MAX_BODY) {
-            $this->respond($c, 413, "{\"ok\":false,\"error\":\"请求太大\"}");
+            // body 可能已经到了一部分：还差的就是声明的长度减去已缓冲的
+            $got = strlen($c->buf) - ($end + 4);
+            $this->respondAndDrain($c, 413, "{\"ok\":false,\"error\":\"请求太大\"}", $len - ($got > 0 ? $got : 0));
             return true;
         }
         $bodyStart = $end + 4;
