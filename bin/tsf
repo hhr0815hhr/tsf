@@ -861,7 +861,7 @@ function verifySuites(): array
         // 于是"环境没装"被当成"代码有问题"——正是 needs 要拦掉的那种假红
         // 文档链接检查放第一个：它最快（<1 秒），而且坏了意味着"新人照着走会 404"，
         // 属于最该在回归里拦住的一类问题
-        ["id" => "docs", "desc" => "文档链接有效性（43 条）", "sh" => "scripts/check-doc-links.sh"],
+        ["id" => "docs", "desc" => "文档链接有效性", "sh" => "scripts/check-doc-links.sh"],
         ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh", "needs" => ["python3"]],
         ["id" => "swoole", "desc" => "Swoole 契约（10 项）", "sh" => "tests/swoole-contract/run.sh"],
         ["id" => "aoi", "desc" => "AOI 网格（36 项：边界/邻域对拍/规模）", "sh" => "tests/aoi-test/run.sh"],

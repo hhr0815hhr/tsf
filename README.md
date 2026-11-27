@@ -45,6 +45,8 @@
 | `eventlog` | 事件日志（金币结算等）+ 检查点 |
 | `script` | 脚本热更（`ext/interp`，替 Lua） |
 | `http` | 极简 HTTP 路由（登录服 / Web API） |
+| `handoff` | 单键状态交接：扩缩容/故障摘除时把状态从一台搬到另一台（三消息 + 超时回滚 + 幂等） |
+| `registry` | Redis 版节点注册表 + 归属租约（跨机服务发现），自带最小 RESP 客户端，不依赖 php-redis 扩展 |
 
 ### 工具链（`bin/tsf`）
 

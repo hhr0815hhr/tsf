@@ -7,18 +7,22 @@
 ## 状态：已验证
 
 ```bash
-docker build -f docker/Dockerfile -t tsf:latest .          # 313MB，约 25 分钟
+docker build -f docker/Dockerfile -t tsf:latest .          # 约 25 分钟
 
-docker run --rm -v "$PWD":/app -w /app tsf:latest tsf build .
-#   Successfully compiled 89 files
-#   Build successful: battle  (3795 KB)
+# 注意：镜像里没有把 tsf / tpc 放进 PATH，用完整路径或 php85 调
+docker run --rm -v "$PWD":/app -w /app tsf:latest \
+  php85 /app/vendor/hhr0815hhr/tsf/bin/tsf build .
+#   Build successful: <name>
 
-docker run --rm -v "$PWD":/app -w /app tsf:latest ./battle
-#   GAME_9002_OK   GM_9701_OK   日志正常写入
+docker run --rm -v "$PWD":/app -w /app tsf:latest ./my-server
 ```
 
-编译和运行都实测过（用 `demo/battle`：89 个文件编译、100 人压测收发正常、
-GM 端口通、`var/log/app.log` 有写入）。
+编译和运行都实测过（用 `demo/battle`：100 人压测收发正常、GM 端口通、
+`var/log/app.log` 有写入）。
+
+**镜像体积**：2026-11-27 实测 `docker images` 显示 **1.28 GB**（早期记录写的
+313 MB 是更早一版的构建结果，那次 PHP 只编了最小扩展；现在带 swoole thread +
+phpredis + zip + pdo_mysql，体积涨上来了）。
 
 ## 用法
 
@@ -32,8 +36,8 @@ docker build -f docker/Dockerfile -t tsf:latest .
 # 2) 在工程目录里装框架（需要 composer.json；没有就先 tsf new）
 docker run --rm -v "$PWD":/app -w /app tsf:latest composer require hhr0815hhr/tsf
 
-# 3) 编译
-docker run --rm -v "$PWD":/app -w /app tsf:latest tsf build .
+# 3) 编译（tsf 不在 PATH；独立工程用 vendor/bin/tsf）
+docker run --rm -v "$PWD":/app -w /app tsf:latest php85 vendor/bin/tsf build .
 
 # 4) 起服务（映射端口）
 docker run --rm -p 9001:9001 -v "$PWD":/app -w /app tsf:latest ./my-server
@@ -56,7 +60,7 @@ docker run --rm -v /path/to/TypeServer:/work -w /work/demo/battle tsf:latest \
 | 工具链 | `~/.tsf/toolchain/typephp`（tpc + src + vendor），**含 tpc-patches 的改动** |
 | phpx | `~/.tsf/toolchain/typephp/vendor/swoole/phpx/lib/libphpx.so` |
 | 其他 | g++ / cmake / libgmp-dev / libmpfr-dev / composer |
-| 命令 | `php85`、`php`（都指向 ZTS 版）、`composer` |
+| 命令 | `php85`、`php`（都指向 ZTS 版）、`composer`。**`tsf` 和 `tpc` 不在 PATH**——用 `php85 .../bin/tsf` 或工程里的 `vendor/bin/tsf` 调 |
 
 **为什么 PHP 前缀必须是 `/usr/local/php-8.5-zts`**：`tsf build` 生成的链接命令把
 rpath 写死了（`-Wl,-rpath,/usr/local/php-8.5-zts/lib` 和 `.../vendor/swoole/phpx/lib`）。
