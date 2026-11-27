@@ -169,7 +169,13 @@ PHP_FUNCTION(interp_invoke)
     zval *fn;
     zval *obj;
     zend_long timeout_ms = 0;
-    long long t_start = 0;
+    /* 执行预算的起点：进程 CPU 时间（clock()），与 zend_set_timeout 的计时口径相同（留 5% 容差）。
+     * cpu0 == 0 表示没设预算。
+     * 2026-11-27 之前这里用 time(NULL)：墙钟、整秒精度。超时要整整 1 秒的 CPU 之后才
+     * bailout，可墙钟一旦在这 1 秒里往回拨（WSL2、云主机都会校正时钟），或者调用发生在
+     * 某一秒的末尾，time(NULL) - 起点就还是 0 —— 一次真超时被判成"别的 fatal"。
+     * script-test 的「标记为 timeout」在全量回归里偶发红，就是这个。 */
+    clock_t cpu0 = 0;
     zval  retval;
     zval  args[1];
     int   rc = FAILURE;
@@ -207,7 +213,7 @@ PHP_FUNCTION(interp_invoke)
      */
     if (timeout_ms > 0) {
         zend_set_timeout((timeout_ms + 999) / 1000, 0);
-        t_start = (long long) time(NULL);
+        cpu0 = clock();
     }
 
     zend_try {
@@ -234,8 +240,24 @@ PHP_FUNCTION(interp_invoke)
         add_assoc_bool(return_value, "ok", 0);
         add_assoc_string(return_value, "fatal", "script caused a bailout (fatal error / timeout / oom)");
         /* 让调用方能把"超时"和"别的 fatal"分开处理：超时通常是脚本写错，
-         * 其余 fatal 可能意味着进程状态已经不可信 */
-        if (timeout_ms > 0 && t_start > 0 && ((long long) time(NULL) - t_start) * 1000 >= timeout_ms) {
+         * 其余 fatal 可能意味着进程状态已经不可信。
+         * 判据：设了预算，且从进入到 bailout 的**进程 CPU 时间** >= 预算的 95%。
+         * zend_set_timeout 内部是 ITIMER_PROF（进程 CPU 时间，按整秒向上取整），
+         * 和 clock() 量的是同一个东西，所以口径一致、不受墙钟校正影响。
+         * 实测两者差 3~5 毫秒（1 秒预算时 clock() 读到 995~997）：内核的 ITIMER 记账
+         * 和 clock() 的取整点不同，所以留 5% 的容差，而不是要求 >= 预算。
+         * 取不到起点（cpu0 == 0）时没有更好的依据：设了预算又 bailout，按超时算。 */
+        int is_timeout = 0;
+        if (timeout_ms > 0) {
+            clock_t cpu1 = clock();
+            if (cpu0 > 0) {
+                double cpu_ms = ((double) (cpu1 - cpu0)) * 1000.0 / (double) CLOCKS_PER_SEC;
+                is_timeout = cpu_ms >= (double) timeout_ms * 0.95;
+            } else {
+                is_timeout = 1;
+            }
+        }
+        if (is_timeout) {
             add_assoc_bool(return_value, "timeout", 1);
         }
         return;

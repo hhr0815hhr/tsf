@@ -43,6 +43,11 @@ AOT 二进制（C++ 对象、帧循环）
 | `trace` | `getTraceAsString()` 的原文（2026-11-27 补） |
 | `fatal` / `timeout` | 只有 bailout 分支才有 |
 
+**`timeout` 怎么判**：设了执行预算、又发生了 bailout 时，比较进入前后的**进程 CPU 时间**
+（`clock()`）——和 `zend_set_timeout` 内部的 `ITIMER_PROF` 是同一个口径，留 5% 容差
+（实测两者差 3–5 毫秒）。2026-11-27 之前用 `time(NULL)` 相减：墙钟、整秒精度，
+墙钟在那 1 秒里往回拨一下（WSL2、云主机会校正时钟），一次真超时就被判成"别的 fatal"。
+
 为什么非要 file/line：只有 class+message 时，2000 行的脚本报一句
 `business failed`，运维只能人肉翻。Lua 的 `error()` 默认带 `file:line`，
 这是脚本能不能上生产的分界，不是"调试舒服"的问题。
