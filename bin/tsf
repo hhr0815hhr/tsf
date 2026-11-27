@@ -919,6 +919,7 @@ function verifySuites(): array
         ["id" => "lock", "desc" => "分布式锁（持有者校验/续期/过期，无 Redis 则 SKIP）", "sh" => "tests/lock-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（120 项：含版本落后调度）", "sh" => "tests/handoff-test/run.sh"],
         ["id" => "config", "desc" => "配置加载/热更/校验", "sh" => "tests/config-test/run.sh"],
+        ["id" => "config-check", "desc" => "配置表校验器负例（主键重复/引用缺失/字段重名/越界/未知类型/区间反）", "sh" => "tests/config-check-test/run.sh"],
         ["id" => "gm", "desc" => "GM 命令/权限/审计/一人一个 token（55 项）", "sh" => "tests/gm-test/run.sh"],
         ["id" => "proto", "desc" => "协议编解码/版本协商", "sh" => "tests/proto-test/run.sh"],
         ["id" => "watch", "desc" => "watch 增量重编与失败处理", "sh" => "tests/watch-test/run.sh"],
