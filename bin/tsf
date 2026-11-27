@@ -1970,9 +1970,12 @@ function lintTree(string $base, string $nsPrefix, string $root, array &$problems
  *
  * 这两条是"热更能不能长期用"的前提，不是洁癖：
  *
- * - **规则 6**：脚本里不能有 `class` / `function` 定义。PHP 不允许重复定义，
- *   `reload()` 第二次必然 `Cannot redeclare`。这个错误在开发期不会暴露
- *   （第一次加载是好的），要等运营点第一次重载才炸。
+ * - **规则 6**：脚本里不能有 `class` / `function` 定义。
+ *   **不是 PHP 不允许**——用 `function_exists` 包住就能重复 require——而是
+ *   **reload 时不清理符号表**：直接写，第二次 `Cannot redeclare` 中止；
+ *   包住之后不报错，但调用拿到的还是第一次的实现，热更等于没做。
+ *   两条路都不能用，所以约定只 `return` 闭包。
+ *   顺带：这个坑首次加载看不出来，要等第一次重载才炸。
  * - **规则 7**：脚本只能 `use TSF\Script\*`，能力一律从 `Context` 取。
  *   `12-hot-reload.md` §6.5 那条安全边界——"脚本碰不到任意业务对象"——
  *   只有落成门禁才守得住，否则第一个图省事的人 `use TSF\Room\Room` 就破了。
@@ -1995,10 +1998,10 @@ function lintScripts(string $dir, string $root, array &$problems): int
         $code = (string) file_get_contents($f->getPathname());
 
         if (preg_match('/^\s*(final\s+|abstract\s+)?class\s+[A-Za-z_]/m', $code)) {
-            $problems[] = $rel . "  脚本里不能定义 class（reload 第二次会 Cannot redeclare）";
+            $problems[] = $rel . "  脚本里不能定义 class（reload 不清符号表：要么 fatal，要么拿旧实现）";
         }
         if (preg_match('/^\s*function\s+[A-Za-z_]/m', $code)) {
-            $problems[] = $rel . "  脚本里不能定义 function（reload 第二次会 Cannot redeclare）";
+            $problems[] = $rel . "  脚本里不能定义 function（reload 不清符号表：要么 fatal，要么拿旧实现）";
         }
         if (preg_match_all('/^\s*use\s+(?:function\s+|const\s+)?([^;]+);/m', $code, $m) > 0) {
             foreach ($m[1] as $u) {

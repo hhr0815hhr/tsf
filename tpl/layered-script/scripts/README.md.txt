@@ -17,8 +17,10 @@
 ## 三条硬规矩
 
 1. **只 `return` 一个数组**（入口名 => 闭包），不要定义 `function` / `class`。
-   PHP 不允许重复定义，`reload` 第二次必然 `Cannot redeclare`，
-   而且这个错误**开发期不暴露**（首次加载是好的），要等第一次重载才炸。
+   **不是 PHP 不允许**——`function_exists` 包住就能重复 require——而是 **reload 时
+   不清理符号表**：直接写会 `Cannot redeclare` 中止；包住之后不报错，但拿到的还是
+   第一次的实现，热更等于没做。两条路都是死路，所以只 `return` 闭包。
+   这个坑首次加载看不出来，要等第一次重载才炸。
 
 2. **只能 `use TSF\Script\*`**。要发奖、要发消息、要看配置，都从 `Context` 取
    （宿主 `bind` 的能力）。直接 `use TSF\Gateway\Gateway` 就把安全边界破了。
