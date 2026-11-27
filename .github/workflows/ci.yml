@@ -1,0 +1,102 @@
+name: CI
+
+# 这个仓库是**发布的包**（composer hhr0815hhr/tsf），门禁只做"包本身是否完好"：
+# 语法、结构、composer 元数据、模板能不能生成。不需要 AOT 工具链，几分钟跑完。
+#
+# 全量回归（`tsf verify`，57 个套件）不在这里——套件在 TypeServer 仓库的 `tests/`
+# 和 `demo/` 下，跑一次要十几分钟。那两个仓库的分工见 TypeServer 的
+# `docs/CI-RUNNER.md`。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: 包完整性与模板
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # composer.json 要求 php >= 8.5；lint / 模板生成都不依赖 swoole
+      # （实测 `php -n` 也能跑），所以这里不装扩展，省时间也少一处会漂的地方
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          coverage: none
+          tools: composer
+
+      - name: 环境
+        run: php -v && composer --version
+
+      - name: 全量 php -l
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if ! php -l "$f" > /dev/null 2>&1; then
+              echo "语法错误: $f"
+              php -l "$f" || true
+              fail=1
+            fi
+          done < <(git ls-files '*.php')
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK $(git ls-files '*.php' | wc -l) 个 PHP 文件"
+
+      - name: tsf lint（禁 mixed + 命名空间与目录一致 + 核心不依赖 pkg）
+        run: php bin/tsf lint
+
+      # 检查 composer.json 的语法、以及 lock 是否与 json 同步。
+      # 发布流程踩过：改完 version 忘了重算 lock 的 content-hash，
+      # 装的时候一切正常，直到别人 composer install 报 lock 过期。
+      - name: composer.json / lock 一致
+        run: composer validate --no-check-publish
+
+      # 模板坏了不会有人报错，只会在用户 `tsf new` 之后编译失败——
+      # 所以三种形态各生成一次，逐个 php -l。
+      - name: 三种模板都能生成且语法正确
+        run: |
+          set -euo pipefail
+          for mode in flat layered layered+script; do
+            d="$(mktemp -d)/proj"
+            case "$mode" in
+              flat)           php bin/tsf new "$d" --no-packages ;;
+              layered)        php bin/tsf new "$d" --layout=layered --no-packages ;;
+              layered+script) php bin/tsf new "$d" --layout=layered --packages=script ;;
+            esac
+
+            n=0
+            while IFS= read -r f; do
+              php -l "$f" > /dev/null || { echo "语法错误: $f"; exit 1; }
+              n=$((n + 1))
+            done < <(find "$d" -name '*.php')
+            echo "  $mode: $n 个 php 文件通过"
+
+            # 条件生成的占位符必须被替换干净，否则会原样留在用户的 main.php 里
+            if grep -rq "__RULES_" "$d" 2>/dev/null; then
+              echo "  $mode: 占位符没被替换"
+              grep -rn "__RULES_" "$d" || true
+              exit 1
+            fi
+          done
+
+      - name: 模板目录里不能有 .php（会被 build 当成源码扫进去）
+        run: |
+          if find tpl -name '*.php' | grep -q .; then
+            echo "tpl/ 下有 .php 文件，模板必须用 .php.txt："
+            find tpl -name '*.php'
+            exit 1
+          fi
+          echo "OK"
+
+      - name: LICENSE 与 composer 的 license 字段一致
+        run: |
+          lic=$(php -r '$j = json_decode(file_get_contents("composer.json"), true); echo $j["license"] ?? "";')
+          head -1 LICENSE | grep -qi "MIT" || { echo "LICENSE 首行不是 MIT"; exit 1; }
+          [ "$lic" = "MIT" ] || { echo "composer.json license=$lic，与 LICENSE 不一致"; exit 1; }
+          echo "OK MIT"
