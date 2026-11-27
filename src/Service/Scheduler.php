@@ -4,6 +4,7 @@ namespace TSF\Service;
 
 use TSF\Cluster\Addr;
 use TSF\Cluster\Cluster;
+use TSF\Kernel\Config;
 use TSF\Kernel\CrashDump;
 use TSF\Kernel\Logger;
 use TSF\Metrics\Metrics;
@@ -72,6 +73,9 @@ final class Scheduler
 
     /** 已经打过日志的回绕次数（每回绕一次只记一行） */
     private int $idWrapsSeen = 0;
+
+    /** worker_num 的警告只打一次（每个 Service 都检查会刷屏） */
+    private bool $warnedWorkerNum = false;
 
     /**
      * 单个服务在一轮里最多处理多少条。
@@ -964,6 +968,24 @@ final class Scheduler
     {
         if ($this->stopping) {
             throw new \RuntimeException("service: 调度器已停机，不能再创建服务");
+        }
+
+        // 多 worker 下 Service 是**被 fork 复制**的：每个 worker 各有一份实例、
+        // 各有一套 interval 定时器、各有一份内存状态。实测（2026-11-27，
+        // tests/worker-test）：worker_num=2 时 100ms 的 tick 打了两次、两个 pid
+        // 各自从 n=1 数起。对游戏服这是错模型——不是分片，是复制。
+        //
+        // 这里不抛异常（纯无状态服务配多 worker 是合法的），只警告一次。
+        if (!$this->warnedWorkerNum) {
+            $workers = Config::getInt("server.worker_num", 1);
+            if ($workers > 1) {
+                $this->warnedWorkerNum = true;
+                Logger::warn("worker_num > 1：Service 在每个 worker 各有一份", [
+                    "worker_num" => $workers,
+                    "impact" => "interval/after 定时器会执行 N 次；同房间玩家落在不同 worker 时状态互不可见",
+                    "suggest" => "有状态服务用 worker_num=1，扩容走多节点（不同 node_id + 端口）",
+                ]);
+            }
         }
         $self = $this;
         $id = $this->ids->acquire(self::nowMs(), function (int $candidate) use ($self): bool {
