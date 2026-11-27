@@ -1,0 +1,29 @@
+# 仓库是白名单（先 `*` 再放行）；这里是子模块自己的忽略规则，只管构建产物。
+
+# ext/interp 的构建产物（phpize 生成 + make 产出）。源码 4 个文件（interp.c / php_interp.h /
+# config.m4 / README.md）和 build.sh 入库；.so 必须在目标机上现编，不进仓库。
+/ext/interp/build/
+/ext/interp/modules/
+/ext/interp/.libs/
+/ext/interp/autom4te.cache/
+/ext/interp/configure
+/ext/interp/configure.ac
+/ext/interp/config.h
+/ext/interp/config.h.in
+/ext/interp/config.log
+/ext/interp/config.nice
+/ext/interp/config.status
+/ext/interp/Makefile
+/ext/interp/Makefile.fragments
+/ext/interp/Makefile.objects
+/ext/interp/*.dep
+/ext/interp/*.lo
+/ext/interp/*.la
+/ext/interp/libtool
+/ext/interp/ltmain.sh
+/ext/interp/missing
+/ext/interp/install-sh
+/ext/interp/config.guess
+/ext/interp/config.sub
+/ext/interp/run-tests.php
+/aclocal.m4

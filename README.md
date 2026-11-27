@@ -43,7 +43,7 @@
 | `entity` / `snapshot` | 实体管理与状态快照 |
 | `frameloop` | 固定帧循环（10Hz / 20Hz 玩法） |
 | `eventlog` | 事件日志（金币结算等）+ 检查点 |
-| `script` | 脚本热更（`ext/interp`，替 Lua） |
+| `script` | 脚本热更（`ext/interp`，替 Lua）。运行时是 `ext/interp` 扩展，源码随本包分发；`composer require` 之后跑一次 `bash vendor/hhr0815hhr/tsf/ext/interp/build.sh` 现编 |
 | `http` | 极简 HTTP 路由（登录服 / Web API） |
 | `handoff` | 单键状态交接：扩缩容/故障摘除时把状态从一台搬到另一台（三消息 + 超时回滚 + 幂等） |
 | `registry` | Redis 版节点注册表 + 归属租约（跨机服务发现），自带最小 RESP 客户端，不依赖 php-redis 扩展 |
@@ -92,6 +92,9 @@ export TSF_PHP=php85
 
 # 3) 自检
 ./vendor/bin/tsf doctor
+
+# 4) 只在用到脚本热更（pkg/script）时：现编它的运行时
+bash vendor/hhr0815hhr/tsf/ext/interp/build.sh
 ```
 
 ### 或者用 Docker（省掉上面这一套）
