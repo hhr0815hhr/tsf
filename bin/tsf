@@ -917,6 +917,7 @@ function verifySuites(): array
         ["id" => "db-pg", "desc" => "db 接真 PostgreSQL（方言差异/迁移/事务隔离，无 PG 则 SKIP）", "sh" => "tests/db-pg-test/run.sh"],
         ["id" => "redis", "desc" => "pkg/redis（基本命令/nil/哈希/有序集合/重连/pipeline，无 Redis 则 SKIP）", "sh" => "tests/redis-test/run.sh"],
         ["id" => "lock", "desc" => "分布式锁（持有者校验/续期/过期，无 Redis 则 SKIP）", "sh" => "tests/lock-test/run.sh"],
+        ["id" => "http-client", "desc" => "出站 HTTP（环境代理/超时/失败不抛异常）", "sh" => "tests/http-client-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（120 项：含版本落后调度）", "sh" => "tests/handoff-test/run.sh"],
         ["id" => "config", "desc" => "配置加载/热更/校验", "sh" => "tests/config-test/run.sh"],
         ["id" => "config-check", "desc" => "配置表校验器负例（主键重复/引用缺失/字段重名/越界/未知类型/区间反）", "sh" => "tests/config-check-test/run.sh"],

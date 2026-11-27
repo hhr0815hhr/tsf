@@ -1,7 +1,7 @@
 {
   "name": "http",
   "ns": "TSF\\Http",
-  "desc": "极简 HTTP 路由：路由表 + 路径参数 + 统一响应",
+  "desc": "极简 HTTP 路由（服务端）+ 出站客户端",
   "requires": [],
-  "hint": "登录服 / Web API 用。只做路由和响应封装，不做 ORM、不做模板、不做容器 —— 那些在 AOT 下要么编不过，要么不值得。游戏服（帧协议）不需要它。"
+  "hint": "服务端（App/Router/Response）给登录服 / Web API；出站（Client/Result）调第三方（支付/实名/推送）。不做 ORM、不做模板、不做容器 —— 那些在 AOT 下要么编不过，要么不值得。出站是同步阻塞的，别放在消息热路径。"
 }
