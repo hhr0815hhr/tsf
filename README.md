@@ -83,7 +83,9 @@
 # 1) 框架
 composer require hhr0815hhr/tsf
 
-# 2) 工具链：typephp 编译器（约 42MB，解压 168MB）
+# 2) 工具链：typephp 编译器（42MB，解压 172MB）
+#    版本是**编译器的**（当前 0.9.6），与框架版本无关——发布在独立 tag
+#    toolchain-0.9.6 下。同一份工具链配任意框架版本都行。
 curl -fsSL https://raw.githubusercontent.com/hhr0815hhr/TypeServer/main/scripts/install-toolchain.sh | bash
 export TPC=~/.tsf/toolchain/typephp/bin/tpc.php
 export TSF_PHP=php85

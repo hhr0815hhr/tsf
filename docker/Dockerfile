@@ -28,7 +28,7 @@
 ARG PHP_VERSION=8.5.12
 ARG SWOOLE_VERSION=6.2.5
 ARG REDIS_VERSION=6.3.0
-ARG TSF_TOOLCHAIN_VERSION=v0.7.0
+ARG TSF_TOOLCHAIN_TAG=toolchain-0.9.6
 
 # 国内网络建议换源，能省几分钟（Debian 官方源拉索引有时会卡在 Ign: 重试）：
 #   docker build --build-arg APT_MIRROR=mirrors.aliyun.com -f docker/Dockerfile -t tsf:latest .
@@ -43,7 +43,7 @@ FROM debian:bookworm AS builder
 ARG PHP_VERSION
 ARG SWOOLE_VERSION
 ARG REDIS_VERSION
-ARG TSF_TOOLCHAIN_VERSION
+ARG TSF_TOOLCHAIN_TAG
 ARG APT_MIRROR
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -144,19 +144,19 @@ RUN set -eux; \
     "${PHP_PREFIX}/bin/php" -m | grep -qix redis && echo "redis loaded"; \
     "${PHP_PREFIX}/bin/php" -r 'exit(class_exists("Redis") ? 0 : 1);' && echo "Redis class ok"
 
-# --- typephp 编译器（工具链包，约 42MB / 解压 168MB）---
+# --- typephp 编译器（工具链包，约 42MB / 解压 172MB）---
 # 两个坑：
 # 1. 这个脚本在 **TypeServer** 仓库，不在 tsf 仓库（写错 URL 会 404）
 # 2. 不要用 `curl ... | bash` —— 404 时 curl -f 失败，但 bash 收到空输入照样
 #    "成功"，错误被拖到下一步（cd 到不存在的目录）才暴露。先落盘再执行。
 # 最后一句是补丁断言：tpc-patches/README.md 说「升级 tpc 之后这些补丁会丢」，
 # 而只有打了补丁的 tpc 才只重编变化部分（否则改一行重编整个聚合单元）。
-# v0.7.0 已含补丁；将来换版本时这条会拦住，提示需要重新应用。
+# toolchain-0.9.6 已含补丁；将来换版本时这条会拦住，提示需要重新应用。
 # （注释只能写在这里，不能写进 RUN 的续行 —— 会被 shell 当成与后续命令同一行的注释）
 RUN set -eux; \
     curl -fsSL -o /tmp/install-toolchain.sh \
       "https://raw.githubusercontent.com/hhr0815hhr/TypeServer/main/scripts/install-toolchain.sh"; \
-    TSF_TOOLCHAIN_VERSION="${TSF_TOOLCHAIN_VERSION}" bash /tmp/install-toolchain.sh; \
+    TSF_TOOLCHAIN_TAG="${TSF_TOOLCHAIN_TAG}" bash /tmp/install-toolchain.sh; \
     test -f /root/.tsf/toolchain/typephp/bin/tpc.php; \
     grep -q "Stub hash: <ignored>" /root/.tsf/toolchain/typephp/src/Translator.php \
       || { echo "ERROR: tpc 补丁缺失，见 TypeServer/tpc-patches/README.md"; exit 1; }
