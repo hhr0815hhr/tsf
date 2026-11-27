@@ -861,9 +861,11 @@ function verifySuites(): array
         // 于是"环境没装"被当成"代码有问题"——正是 needs 要拦掉的那种假红
         // 文档链接检查放第一个：它最快（<1 秒），而且坏了意味着"新人照着走会 404"，
         // 属于最该在回归里拦住的一类问题
-        ["id" => "docs", "desc" => "文档链接有效性", "sh" => "scripts/check-doc-links.sh"],
+        ["id" => "docs", "desc" => "文档链接有效性", "sh" => "scripts/check-doc-links.sh",
+            "noBuild" => "纯 sh + python3 的文档检查，没有产物"],
         ["id" => "semantics", "desc" => "AOT 语言语义差分（45 用例）", "sh" => "tests/aot-semantics/run.sh", "needs" => ["python3"]],
-        ["id" => "swoole", "desc" => "Swoole 契约（10 项）", "sh" => "tests/swoole-contract/run.sh"],
+        ["id" => "swoole", "desc" => "Swoole 契约（10 项）", "sh" => "tests/swoole-contract/run.sh",
+            "noBuild" => "测的是 Swoole 原生行为，解释执行（php85 main.php），刻意不经过 AOT"],
         ["id" => "aoi", "desc" => "AOI 网格（36 项：边界/邻域对拍/规模）", "sh" => "tests/aoi-test/run.sh"],
         ["id" => "frameloop", "desc" => "帧循环 delta（12 项：首帧/倒退/封顶）", "sh" => "tests/frameloop-test/run.sh"],
         ["id" => "frame", "desc" => "拆包/粘包/非法帧（4 项）", "sh" => "tests/frame-test/run.sh"],
@@ -920,7 +922,8 @@ function verifySuites(): array
         ["id" => "http-client", "desc" => "出站 HTTP（环境代理/超时/失败不抛异常）", "sh" => "tests/http-client-test/run.sh"],
         ["id" => "handoff", "desc" => "状态交接（120 项：含版本落后调度）", "sh" => "tests/handoff-test/run.sh"],
         ["id" => "config", "desc" => "配置加载/热更/校验", "sh" => "tests/config-test/run.sh"],
-        ["id" => "config-check", "desc" => "配置表校验器负例（主键重复/引用缺失/字段重名/越界/未知类型/区间反）", "sh" => "tests/config-check-test/run.sh"],
+        ["id" => "config-check", "desc" => "配置表校验器负例（主键重复/引用缺失/字段重名/越界/未知类型/区间反）", "sh" => "tests/config-check-test/run.sh",
+            "noBuild" => "测的是开发期的导出工具链（ZipArchive），解释执行（php85 run.php），没有产物"],
         ["id" => "gm", "desc" => "GM 命令/权限/审计/一人一个 token（55 项）", "sh" => "tests/gm-test/run.sh"],
         ["id" => "proto", "desc" => "协议编解码/版本协商", "sh" => "tests/proto-test/run.sh"],
         ["id" => "watch", "desc" => "watch 增量重编与失败处理", "sh" => "tests/watch-test/run.sh"],
@@ -2181,6 +2184,13 @@ function cmdLint(string $root, string $project = ""): int
          *
          * 认几种写法：显式 build、走共用入口 scripts/run-svc-test.sh（它内部 build）、
          * `tsf run` / `tsf watch`（它们自己也 build）。
+         *
+         * 解释执行的套件（没有产物，谈不上旧）必须在注册表条目里**显式声明**
+         * `"noBuild" => "原因"`。2026-11-27 之前这里靠认 `php85 main.php` 这个字面量豁免，
+         * 结果 `docs`（纯 sh）和 `config-check`（`php85 run.php`）被误伤，lint 整体判红；
+         * 而反过来的漏洞更危险：`frame-test` 的 run.sh 里**有** "build" 字样，但写在
+         * `if [ ! -x 产物 ]` 里——产物存在就跳过。嗅探通过了，它却在 11-27 跑了一个
+         * 动态库已经加载不了的旧产物。字面量两头都不可靠，所以豁免改为显式声明。
          */
         $noBuild = [];
         foreach (verifySuites() as $vs) {
@@ -2188,6 +2198,9 @@ function cmdLint(string $root, string $project = ""): int
             $full = dirname($root) . "/" . $sh;
             if (!is_file($full)) {
                 continue;   // 上一条已经报过了
+            }
+            if (!empty($vs["noBuild"])) {
+                continue;   // 解释执行的套件，注册表里写明了原因
             }
             $txt = (string) @file_get_contents($full);
             // 去掉注释行：注释里写了"build"不算数
@@ -2199,8 +2212,6 @@ function cmdLint(string $root, string $project = ""): int
                 && strpos($code, "run-svc-test.sh") === false
                 && strpos($code, " watch ") === false
                 && strpos($code, " run ") === false
-                // 解释执行的套件（直接 php85 main.php）没有产物，谈不上旧
-                && strpos($code, "php85 main.php") === false
             ) {
                 $noBuild[] = (string) $vs["id"] . " → " . $sh;
             }
@@ -2213,6 +2224,7 @@ function cmdLint(string $root, string $project = ""): int
                 say("    " . $g);
             }
             say(c("  在 run.sh 里加 `php85 \"\$ROOT/tsf/bin/tsf\" build .`，失败即 exit 1", "d"));
+            say(c("  （确属解释执行、没有产物的，在 verifySuites() 条目里写 `\"noBuild\" => \"原因\"`）", "d"));
             return 1;
         }
 
