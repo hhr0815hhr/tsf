@@ -664,7 +664,7 @@ ZTS 是 **phpx（AOT 运行时）的要求**：它用线程承载 worker，每�
 
 ## 版本
 
-当前 **v1.0.0-rc.2**（1.0 的候选版）。变更记录见 [`CHANGELOG.md`](CHANGELOG.md)，
+当前 **v1.0.0-rc.3**（1.0 的候选版）。变更记录见 [`CHANGELOG.md`](CHANGELOG.md)，
 发版说明见 [Releases](https://github.com/hhr0815hhr/tsf/releases)。
 
 候选版不建议上生产：这批代码写出来还不到两天，API 的稳定性分级也没定。
