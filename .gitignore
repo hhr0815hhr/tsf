@@ -27,3 +27,5 @@
 /ext/interp/config.sub
 /ext/interp/run-tests.php
 /aclocal.m4
+# autoconf / 编辑器留下的备份文件（config.h.in~、configure~）
+*~
