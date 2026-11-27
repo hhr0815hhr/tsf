@@ -8,7 +8,7 @@
             "name": "hhr0815hhr"
         }
     ],
-    "version": "1.0.0-rc.1",
+    "version": "1.0.0-rc.2",
     "require": {
         "php": ">=8.5",
         "ext-swoole": ">=6.0"
