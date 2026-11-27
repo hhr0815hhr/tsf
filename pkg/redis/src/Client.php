@@ -144,6 +144,28 @@ final class Client
         return null;
     }
 
+    /**
+     * 发一条"只关心成功/失败"的原始命令（SET / EXPIRE / HSET 这类）。
+     *
+     * 为什么要单独一个方法：`cmd()` 的返回类型**刻意不收 bool**，而 `rawCommand`
+     * 对 SET 这类命令返回的是 `true`，会被 `cmd()` 吞成 `null` —— 于是"命令成功"
+     * 和"redis 不可达"看起来一模一样。分布式锁的 `acquire()` 第一版就死在这里：
+     * 锁其实加上了，但 `=== "OK"` 判不出来，acquire 永远返回空 token。
+     *
+     * 语义：`true` = 命令成功；`false` = 没成功（nil 结果、连不上、抛异常）。
+     */
+    public function cmdBool(string ...$args): bool
+    {
+        if (!$this->connect()) {
+            return false;
+        }
+        try {
+            return $this->r->rawCommand(...$args) === true;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
     // ---------------- 字符串 ----------------
 
     public function get(string $key): ?string
